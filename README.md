@@ -5,7 +5,7 @@ PAQJPVG_8.5-4 Replit App by Jurijus Pacalovas 8.5L-4 PAQ level 9 and zstandard l
 
 PJP-10 The best PAQ level default and zstandard level 22 Done all 2026 year in May 6 by Jurijus Pacalovas
 
-Majorana program was written by Jurijus Pacalovas in 25 Semtember
+The Majorana program for Majorana chip 2029 year q1 8, q2 16, q3 8192 qubits 
 
 
 Python 3.7.4
