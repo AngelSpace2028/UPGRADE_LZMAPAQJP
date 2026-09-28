@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PPMD_1.1 — Unified PAQJP+PJP Lossless Tournament (Dictionary-Aware)
-=====================================================================
+PPMD_1.1 — Unified PAQJP+PJP Lossless Tournament (Dictionary-Aware)  +  Qiskit
+=================================================================================
 Target: compress 1 KB Lorem ipsum to ~240 bytes with 100% lossless guarantee.
 
-Patches:
+Classical patches (unchanged):
   • 1.1c — live raw baseline candidate carries 0xFC header.
   • 1.1d — exhaustive pair self-test (all 65,535 pairs).
   • 1.1e — t58/r58 asymmetry fix (la predictor update guarded by i >= 1).
@@ -14,6 +14,16 @@ Patches:
   • 1.2a — CCMX external backend (fmt 12, level-9 style, auto-verified).
   • 1.2b — CCMX y/n install prompt, prints "ccmx: OK" on success.
   • 1.2c — main() menu line 5 syntax verified.
+
+Qiskit additions (this revision):
+  • Uses ONLY qiskit.QuantumCircuit — no qiskit_aer, no AerSimulator, no transpile.
+  • Interactive y/n prompts:
+      - 8  qubits (256 basis states)  -> transform #60
+      - 16 qubits (65 536 states)     -> transform #61
+      - 8192 qubits (classical bit-permutation; real HW does not exist)
+                                      -> transform #62
+  • Each circuit is built from X / CX / CCX / SWAP gates only (permutation
+    matrices), so the classical table is a bijection => 100% lossless.
 """
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
@@ -29,6 +39,13 @@ try: import brotli; HAS_BROTLI = True
 except ImportError: brotli = None; HAS_BROTLI = False
 try: import pyppmd; HAS_PPMD = True
 except ImportError: pyppmd = None; HAS_PPMD = False
+
+try:
+    import qiskit
+    HAS_QISKIT = True
+except ImportError:
+    qiskit = None
+    HAS_QISKIT = False
 
 try:
     import lzma; HAS_LZMA = True
@@ -94,10 +111,7 @@ CCMX_MIRRORS = [
 def _install_ccmx():
     global HAS_CCMX
     if HAS_CCMX:
-        p = shutil.which('ccmx')
-        print(f"ccmx: OK ({p})")
-        return True, p
-
+        p = shutil.which('ccmx'); print(f"ccmx: OK ({p})"); return True, p
     print("ccmx: not found — trying pip ...")
     for pkg in ('ccmx', 'pyccmx', 'ccmx-py'):
         try:
@@ -108,52 +122,36 @@ def _install_ccmx():
             if r.returncode == 0:
                 p = shutil.which('ccmx')
                 if p:
-                    HAS_CCMX = True
-                    print(f"ccmx: OK ({p})")
-                    return True, p
-        except Exception:
-            pass
-
-    target_dir = os.path.join(site.getusersitepackages() or os.path.expanduser('~'),
-                              '.ppmd_bin')
+                    HAS_CCMX = True; print(f"ccmx: OK ({p})"); return True, p
+        except Exception: pass
+    target_dir = os.path.join(site.getusersitepackages() or os.path.expanduser('~'), '.ppmd_bin')
     try: os.makedirs(target_dir, exist_ok=True)
     except Exception: pass
     target = os.path.join(target_dir, 'ccmx')
-
     for url in CCMX_MIRRORS:
         print(f"ccmx: trying mirror {url} ...")
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=30) as r:
-                blob = r.read()
+            with urllib.request.urlopen(req, timeout=30) as r: blob = r.read()
             if blob[:2] == b'PK':
                 import zipfile, io
                 with zipfile.ZipFile(io.BytesIO(blob)) as z:
                     name = next((n for n in z.namelist()
-                                 if os.path.basename(n).lower().startswith('ccmx')),
-                                None)
+                                 if os.path.basename(n).lower().startswith('ccmx')), None)
                     if name is None: continue
                     data = z.read(name)
-            else:
-                data = blob
+            else: data = blob
             with open(target, 'wb') as f: f.write(data)
             os.chmod(target, 0o755)
             try:
-                subprocess.run([target], capture_output=True, timeout=10)
-                ok = True
-            except Exception:
-                ok = os.path.getsize(target) > 1024
+                subprocess.run([target], capture_output=True, timeout=10); ok = True
+            except Exception: ok = os.path.getsize(target) > 1024
             if ok:
                 os.environ['PATH'] = target_dir + os.pathsep + os.environ.get('PATH', '')
-                HAS_CCMX = True
-                print(f"ccmx: OK ({target})")
-                return True, target
+                HAS_CCMX = True; print(f"ccmx: OK ({target})"); return True, target
         except Exception as e:
-            print(f"ccmx: mirror failed ({e})")
-            continue
-
+            print(f"ccmx: mirror failed ({e})"); continue
     print("ccmx: NOT available")
-    print("      Manual: download ccmx130a, chmod +x, put in $PATH.")
     return False, None
 
 if not HAS_PPMD:
@@ -171,14 +169,48 @@ if not HAS_BROTLI:
         if inst('brotli'):
             try: import brotli; HAS_BROTLI = True; print("brotli: OK")
             except ImportError: pass
+if not HAS_QISKIT:
+    if input("Install qiskit (QuantumCircuit only)? (y/n) [y]: ").strip().lower() != 'n':
+        if inst('qiskit'):
+            try:
+                import qiskit
+                HAS_QISKIT = True
+                print("qiskit: OK")
+            except ImportError: pass
 if not HAS_CCMX:
     if input("Install ccmx (level-9 backend)? (y/n) [y]: ").strip().lower() != 'n':
         _install_ccmx()
 
+# ==================== QISKIT OPTIONS (user y/n) ====================
+# These three flags decide which quantum-derived transforms are registered.
+ENABLE_Q8   = False   # 8  qubits  (256 basis states)
+ENABLE_Q16  = False   # 16 qubits  (65 536 basis states)
+ENABLE_Q8192 = False  # 8192 qubits (bit-permutation, no real HW)
+
+if HAS_QISKIT:
+    print("\n" + "="*70)
+    print("Qiskit QuantumCircuit options")
+    print("="*70)
+    ans = input("Enable 8-qubit  QuantumCircuit transform (256 states)? (y/n) [y]: ").strip().lower()
+    ENABLE_Q8 = (ans != 'n')
+    ans = input("Enable 16-qubit QuantumCircuit transform (65,536 states)? (y/n) [y]: ").strip().lower()
+    ENABLE_Q16 = (ans != 'n')
+    print("WARNING: 8192 qubits do NOT exist on any real quantum computer today.")
+    print("         Enabling this will still work classically (as a bit-permutation)")
+    print("         but is a theoretical / speculative option.")
+    ans = input("Enable 8192-qubit QuantumCircuit transform? (y/n) [n]: ").strip().lower()
+    ENABLE_Q8192 = (ans == 'y')
+else:
+    print("\nQiskit not available — 8/16/8192-qubit transforms will be no-ops.")
+
 print(f"\nBackends: zstd={'Y' if HAS_ZSTD else 'N'} lzma={'Y' if HAS_LZMA else 'N'} "
       f"paq={'Y' if paq else 'N'} brotli={'Y' if HAS_BROTLI else 'N'} "
       f"pyppmd={'Y' if HAS_PPMD else 'N'} zpaq={'Y' if HAS_ZPAQ else 'N'} "
-      f"ccmx={'Y' if HAS_CCMX else 'N'}")
+      f"ccmx={'Y' if HAS_CCMX else 'N'} qiskit={'Y' if HAS_QISKIT else 'N'}")
+print(f"Quantum transforms enabled: "
+      f"8q={'Y' if ENABLE_Q8 else 'N'} "
+      f"16q={'Y' if ENABLE_Q16 else 'N'} "
+      f"8192q={'Y' if ENABLE_Q8192 else 'N'}")
 
 PROGNAME = "PPMD_1.1"
 
@@ -424,18 +456,64 @@ def mod_inv(a, m):
     if x < 0: x += m0
     return x
 
-_MP_C = None; _MP_DATA = None
-def _mp_init(c, d):
-    global _MP_C, _MP_DATA
-    _MP_C = c; _MP_DATA = d
-def _mp_worker(chunk):
-    c = _MP_C; data = _MP_DATA; out = []
-    for idx, t1, t2 in chunk:
+# ==================== QISKIT QUANTUMCIRCUIT HELPERS ====================
+# NOTE: We only use qiskit.QuantumCircuit. No qiskit_aer, no AerSimulator,
+#       no qiskit.transpile, no Operator — only gate-application on the
+#       QuantumCircuit object. The classical truth table is derived by
+#       direct bit evaluation of the same gate list, so it is guaranteed
+#       consistent with what the QuantumCircuit represents.
+
+def build_qc_gatelist(n_qubits, seed):
+    """Return (gate_list, QuantumCircuit). Only X/CX/CCX/SWAP gates."""
+    rng = random.Random(seed)
+    gate_list = []
+    n_gates = 24 + n_qubits * 2
+    for _ in range(n_gates):
+        choices = ['x']
+        if n_qubits >= 2: choices.extend(['cx', 'swap'])
+        if n_qubits >= 3: choices.append('ccx')
+        g = rng.choice(choices)
+        if g == 'x':
+            gate_list.append(('x', rng.randrange(n_qubits)))
+        elif g == 'cx':
+            a, b = rng.sample(range(n_qubits), 2)
+            gate_list.append(('cx', a, b))
+        elif g == 'ccx':
+            a, b, c = rng.sample(range(n_qubits), 3)
+            gate_list.append(('ccx', a, b, c))
+        else:
+            a, b = rng.sample(range(n_qubits), 2)
+            gate_list.append(('swap', a, b))
+
+    qc = None
+    if HAS_QISKIT:
         try:
-            tr1 = c.fwd[t1](data); tr2 = c.fwd[t2](tr1)
-            out.append((idx, t1, t2, len(zf.compress(tr2)), tr2))
-        except Exception: pass
-    return out
+            from qiskit import QuantumCircuit
+            qc = QuantumCircuit(n_qubits, name=f"qperm{n_qubits}")
+            for g in gate_list:
+                if g[0] == 'x':      qc.x(g[1])
+                elif g[0] == 'cx':   qc.cx(g[1], g[2])
+                elif g[0] == 'ccx':  qc.ccx(g[1], g[2], g[3])
+                elif g[0] == 'swap': qc.swap(g[1], g[2])
+        except Exception as e:
+            print(f"  qiskit[{n_qubits}q] QuantumCircuit build failed: {e}")
+            qc = None
+    return gate_list, qc
+
+def apply_gatelist_to_int(v, gate_list):
+    for g in gate_list:
+        op = g[0]
+        if op == 'x':
+            v ^= 1 << g[1]
+        elif op == 'cx':
+            if (v >> g[1]) & 1: v ^= 1 << g[2]
+        elif op == 'ccx':
+            if ((v >> g[1]) & 1) and ((v >> g[2]) & 1): v ^= 1 << g[3]
+        elif op == 'swap':
+            a, b = g[1], g[2]
+            if ((v >> a) & 1) != ((v >> b) & 1):
+                v ^= (1 << a) | (1 << b)
+    return v
 
 # ==================== COMPRESSOR ====================
 class Compressor:
@@ -530,12 +608,10 @@ class Compressor:
             except Exception: return None
         return None
 
-    # ---------- CCMX wrappers ----------
     def _ccmxc(self, d):
         if not HAS_CCMX: return None
         with tempfile.TemporaryDirectory() as td:
-            inp = os.path.join(td, 'i')
-            out = os.path.join(td, 'o.ccmx')
+            inp = os.path.join(td, 'i'); out = os.path.join(td, 'o.ccmx')
             with open(inp, 'wb') as f: f.write(d)
             attempts = (
                 ['ccmx', 'c', inp, out, '256'],
@@ -548,20 +624,17 @@ class Compressor:
             for args in attempts:
                 try:
                     r = subprocess.run(args, capture_output=True, timeout=600)
-                    if r.returncode != 0:
-                        continue
+                    if r.returncode != 0: continue
                     for p in (out, inp + '.ccmx', inp + '.cmx', inp + '.ccm'):
                         if os.path.exists(p):
                             with open(p, 'rb') as f: return f.read()
-                except Exception:
-                    continue
+                except Exception: continue
         return None
 
     def _ccmxd(self, d):
         if not HAS_CCMX: return None
         with tempfile.TemporaryDirectory() as td:
-            inp = os.path.join(td, 'i.ccmx')
-            out = os.path.join(td, 'o')
+            inp = os.path.join(td, 'i.ccmx'); out = os.path.join(td, 'o')
             with open(inp, 'wb') as f: f.write(d)
             attempts = (
                 ['ccmx', 'd', inp, out],
@@ -572,13 +645,11 @@ class Compressor:
             for args in attempts:
                 try:
                     r = subprocess.run(args, capture_output=True, timeout=600)
-                    if r.returncode != 0:
-                        continue
+                    if r.returncode != 0: continue
                     for p in (out, inp[:-5], inp[:-4], inp[:-5] + '.out'):
                         if p and os.path.exists(p):
                             with open(p, 'rb') as f: return f.read()
-                except Exception:
-                    continue
+                except Exception: continue
         return None
 
     def cback(self, d):
@@ -629,15 +700,11 @@ class Compressor:
             except Exception: pass
 
         for fmt, comp in sorted(cs, key=lambda x: len(x[1])):
-            if fmt == 0:
-                return bytes([0]) + comp
+            if fmt == 0: return bytes([0]) + comp
             try:
                 blob = bytes([fmt]) + comp
-                back = self.dback(blob)
-                if back == d:
-                    return blob
-            except Exception:
-                continue
+                if self.dback(blob) == d: return blob
+            except Exception: continue
         return bytes([0]) + d
 
     def dback(self, d):
@@ -682,7 +749,127 @@ class Compressor:
             except Exception: return None
         return None
 
-    # ============ TRANSFORMS ============
+    # ============ QISKIT-BASED TRANSFORMS ============
+    def _build_qtable(self, n_qubits, seed):
+        """Enumerate classical permutation table by direct bit evaluation."""
+        gate_list, qc = build_qc_gatelist(n_qubits, seed)
+        N = 1 << n_qubits
+        perm = [0] * N
+        for i in range(N):
+            perm[i] = apply_gatelist_to_int(i, gate_list)
+        if len(set(perm)) != N:
+            raise TransformError(f"quantum perm {n_qubits}q not bijective")
+        inv = [0] * N
+        for i, j in enumerate(perm):
+            inv[j] = i
+        return perm, inv, qc, len(gate_list), gate_list
+
+    def _get_q8(self):
+        if getattr(self, '_q8_perm', None) is None:
+            p, i_, qc, ng, gl = self._build_qtable(8, seed=0x6008)
+            self._q8_perm, self._q8_inv, self._q8_circ, self._q8_ngates, self._q8_gatelist = p, i_, qc, ng, gl
+            print(f"  qiskit[8q]  : QuantumCircuit built ({ng} gates, {len(p)} states)")
+        return self._q8_perm, self._q8_inv
+
+    def _get_q16(self):
+        if getattr(self, '_q16_perm', None) is None:
+            p, i_, qc, ng, gl = self._build_qtable(16, seed=0x6016)
+            self._q16_perm, self._q16_inv, self._q16_circ, self._q16_ngates, self._q16_gatelist = p, i_, qc, ng, gl
+            print(f"  qiskit[16q] : QuantumCircuit built ({ng} gates, {len(p)} states)")
+        return self._q16_perm, self._q16_inv
+
+    def _get_q8192(self):
+        if getattr(self, '_q8192_gatelist', None) is None:
+            gl, qc = build_qc_gatelist(8192, seed=0x6020)
+            self._q8192_gatelist = gl
+            self._q8192_circ = qc
+            self._q8192_ngates = len(gl)
+            # NOTE: no full 2^8192 table — we apply the gate list bit-by-bit
+            print(f"  qiskit[8192q]: QuantumCircuit built ({len(gl)} gates); "
+                  f"table NOT materialised (2^8192 states)")
+        return self._q8192_gatelist
+
+    # ---- 8-qubit (byte substitution) ----
+    def t60(self, d):
+        if not d: return b''
+        perm, _ = self._get_q8()
+        return bytes(perm[b] for b in d)
+    def r60(self, d):
+        if not d: return b''
+        _, inv = self._get_q8()
+        return bytes(inv[b] for b in d)
+
+    # ---- 16-qubit (2-byte word substitution) ----
+    def t61(self, d):
+        if not d: return b'\x00'
+        perm, _ = self._get_q16()
+        pad = len(d) % 2
+        body = d + (b'\x00' if pad else b'')
+        out = bytearray([pad])
+        for i in range(0, len(body), 2):
+            w = (body[i] << 8) | body[i + 1]
+            nw = perm[w]
+            out.append((nw >> 8) & 0xFF); out.append(nw & 0xFF)
+        return bytes(out)
+    def r61(self, d):
+        if not d: return b''
+        if d == b'\x00': return b''
+        pad = d[0]
+        body = d[1:]
+        if len(body) % 2 != 0: raise TransformError("T61 odd body")
+        _, inv = self._get_q16()
+        out = bytearray()
+        for i in range(0, len(body), 2):
+            w = (body[i] << 8) | body[i + 1]
+            nw = inv[w]
+            out.append((nw >> 8) & 0xFF); out.append(nw & 0xFF)
+        if pad:
+            if len(out) < pad: raise TransformError("T61 short")
+            out = out[:-pad]
+        return bytes(out)
+
+    # ---- 8192-qubit (bit-permutation, no huge table) ----
+    # We apply the gate list directly bit-by-bit, on big integers.
+    def _bytes_to_int(self, b):
+        return int.from_bytes(b, 'big')
+    def _int_to_bytes(self, v, length):
+        if length <= 0: return b''
+        return v.to_bytes(length, 'big')
+    def t62(self, d):
+        if not d: return b'\x00'
+        gl = self._get_q8192()
+        nbytes = (8192 + 7) // 8   # 1024
+        L = len(d)
+        pad = (-L) % nbytes
+        body = d + b'\x00' * pad
+        out = bytearray([pad & 0xFF, (pad >> 8) & 0xFF, (L >> 24) & 0xFF,
+                         (L >> 16) & 0xFF, (L >> 8) & 0xFF, L & 0xFF])
+        for off in range(0, len(body), nbytes):
+            chunk = body[off:off+nbytes]
+            v = self._bytes_to_int(chunk)
+            v = apply_gatelist_to_int(v, gl)
+            out += self._int_to_bytes(v, nbytes)
+        return bytes(out)
+    def r62(self, d):
+        if not d: return b''
+        if d == b'\x00': return b''
+        if len(d) < 6: raise TransformError("T62 short")
+        pad = d[0] | (d[1] << 8)
+        L = (d[2] << 24) | (d[3] << 16) | (d[4] << 8) | d[5]
+        body = d[6:]
+        gl = self._get_q8192()
+        nbytes = (8192 + 7) // 8
+        if len(body) % nbytes != 0: raise TransformError("T62 body")
+        out = bytearray()
+        for off in range(0, len(body), nbytes):
+            chunk = body[off:off+nbytes]
+            v = self._bytes_to_int(chunk)
+            v = apply_gatelist_to_int(v, gl)
+            out += self._int_to_bytes(v, nbytes)
+        if pad: out = out[:-pad]
+        return bytes(out[:L])
+
+    # ============ CLASSICAL TRANSFORMS ============
     def t00(self, d):
         if not d: return struct.pack('>I', 0)
         br, bl, bsh = None, float('inf'), []
@@ -711,8 +898,7 @@ class Compressor:
             if len(rle) >= len(d): break
         if br is None or bl >= len(d):
             return struct.pack('>I', len(d)) + bytes([0]) + d
-        h = bytearray(struct.pack('>I', len(d)))
-        h.append(len(bsh)); h.extend(bsh)
+        h = bytearray(struct.pack('>I', len(d))); h.append(len(bsh)); h.extend(bsh)
         return bytes(h) + br
     def _rle(self, sd, sh):
         bits = []
@@ -729,11 +915,9 @@ class Compressor:
             if rn == 1:
                 self._bits(bits, 0b00, 2); self._bits(bits, v, 8)
             elif rn <= 5:
-                self._bits(bits, 0b01, 2)
-                self._bits(bits, rn-2, 2); self._bits(bits, v, 8)
+                self._bits(bits, 0b01, 2); self._bits(bits, rn-2, 2); self._bits(bits, v, 8)
             elif rn <= 12:
-                self._bits(bits, 0b10, 2)
-                self._bits(bits, rn-6, 3); self._bits(bits, v, 8)
+                self._bits(bits, 0b10, 2); self._bits(bits, rn-6, 3); self._bits(bits, v, 8)
         pad = (8 - len(bits) % 8) % 8; self._bits(bits, 0, pad)
         o = bytearray()
         for j in range(0, len(bits), 8):
@@ -858,8 +1042,7 @@ class Compressor:
 
     def t07(self, d):
         t = bytearray(d); r = self.rep
-        sh = len(d) % len(self.PI)
-        pr = self.PI[sh:] + self.PI[:sh]
+        sh = len(d) % len(self.PI); pr = self.PI[sh:] + self.PI[:sh]
         sz = len(d) % 256
         for i in range(len(t)): t[i] ^= sz
         for _ in range(r):
@@ -869,8 +1052,7 @@ class Compressor:
 
     def t08(self, d):
         t = bytearray(d); r = self.rep
-        sh = len(d) % len(self.PI)
-        pr = self.PI[sh:] + self.PI[:sh]
+        sh = len(d) % len(self.PI); pr = self.PI[sh:] + self.PI[:sh]
         p = nearest_prime(len(d) % 256)
         for i in range(len(t)): t[i] ^= p
         for _ in range(r):
@@ -880,8 +1062,7 @@ class Compressor:
 
     def t09(self, d):
         t = bytearray(d); r = self.rep
-        sh = len(d) % len(self.PI)
-        pr = self.PI[sh:] + self.PI[:sh]
+        sh = len(d) % len(self.PI); pr = self.PI[sh:] + self.PI[:sh]
         p = nearest_prime(len(d) % 256)
         sd = self._seed(len(d) % len(self.seeds), len(d))
         for i in range(len(t)): t[i] ^= p ^ sd
@@ -1129,8 +1310,7 @@ class Compressor:
 
     def t26(self, d):
         if not d: return b''
-        sec = b"PJP_T26"
-        o = bytearray()
+        sec = b"PJP_T26"; o = bytearray()
         for idx in range(0, len(d), 1024):
             ch = d[idx:idx+1024]; bn = idx // 1024
             h = hashlib.sha256(sec + struct.pack(">Q", bn)).digest()
@@ -1229,8 +1409,7 @@ class Compressor:
     def r29(self, d):
         if d == b'\x00': return b''
         if len(d) < 3: raise TransformError("T29")
-        pad = d[0]; k = int.from_bytes(d[1:3], 'little')
-        p = d[3:]
+        pad = d[0]; k = int.from_bytes(d[1:3], 'little'); p = d[3:]
         if len(p) % 3 != 0: raise TransformError("T29 l")
         o = bytearray()
         for i in range(0, len(p), 3):
@@ -1244,8 +1423,7 @@ class Compressor:
         pad = (3 - len(d) % 3) % 3
         p = d + b'\x00'*pad
         vals = [int.from_bytes(p[i:i+3], 'little') for i in range(0, len(p), 3)]
-        mean = sum(vals)//len(vals)
-        sv = sorted(vals); med = sv[len(sv)//2]
+        mean = sum(vals)//len(vals); sv = sorted(vals); med = sv[len(sv)//2]
         cands = set()
         for b in [mean, med]:
             for o in [0,1,-1,10,-10,100,-100,1000,-1000]: cands.add((b+o) % (1<<24))
@@ -1254,8 +1432,7 @@ class Compressor:
         bk, bc = 0, float('inf')
         for k in cands:
             tr = [(v-k) & 0xFFFFFF for v in vals]
-            m = sum(tr)//len(tr)
-            c = sum(abs(t-m) for t in tr)
+            m = sum(tr)//len(tr); c = sum(abs(t-m) for t in tr)
             if c < bc: bc = c; bk = k
         o = bytearray([pad]) + bk.to_bytes(3, 'little')
         for i in range(0, len(p), 3):
@@ -1265,8 +1442,7 @@ class Compressor:
     def r30(self, d):
         if d == b'\x00': return b''
         if len(d) < 4: raise TransformError("T30")
-        pad = d[0]; k = int.from_bytes(d[1:4], 'little')
-        p = d[4:]
+        pad = d[0]; k = int.from_bytes(d[1:4], 'little'); p = d[4:]
         if len(p) % 3 != 0: raise TransformError("T30 l")
         o = bytearray()
         for i in range(0, len(p), 3):
@@ -1382,8 +1558,7 @@ class Compressor:
                 if pos+14 > nb: raise TransformError("BlkRun t")
                 bv = self._rd(bits, pos, 8); pos += 8
                 cm = self._rd(bits, pos, 6); pos += 6
-                rl = min(cm+1, ol-len(o))
-                o.extend([bv]*rl)
+                rl = min(cm+1, ol-len(o)); o.extend([bv]*rl)
             else:
                 if pos+6 > nb: raise TransformError("BlkRun l")
                 cl = self._rd(bits, pos, 6); pos += 6
@@ -1676,59 +1851,43 @@ class Compressor:
     r47 = t47
 
     def t59(self, d):
-        if not d:
-            return b''
+        if not d: return b''
         ri = self.ref_idx
         out = bytearray()
         for tok in _TOK_RE.split(d):
-            if not tok:
-                continue
+            if not tok: continue
             if tok.isascii() and tok.isalpha():
                 low = tok.lower()
                 i = ri.get(low)
                 if i is not None:
-                    if tok == low:
-                        code = (i << 2) | 0
-                    elif tok == low.capitalize():
-                        code = (i << 2) | 1
-                    elif tok == low.upper():
-                        code = (i << 2) | 2
-                    else:
-                        code = None
+                    if tok == low: code = (i << 2) | 0
+                    elif tok == low.capitalize(): code = (i << 2) | 1
+                    elif tok == low.upper(): code = (i << 2) | 2
+                    else: code = None
                     if code is not None:
-                        _emit_varint(out, code + 1)
-                        continue
-            _emit_varint(out, 0)
-            _emit_varint(out, len(tok))
-            out += tok
+                        _emit_varint(out, code + 1); continue
+            _emit_varint(out, 0); _emit_varint(out, len(tok)); out += tok
         return bytes(out)
 
     def r59(self, blob):
         rw = self.ref_words
         out = bytearray()
-        pos = 0
-        n = len(blob)
+        pos = 0; n = len(blob)
         while pos < n:
             code, pos = _read_varint(blob, pos)
             if code == 0:
                 ln, pos = _read_varint(blob, pos)
-                out += blob[pos:pos+ln]
-                pos += ln
+                out += blob[pos:pos+ln]; pos += ln
             else:
                 x = code - 1
                 i = x >> 2
                 c = x & 3
-                if i >= len(rw):
-                    raise TransformError(f"t59 id {i}")
+                if i >= len(rw): raise TransformError(f"t59 id {i}")
                 w = rw[i]
-                if c == 0:
-                    out += w.encode('ascii')
-                elif c == 1:
-                    out += w.encode('ascii').capitalize()
-                elif c == 2:
-                    out += w.encode('ascii').upper()
-                else:
-                    raise TransformError("t59 case 3")
+                if c == 0: out += w.encode('ascii')
+                elif c == 1: out += w.encode('ascii').capitalize()
+                elif c == 2: out += w.encode('ascii').upper()
+                else: raise TransformError("t59 case 3")
         return bytes(out)
 
     def t57(self, d):
@@ -1772,8 +1931,7 @@ class Compressor:
         const = Counter(words).most_common(1)[0][0]
         fib_s = [0]*n; lz_s = [0]*n; la = {}
         for i in range(n):
-            if i == 0:
-                fib_s[i] = const; lz_s[i] = const
+            if i == 0: fib_s[i] = const; lz_s[i] = const
             else:
                 fib_s[i] = (words[i-1] + fibs[i % Lf]) & mask
                 lz_s[i] = la.get(words[i-1], const)
@@ -1960,7 +2118,22 @@ class Compressor:
         self.fwd[57] = self.t57; self.rev[57] = self.r57
         self.fwd[58] = self.t58; self.rev[58] = self.r58
         self.fwd[59] = self.t59; self.rev[59] = self.r59
-        for i in range(60, 256):
+
+        # ---- Quantum slots 60/61/62 (register or leave no-op) ----
+        if ENABLE_Q8 and HAS_QISKIT:
+            self.fwd[60] = self.t60; self.rev[60] = self.r60
+        else:
+            f, r = self._dyn(60); self.fwd[60] = f; self.rev[60] = r
+        if ENABLE_Q16 and HAS_QISKIT:
+            self.fwd[61] = self.t61; self.rev[61] = self.r61
+        else:
+            f, r = self._dyn(61); self.fwd[61] = f; self.rev[61] = r
+        if ENABLE_Q8192 and HAS_QISKIT:
+            self.fwd[62] = self.t62; self.rev[62] = self.r62
+        else:
+            f, r = self._dyn(62); self.fwd[62] = f; self.rev[62] = r
+
+        for i in range(63, 256):
             f, r = self._dyn(i); self.fwd[i] = f; self.rev[i] = r
         self.fwd[256] = self.t256; self.rev[256] = self.r256
 
@@ -2011,39 +2184,25 @@ class Compressor:
         os.replace(tmp, path)
 
     def _require_file(self, path):
-        if not path:
-            print("Error: no filename given.")
-            return False
-        if not os.path.exists(path):
-            print(f"Error: file not found: {path!r}")
-            return False
-        if not os.path.isfile(path):
-            print(f"Error: not a regular file: {path!r}")
-            return False
-        if not os.access(path, os.R_OK):
-            print(f"Error: permission denied: {path!r}")
-            return False
+        if not path: print("Error: no filename given."); return False
+        if not os.path.exists(path): print(f"Error: file not found: {path!r}"); return False
+        if not os.path.isfile(path): print(f"Error: not a regular file: {path!r}"); return False
+        if not os.access(path, os.R_OK): print(f"Error: permission denied: {path!r}"); return False
         return True
 
     # ==================== COMPRESS ====================
     def compress(self, infile, pairs=True, multi=False, timeout=None):
-        if not self._require_file(infile):
-            return
+        if not self._require_file(infile): return
         try:
-            with open(infile, 'rb') as f:
-                data = f.read()
+            with open(infile, 'rb') as f: data = f.read()
         except PermissionError:
-            print(f"Error: permission denied reading {infile!r}")
-            return
+            print(f"Error: permission denied reading {infile!r}"); return
         except OSError as e:
-            print(f"Error reading {infile!r}: {e}")
-            return
+            print(f"Error reading {infile!r}: {e}"); return
         if len(data) == 0:
-            print(f"Error: {infile!r} is empty — nothing to compress.")
-            return
+            print(f"Error: {infile!r} is empty — nothing to compress."); return
         if isinstance(pairs, bool):
-            if pairs: pair_list = self.pairs
-            else: pair_list = []
+            pair_list = self.pairs if pairs else []
         else:
             try: n_pairs = int(pairs)
             except (TypeError, ValueError): n_pairs = 0
@@ -2076,18 +2235,15 @@ class Compressor:
                 else:
                     print(f"  [single {t:>3}/256] size={size} bytes  best={best}")
             except Exception as e:
-                print(f"  [single {t:>3}/256] FAILED ({e})")
-                continue
+                print(f"  [single {t:>3}/256] FAILED ({e})"); continue
         print(f"  singles done: {ns}  ({time.time()-st:.1f}s)  best={best} bytes")
 
         if pair_list:
-            total = len(pair_list)
-            t0 = time.time()
-            print(f"  pairs: walking {total} of {len(self.pairs)} pairs with full backends ...")
+            total = len(pair_list); t0 = time.time()
+            print(f"  pairs: walking {total} of {len(self.pairs)} pairs ...")
             for i, (a, b) in enumerate(pair_list):
                 if timeout and time.time()-st > timeout:
-                    print(f"  Time limit reached at pair {i+1}/{total}")
-                    break
+                    print(f"  Time limit reached at pair {i+1}/{total}"); break
                 try:
                     tr = self.fwd[b](self.fwd[a](data))
                     p = self.cback(tr)
@@ -2101,19 +2257,16 @@ class Compressor:
                         print(f"  [pair {i+1:>5}/{total} #{a:>3}->#{b:>3}] "
                               f"size={size} bytes  best={best}")
                 except Exception as e:
-                    print(f"  [pair {i+1:>5}/{total} #{a:>3}->#{b:>3}] FAILED ({e})")
-                    continue
+                    print(f"  [pair {i+1:>5}/{total} #{a:>3}->#{b:>3}] FAILED ({e})"); continue
             print(f"  pairs done: {total}  ({time.time()-t0:.1f}s)  best={best} bytes")
 
         if multi:
-            rng = random.Random(42); tries = 0
-            MAX_MULTI = 200
+            rng = random.Random(42); tries = 0; MAX_MULTI = 200
             print(f"  multi: trying up to {MAX_MULTI} chains of 2-3 pairs ...")
             t0m = time.time()
             while tries < MAX_MULTI:
                 if timeout and time.time()-st > timeout:
-                    print(f"  Multi time limit reached at try {tries}")
-                    break
+                    print(f"  Multi time limit at try {tries}"); break
                 tries += 1
                 k = rng.randint(2, 3)
                 seq = [rng.randrange(len(self.pairs)) for _ in range(k)]
@@ -2132,59 +2285,45 @@ class Compressor:
                     else:
                         print(f"  [multi {tries:>3} {ext_label}] size={size} bytes  best={best}")
                 except Exception as e:
-                    print(f"  [multi {tries:>3} {ext_label}] FAILED ({e})")
-                    continue
+                    print(f"  [multi {tries:>3} {ext_label}] FAILED ({e})"); continue
             print(f"  multi done: {tries}  ({time.time()-t0m:.1f}s)  best={best} bytes")
 
-        if not cands:
-            print("Nothing to write"); return
+        if not cands: print("Nothing to write"); return
         ranked = sorted(cands, key=lambda x: len(x[1]))
         winner = None
         for ext, payload, label in ranked:
             try:
-                if ext == "_raw_":
-                    chk, _ = self._auto(payload)
+                if ext == "_raw_": chk, _ = self._auto(payload)
                 elif ext.startswith(".p"):
-                    idx = int(ext[2:]) - 1
-                    a, b = self.pairs[idx]
+                    idx = int(ext[2:]) - 1; a, b = self.pairs[idx]
                     r = self.dback(payload)
                     if r is None: continue
                     chk = self.rev[a](self.rev[b](r))
                 elif ext.startswith(".a"):
-                    tn = int(ext[2:])
-                    r = self.dback(payload)
+                    tn = int(ext[2:]); r = self.dback(payload)
                     if r is None: continue
                     chk = self.rev[tn](r)
                 elif ext.startswith(".m"):
                     parts = ext[2:].split("-")
-                    try:
-                        indices = [int(x) - 1 for x in parts]
-                    except ValueError:
-                        continue
+                    try: indices = [int(x) - 1 for x in parts]
+                    except ValueError: continue
                     r = self.dback(payload)
                     if r is None: continue
-                    chk = r
-                    ok = True
+                    chk = r; ok = True
                     for idx in reversed(indices):
-                        if not (0 <= idx < len(self.pairs)):
-                            ok = False; break
+                        if not (0 <= idx < len(self.pairs)): ok = False; break
                         a, b = self.pairs[idx]
                         chk = self.rev[a](self.rev[b](chk))
                     if not ok: continue
-                else:
-                    continue
+                else: continue
                 if chk == data:
                     winner = (ext, payload, label); break
-            except Exception:
-                continue
+            except Exception: continue
 
         if winner is None:
             print("  No candidate passed verify; raw fallback")
-            ext = "_raw_"
-            payload = self._mr() + self.cback(data)
-            label = "raw fallback"
-        else:
-            ext, payload, label = winner
+            ext = "_raw_"; payload = self._mr() + self.cback(data); label = "raw fallback"
+        else: ext, payload, label = winner
 
         out_dir = os.path.dirname(infile) or '.'
         if os.path.isdir(out_dir):
@@ -2200,8 +2339,7 @@ class Compressor:
         try:
             with open(out, 'rb') as f: wr = f.read()
         except OSError as e:
-            print(f"Error re-reading output {out!r}: {e}")
-            return
+            print(f"Error re-reading output {out!r}: {e}"); return
         try:
             if ext.startswith(".p"):
                 idx = int(ext[2:]) - 1; a, b = self.pairs[idx]
@@ -2215,14 +2353,11 @@ class Compressor:
                 for idx in reversed(indices):
                     a, b = self.pairs[idx]
                     chk2 = self.rev[a](self.rev[b](chk2))
-            else:
-                chk2, _ = self._auto(wr)
+            else: chk2, _ = self._auto(wr)
             if chk2 != data:
                 print("  Post-write verify failed; raw fallback")
-                ext = "_raw_"
-                payload = self._mr() + self.cback(data)
-                out = infile + ext
-                self._write(out, payload)
+                ext = "_raw_"; payload = self._mr() + self.cback(data)
+                out = infile + ext; self._write(out, payload)
         except Exception as e:
             print(f"  Post-write exception: {e}")
 
@@ -2237,138 +2372,98 @@ class Compressor:
 
     # ==================== DECOMPRESS ====================
     def decompress(self, infile, outfile=""):
-        if not self._require_file(infile):
-            return False
+        if not self._require_file(infile): return False
         try:
-            with open(infile, 'rb') as f:
-                blob = f.read()
+            with open(infile, 'rb') as f: blob = f.read()
         except PermissionError:
-            print(f"Error: permission denied reading {infile!r}")
-            return False
+            print(f"Error: permission denied reading {infile!r}"); return False
         except OSError as e:
-            print(f"Error reading {infile!r}: {e}")
-            return False
+            print(f"Error reading {infile!r}: {e}"); return False
         if len(blob) == 0:
-            print(f"Error: {infile!r} is empty.")
-            return False
+            print(f"Error: {infile!r} is empty."); return False
         base = os.path.basename(infile)
 
         m = re.search(r'\.p(\d+)$', infile)
         if m:
             idx = int(m.group(1)) - 1
             if not (0 <= idx < len(self.pairs)):
-                print(f"Error: pair index out of range in {infile!r}")
-                return False
+                print(f"Error: pair index out of range in {infile!r}"); return False
             a, b = self.pairs[idx]
-            try:
-                r = self.dback(blob)
+            try: r = self.dback(blob)
             except Exception as e:
-                print(f"Error: backend failed: {e}")
-                return False
+                print(f"Error: backend failed: {e}"); return False
             if r is None:
-                print("Error: backend could not decode payload.")
-                return False
-            try:
-                orig = self.rev[a](self.rev[b](r))
+                print("Error: backend could not decode payload."); return False
+            try: orig = self.rev[a](self.rev[b](r))
             except Exception as e:
-                print(f"Error: inverse transform failed: {e}")
-                return False
+                print(f"Error: inverse transform failed: {e}"); return False
             if not outfile:
                 outfile = re.sub(r'\.p\d+$', '', base) or (base + ".out")
-            try:
-                self._write(outfile, orig)
+            try: self._write(outfile, orig)
             except OSError as e:
-                print(f"Error writing {outfile!r}: {e}")
-                return False
-            print(f"-> {outfile} ({len(orig)} bytes)")
-            return True
+                print(f"Error writing {outfile!r}: {e}"); return False
+            print(f"-> {outfile} ({len(orig)} bytes)"); return True
 
         m = re.search(r'\.a(\d+)$', infile, re.IGNORECASE)
         if m:
             tn = int(m.group(1))
             if not (1 <= tn <= 256):
-                print(f"Error: transform number out of range: {tn}")
-                return False
-            try:
-                r = self.dback(blob)
+                print(f"Error: transform number out of range: {tn}"); return False
+            try: r = self.dback(blob)
             except Exception as e:
-                print(f"Error: backend failed: {e}")
-                return False
+                print(f"Error: backend failed: {e}"); return False
             if r is None:
-                print("Error: backend could not decode payload.")
-                return False
-            try:
-                orig = self.rev[tn](r)
+                print("Error: backend could not decode payload."); return False
+            try: orig = self.rev[tn](r)
             except Exception as e:
-                print(f"Error: inverse transform #{tn} failed: {e}")
-                return False
+                print(f"Error: inverse transform #{tn} failed: {e}"); return False
             if not outfile:
                 outfile = re.sub(r'\.a\d+$', '', base, flags=re.IGNORECASE) or (base + ".out")
-            try:
-                self._write(outfile, orig)
+            try: self._write(outfile, orig)
             except OSError as e:
-                print(f"Error writing {outfile!r}: {e}")
-                return False
-            print(f"-> {outfile} ({len(orig)} bytes)")
-            return True
+                print(f"Error writing {outfile!r}: {e}"); return False
+            print(f"-> {outfile} ({len(orig)} bytes)"); return True
 
         m = re.search(r'\.m([\d-]+)$', infile)
         if m:
             parts = m.group(1).split("-")
-            try:
-                indices = [int(x) - 1 for x in parts]
+            try: indices = [int(x) - 1 for x in parts]
             except ValueError:
-                print(f"Error: bad multi-pair sequence in {infile!r}")
-                return False
+                print(f"Error: bad multi-pair sequence in {infile!r}"); return False
             for idx in indices:
                 if not (0 <= idx < len(self.pairs)):
-                    print(f"Error: pair index {idx+1} out of range")
-                    return False
-            try:
-                r = self.dback(blob)
+                    print(f"Error: pair index {idx+1} out of range"); return False
+            try: r = self.dback(blob)
             except Exception as e:
-                print(f"Error: backend failed: {e}")
-                return False
+                print(f"Error: backend failed: {e}"); return False
             if r is None:
-                print("Error: backend could not decode payload.")
-                return False
+                print("Error: backend could not decode payload."); return False
             orig = r
             try:
                 for idx in reversed(indices):
                     a, b = self.pairs[idx]
                     orig = self.rev[a](self.rev[b](orig))
             except Exception as e:
-                print(f"Error: inverse chain failed: {e}")
-                return False
+                print(f"Error: inverse chain failed: {e}"); return False
             if not outfile:
                 outfile = re.sub(r'\.m[\d-]+$', '', base) or (base + ".out")
-            try:
-                self._write(outfile, orig)
+            try: self._write(outfile, orig)
             except OSError as e:
-                print(f"Error writing {outfile!r}: {e}")
-                return False
-            print(f"-> {outfile} ({len(orig)} bytes)")
-            return True
+                print(f"Error writing {outfile!r}: {e}"); return False
+            print(f"-> {outfile} ({len(orig)} bytes)"); return True
 
         off, seq = self._dh(blob)
         if off == 0:
-            print(f"Error: bad header in {infile!r} (not a PPMD_1.1 stream).")
-            return False
-        try:
-            orig, _ = self._auto(blob)
+            print(f"Error: bad header in {infile!r} (not a PPMD_1.1 stream)."); return False
+        try: orig, _ = self._auto(blob)
         except DecompressionError as e:
-            print(f"Error: {e}")
-            return False
+            print(f"Error: {e}"); return False
         except Exception as e:
-            print(f"Error decoding {infile!r}: {e}")
-            return False
-        if not outfile:
-            outfile = base + ".out"
-        try:
-            self._write(outfile, orig)
+            print(f"Error decoding {infile!r}: {e}"); return False
+        if not outfile: outfile = base + ".out"
+        try: self._write(outfile, orig)
         except OSError as e:
-            print(f"Error writing {outfile!r}: {e}")
-            return False
+            print(f"Error writing {outfile!r}: {e}"); return False
         print(f"-> {outfile} ({len(orig)} bytes)")
         return True
 
@@ -2381,10 +2476,8 @@ class Compressor:
                 d = bytes([tb])
                 try:
                     tr = self.fwd[t](d); rs = self.rev[t](tr)
-                    if rs != d:
-                        print(f"  FAIL t={t} b={tb:#04x}"); return False
-                except TransformError:
-                    continue
+                    if rs != d: print(f"  FAIL t={t} b={tb:#04x}"); return False
+                except TransformError: continue
                 except Exception as e:
                     print(f"  EXC t={t} b={tb:#04x}: {e}"); return False
         print("  256 transforms on single bytes: PASS")
@@ -2401,9 +2494,8 @@ class Compressor:
                 try:
                     tr = self.fwd[t](tv); rs = self.rev[t](tr)
                     if rs != tv:
-                        print(f"  FAIL t={t} len={len(tv)} ({len(tv)} bytes)"); return False
-                except TransformError:
-                    continue
+                        print(f"  FAIL t={t} len={len(tv)}"); return False
+                except TransformError: continue
                 except Exception as e:
                     print(f"  EXC t={t} len={len(tv)}: {e}"); return False
         print("  256 transforms on multi-byte vectors: PASS")
@@ -2411,47 +2503,35 @@ class Compressor:
         for p in [b"hello world " * 20, b"\x00" * 1000, os.urandom(200)]:
             e = self.cback(p); d = self.dback(e)
             if d != p:
-                fmt = e[0] if e else 'NONE'
-                print(f"  FAIL backend {len(p)}  fmt={fmt}  "
-                      f"comp={len(e)-1 if e else 0}  "
-                      f"back={len(d) if d is not None else 'None'}")
-                return False
+                print(f"  FAIL backend {len(p)}"); return False
         print("  Backends: PASS")
 
         print("  Testing all 65,535 pairs (representative 33-byte vector)...")
         pair_data = b"The quick brown fox jumped over."
         n_tested = 0; n_skipped = 0; n_failed = 0
-        failures = []
-        t_start = time.time()
+        failures = []; t_start = time.time()
         for a in range(1, 257):
             for b in range(1, 257):
-                if a == 256 and b == 256:
-                    continue
+                if a == 256 and b == 256: continue
                 try:
                     tr = self.fwd[b](self.fwd[a](pair_data))
                     rs = self.rev[a](self.rev[b](tr))
                     n_tested += 1
                     if rs != pair_data:
                         n_failed += 1
-                        if len(failures) < 20:
-                            failures.append((a, b, "mismatch"))
-                except TransformError:
-                    n_skipped += 1
+                        if len(failures) < 20: failures.append((a, b, "mismatch"))
+                except TransformError: n_skipped += 1
                 except Exception as e:
                     n_failed += 1
-                    if len(failures) < 20:
-                        failures.append((a, b, str(e)[:60]))
+                    if len(failures) < 20: failures.append((a, b, str(e)[:60]))
             if a % 32 == 0:
                 el = time.time() - t_start
-                print(f"    progress a={a:>3}/256 "
-                      f"tested={n_tested} skipped={n_skipped} "
+                print(f"    progress a={a:>3}/256 tested={n_tested} skipped={n_skipped} "
                       f"failed={n_failed}  ({el:.1f}s)")
         el = time.time() - t_start
-        print(f"  Pairs: tested={n_tested}  skipped={n_skipped}  "
-              f"failed={n_failed}  ({el:.1f}s)")
+        print(f"  Pairs: tested={n_tested}  skipped={n_skipped}  failed={n_failed}  ({el:.1f}s)")
         if n_failed:
-            for f in failures:
-                print(f"    FAIL {f}")
+            for f in failures: print(f"    FAIL {f}")
             return False
         print("  All 65,535 pairs: PASS (lossless composition)")
         print("[ALL LOSSLESS CHECKS PASSED]")
@@ -2481,45 +2561,32 @@ def main():
             while True:
                 raw = input(f"Number of pairs to try (1-{max_pairs}) [all]: ").strip()
                 if raw == "":
-                    n_pairs = max_pairs
-                    break
+                    n_pairs = max_pairs; break
                 try:
                     n_pairs = int(raw)
-                    if 1 <= n_pairs <= max_pairs:
-                        break
+                    if 1 <= n_pairs <= max_pairs: break
                     print(f"  Must be between 1 and {max_pairs}.")
-                except ValueError:
-                    print("  Please enter a whole number.")
+                except ValueError: print("  Please enter a whole number.")
             f = input("Input file: ").strip()
-            if not f:
-                print("No file given.")
-                continue
+            if not f: print("No file given."); continue
             c.compress(f, pairs=n_pairs, multi=False)
         elif ch == "2":
             f = input("Compressed: ").strip()
-            if not f:
-                print("No file given.")
-                continue
+            if not f: print("No file given."); continue
             o = input("Output (blank=auto): ").strip()
             c.decompress(f, o)
-        elif ch == "3":
-            c.selftest()
+        elif ch == "3": c.selftest()
         elif ch == "4":
             f = input("Input file: ").strip()
-            if not f:
-                print("No file given.")
-                continue
+            if not f: print("No file given."); continue
             c.compress(f, pairs=True, multi=True)
         elif ch == "5":
             try:
                 c.TOP_K = max(1, int(input("New TOP_K: ").strip()))
                 print(f"TOP_K = {c.TOP_K}")
-            except Exception:
-                print("Invalid")
-        elif ch == "0":
-            break
-        else:
-            print("Invalid")
+            except Exception: print("Invalid")
+        elif ch == "0": break
+        else: print("Invalid")
 
 if __name__ == "__main__":
     main()
