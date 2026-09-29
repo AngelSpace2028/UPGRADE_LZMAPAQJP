@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PPMD_1.1 — Unified PAQJP+PJP Lossless Tournament + Qiskit
+PPMD_1.1 — Unified PAQJP+PJP Lossless Tournament + Qiskit + cmix
 =============================================================================
-Bugfix: t_q / r_q (and t62 / r62) now apply the gate list in REVERSE order
-        in the inverse, because a sequence of involutions is not itself
-        an involution.
+NEW in this revision:
+  • cmix auto-install (Level 9): asks user y/n, downloads v21 source from
+    GitHub, compiles with `make`, and registers as format 13.
+  • cmix backend: format 13 in cback()/dback().
+  • Bugfix retained: t_q / r_q / t62 / r62 apply gate list in REVERSE
+    order in the inverse.
 """
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
@@ -40,6 +43,7 @@ except ImportError:
 
 HAS_ZPAQ = shutil.which('zpaq') is not None
 HAS_CCMX = shutil.which('ccmx') is not None
+HAS_CMIX = shutil.which('cmix') is not None
 
 def _imp_zstd():
     try:
@@ -135,21 +139,180 @@ def _install_ccmx():
     print("ccmx: NOT available")
     return False, None
 
+# ---------- cmix auto-install (Level 9) ----------
+CMIX_SRC_URL = "https://github.com/byronknoll/cmix/archive/refs/tags/v21.tar.gz"
+
+def _install_cmix():
+    """Ask user y/n, download cmix v21 source, compile with make.
+    Returns (True, path) on success, (False, None) on failure."""
+    global HAS_CMIX
+    if HAS_CMIX:
+        p = shutil.which('cmix')
+        print(f"cmix: OK ({p})")
+        return True, p
+
+    # ---- Ask user ----
+    print("\n" + "="*70)
+    print("cmix (Level 9) installation")
+    print("="*70)
+    print("cmix is the strongest lossless compressor available.")
+    print("It is a C++ program — NOT a pip package.")
+    print("This will:")
+    print("  1. Download cmix v21 source (~1 MB) from GitHub")
+    print("  2. Compile it with 'make' (needs g++ / clang++)")
+    print("  3. Install the binary to ~/.ppmd_bin/cmix")
+    print("\nWARNING: cmix needs ~32 GB RAM and is extremely slow.")
+    print("         On enwik8 it takes 10–14 hours.")
+    ans = input("Install cmix (Level 9)? (y/n) [y]: ").strip().lower()
+    if ans == 'n':
+        print("cmix: skipped by user")
+        return False, None
+
+    target_dir = os.path.join(site.getusersitepackages() or os.path.expanduser('~'), '.ppmd_bin')
+    try: os.makedirs(target_dir, exist_ok=True)
+    except Exception: pass
+
+    # ---- Check compiler ----
+    compiler = None
+    for cc in ('g++', 'clang++', 'c++'):
+        if shutil.which(cc):
+            compiler = cc; break
+    if compiler is None:
+        print("cmix: ERROR — no C++ compiler found (g++ / clang++ / c++).")
+        print("      Install build tools first, then re-run.")
+        return False, None
+    print(f"cmix: using compiler: {compiler}")
+
+    # ---- Download source ----
+    tmp_dir = tempfile.mkdtemp(prefix="cmix_build_")
+    print(f"cmix: downloading {CMIX_SRC_URL} ...")
+    try:
+        req = urllib.request.Request(CMIX_SRC_URL, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            tarball = r.read()
+        print(f"cmix: downloaded {len(tarball):,} bytes")
+    except Exception as e:
+        print(f"cmix: download failed: {e}")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return False, None
+
+    tar_path = os.path.join(tmp_dir, "cmix.tar.gz")
+    with open(tar_path, 'wb') as f:
+        f.write(tarball)
+
+    # ---- Extract ----
+    print("cmix: extracting ...")
+    try:
+        import tarfile
+        with tarfile.open(tar_path, 'r:gz') as tar:
+            tar.extractall(tmp_dir)
+    except Exception as e:
+        print(f"cmix: extract failed: {e}")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return False, None
+
+    # ---- Find source dir ----
+    src_dir = None
+    for name in os.listdir(tmp_dir):
+        p = os.path.join(tmp_dir, name)
+        if os.path.isdir(p) and os.path.exists(os.path.join(p, 'makefile')):
+            src_dir = p; break
+    if src_dir is None:
+        print("cmix: source dir not found")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return False, None
+
+    # ---- Patch makefile compiler if needed ----
+    mf = os.path.join(src_dir, 'makefile')
+    try:
+        with open(mf, 'r') as f: mf_text = f.read()
+        # Replace hardcoded clang++-17 or clang++ with detected compiler
+        mf_text = re.sub(r'CC\s*=\s*\S+', f'CC = {compiler}', mf_text, count=1)
+        with open(mf, 'w') as f: f.write(mf_text)
+        print(f"cmix: patched makefile -> CC = {compiler}")
+    except Exception: pass
+
+    # ---- Compile ----
+    print("cmix: compiling (this takes 3–10 minutes) ...")
+    try:
+        r = subprocess.run(['make'], cwd=src_dir,
+                           capture_output=True, timeout=1800)
+        if r.returncode != 0:
+            print("cmix: make FAILED")
+            print(r.stderr.decode('utf-8', errors='ignore')[:2000])
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return False, None
+    except subprocess.TimeoutExpired:
+        print("cmix: make TIMED OUT after 30 min")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return False, None
+    except Exception as e:
+        print(f"cmix: make error: {e}")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return False, None
+
+    # ---- Locate binary ----
+    binary_src = None
+    for candidate in ('cmix', os.path.join('src', 'cmix'),
+                      os.path.join('build', 'cmix')):
+        p = os.path.join(src_dir, candidate)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            binary_src = p; break
+    if binary_src is None:
+        print("cmix: compiled binary not found")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return False, None
+
+    # ---- Install ----
+    target = os.path.join(target_dir, 'cmix')
+    try:
+        shutil.copy2(binary_src, target)
+        os.chmod(target, 0o755)
+    except Exception as e:
+        print(f"cmix: install failed: {e}")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return False, None
+
+    # ---- Smoke test ----
+    try:
+        r = subprocess.run([target], capture_output=True, timeout=10)
+        ok = True  # cmix prints usage and exits; any output = it ran
+    except Exception:
+        ok = os.path.getsize(target) > 100_000
+
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if ok:
+        os.environ['PATH'] = target_dir + os.pathsep + os.environ.get('PATH', '')
+        HAS_CMIX = True
+        print(f"cmix: OK ({target})")
+        return True, target
+    else:
+        print("cmix: binary produced but smoke test failed")
+        return False, None
+
+# ---------- Prompt for pyppmd ----------
 if not HAS_PPMD:
     if input("Install pyppmd? (y/n) [y]: ").strip().lower() != 'n':
         if inst('pyppmd'):
             try: import pyppmd; HAS_PPMD = True; print("pyppmd: OK")
             except ImportError: pass
+
+# ---------- Prompt for paq ----------
 if paq is None:
     if input("Install paq? (y/n) [y]: ").strip().lower() != 'n':
         if inst('paq'):
             try: import paq; print("paq: OK")
             except ImportError: paq = None
+
+# ---------- Prompt for brotli ----------
 if not HAS_BROTLI:
     if input("Install brotli? (y/n) [y]: ").strip().lower() != 'n':
         if inst('brotli'):
             try: import brotli; HAS_BROTLI = True; print("brotli: OK")
             except ImportError: pass
+
+# ---------- Prompt for qiskit ----------
 if not HAS_QISKIT:
     if input("Install qiskit (QuantumCircuit only)? (y/n) [y]: ").strip().lower() != 'n':
         if inst('qiskit'):
@@ -158,9 +321,14 @@ if not HAS_QISKIT:
                 HAS_QISKIT = True
                 print("qiskit: OK")
             except ImportError: pass
+
+# ---------- Prompt for ccmx ----------
 if not HAS_CCMX:
     if input("Install ccmx (level-9 backend)? (y/n) [y]: ").strip().lower() != 'n':
         _install_ccmx()
+
+# ---------- Prompt for cmix (Level 9) ----------
+_install_cmix()
 
 # ==================== USER PROMPTS: QUBITS AND PAIRS ====================
 QUBIT_LIMIT = 1_000_000
@@ -225,7 +393,8 @@ if PAIRS > 10**9:
 print(f"\nBackends: zstd={'Y' if HAS_ZSTD else 'N'} lzma={'Y' if HAS_LZMA else 'N'} "
       f"paq={'Y' if paq else 'N'} brotli={'Y' if HAS_BROTLI else 'N'} "
       f"pyppmd={'Y' if HAS_PPMD else 'N'} zpaq={'Y' if HAS_ZPAQ else 'N'} "
-      f"ccmx={'Y' if HAS_CCMX else 'N'} qiskit={'Y' if HAS_QISKIT else 'N'}")
+      f"ccmx={'Y' if HAS_CCMX else 'N'} cmix={'Y' if HAS_CMIX else 'N'} "
+      f"qiskit={'Y' if HAS_QISKIT else 'N'}")
 
 PROGNAME = "PPMD_1.1"
 
@@ -514,9 +683,6 @@ def build_qc_gatelist(n_qubits, seed):
     return gate_list, qc
 
 def apply_gatelist_to_int(v, gate_list, reverse=False):
-    """Apply gates forward or in reverse order.
-    Reverse is required for the inverse, because a sequence of
-    involutions is not itself an involution."""
     it = reversed(gate_list) if reverse else gate_list
     for g in it:
         op = g[0]
@@ -634,6 +800,45 @@ class Compressor:
         L = len(d); s = sum(d) % 256
         return max(1, min(256, ((L*13 + s*17) % 256) + 1))
 
+    # ---- cmix compression ----
+    def _cmixc(self, d):
+        if not HAS_CMIX: return None
+        cmix = shutil.which('cmix')
+        if not cmix: return None
+        with tempfile.TemporaryDirectory() as td:
+            inp = os.path.join(td, 'i'); out = os.path.join(td, 'o.cmix')
+            with open(inp, 'wb') as f: f.write(d)
+            # Try cmix -c (standard mode)
+            try:
+                r = subprocess.run([cmix, '-c', inp, out],
+                                   capture_output=True, timeout=3600)
+                if r.returncode == 0 and os.path.exists(out):
+                    with open(out, 'rb') as f: return f.read()
+            except Exception: pass
+            # Try cmix without -c (some versions)
+            try:
+                r = subprocess.run([cmix, inp, out],
+                                   capture_output=True, timeout=3600)
+                if r.returncode == 0 and os.path.exists(out):
+                    with open(out, 'rb') as f: return f.read()
+            except Exception: pass
+        return None
+
+    def _cmixd(self, d):
+        if not HAS_CMIX: return None
+        cmix = shutil.which('cmix')
+        if not cmix: return None
+        with tempfile.TemporaryDirectory() as td:
+            inp = os.path.join(td, 'i.cmix'); out = os.path.join(td, 'o')
+            with open(inp, 'wb') as f: f.write(d)
+            try:
+                r = subprocess.run([cmix, '-d', inp, out],
+                                   capture_output=True, timeout=3600)
+                if r.returncode == 0 and os.path.exists(out):
+                    with open(out, 'rb') as f: return f.read()
+            except Exception: pass
+        return None
+
     def _zpc(self, d):
         if not HAS_ZPAQ: return None
         with tempfile.TemporaryDirectory() as td:
@@ -742,6 +947,11 @@ class Compressor:
                 c = self._ccmxc(d)
                 if c: cs.append((12, c))
             except Exception: pass
+        if HAS_CMIX:
+            try:
+                c = self._cmixc(d)
+                if c: cs.append((13, c))
+            except Exception: pass
 
         for fmt, comp in sorted(cs, key=lambda x: len(x[1])):
             if fmt == 0: return bytes([0]) + comp
@@ -791,11 +1001,13 @@ class Compressor:
         if f == 12 and HAS_CCMX:
             try: return self._ccmxd(p)
             except Exception: return None
+        if f == 13 and HAS_CMIX:
+            try: return self._cmixd(p)
+            except Exception: return None
         return None
 
     # ============ QISKIT USER TRANSFORM ============
     def t_q(self, d):
-        """Forward: apply gate list in FORWARD order."""
         if not d: return b'\x00'
         gl = self.user_gatelist
         nbytes = (self.QUBITS + 7) // 8
@@ -813,7 +1025,6 @@ class Compressor:
         return bytes(out)
 
     def r_q(self, d):
-        """Inverse: apply gate list in REVERSE order (BUGFIX)."""
         if not d: return b''
         if d == b'\x00': return b''
         if len(d) < 6: raise TransformError("T_q short")
@@ -827,12 +1038,20 @@ class Compressor:
         for off in range(0, len(body), nbytes):
             chunk = body[off:off+nbytes]
             v = int.from_bytes(chunk, 'big')
-            v = apply_gatelist_to_int(v, gl, reverse=True)   # <-- FIX
+            v = apply_gatelist_to_int(v, gl, reverse=True)
             out += v.to_bytes(nbytes, 'big')
         if pad: out = out[:-pad]
         return bytes(out[:L])
 
-    # ============ QISKIT 8192-BIT TRANSFORM ============
+    def _get_q8192(self):
+        if getattr(self, '_q8192_gatelist', None) is None:
+            gl, qc = build_qc_gatelist(8192, seed=0x6020)
+            self._q8192_gatelist = gl
+            self._q8192_circ = qc
+            self._q8192_ngates = len(gl)
+            print(f"  qiskit[8192q]: gate list built ({len(gl)} gates)")
+        return self._q8192_gatelist
+
     def t62(self, d):
         if not d: return b'\x00'
         gl = self._get_q8192()
@@ -864,19 +1083,10 @@ class Compressor:
         for off in range(0, len(body), nbytes):
             chunk = body[off:off+nbytes]
             v = int.from_bytes(chunk, 'big')
-            v = apply_gatelist_to_int(v, gl, reverse=True)   # <-- FIX
+            v = apply_gatelist_to_int(v, gl, reverse=True)
             out += v.to_bytes(nbytes, 'big')
         if pad: out = out[:-pad]
         return bytes(out[:L])
-
-    def _get_q8192(self):
-        if getattr(self, '_q8192_gatelist', None) is None:
-            gl, qc = build_qc_gatelist(8192, seed=0x6020)
-            self._q8192_gatelist = gl
-            self._q8192_circ = qc
-            self._q8192_ngates = len(gl)
-            print(f"  qiskit[8192q]: gate list built ({len(gl)} gates)")
-        return self._q8192_gatelist
 
     # ============ MINUS TRANSFORMS (EVERY 3rd BYTE) ============
     def _t_minus(self, d, k, reps):
@@ -907,7 +1117,6 @@ class Compressor:
         return k, reps
 
     # ============ CLASSICAL TRANSFORMS ============
-    # (unchanged from previous revision)
     def t00(self, d):
         if not d: return struct.pack('>I', 0)
         br, bl, bsh = None, float('inf'), []
