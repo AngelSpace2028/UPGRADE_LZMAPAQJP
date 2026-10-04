@@ -3,22 +3,25 @@
 """
 PPMD_1.2 — Unified PAQJP+PJP Lossless Tournament + Qiskit + cmix + Lepton
 =============================================================================
-NEW in this revision:
-  • Circle-Diameter-Dot transform (ID 61) rewritten HEADERLESS:
-      – operates on 4-byte "circles" (0 .. 2^32-1 range)
-      – symmetric "diameter" mask growing from the centre circle
-      – "dot" = middle byte of the centre circle (XOR 0x5A)
-      – every 3rd circle subtracts a 4-byte key
-      – key, mid, and mask all derive from len(d)//4 (invariant)
-      – no header at all → always 100% lossless
-  • Lepton JPEG recompression (format 14) — ~22% lossless JPEG savings.
-  • Lepton auto-install prompt (pip install lepton_jpeg_python).
-  • Lepton only activates for valid JPEG files (FF D8 magic).
-  • cmix auto-install (Level 9) retained.
-  • Bugfix retained: t_q / r_q / t62 / r62 apply gate list in REVERSE
-    order in the inverse.
+Layout:
+  1. All imports
+  2. Backend detection + auto-install prompts
+  3. User prompts (QUBITS / PAIRS)
+  4. Embedded reference corpus (Lorem ipsum)
+  5. 260,000-word A-Z built-in dictionary
+  6. 12 Google Drive dictionary download + build_dict()
+  7. ID 61 — headerless Circle-Diameter-Dot (standalone module-level block)
+  8. Constants, Qiskit helpers, LazyTransformMap
+  9. Compressor class
+       • transforms #1..#58
+       • ID 59 (word substitution)
+       • ID 61 (Circle-Diameter-Dot)  ← now defined directly after ID 59
+       • ID 60 (user Qiskit), ID 62 (8192-qubit Qiskit), #63..#256, minus IDs
+       • pairs, compress, decompress, selftest
+ 10. main()
 """
 
+# ============================ ALL IMPORTS ============================
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
 import urllib.request
@@ -579,6 +582,100 @@ def build_dict(try_dl=True):
     words = sorted(w for w in words if w and w.isascii() and 1 <= len(w) <= 64)
     print(f"\nFINAL dictionary: {len(words):,} words")
     return words
+
+# ============================================================================
+# ==================== ID 61: HEADERLESS CIRCLE-DIAMETER-DOT =================
+# ============================================================================
+# Standalone module-level block, placed AFTER the 260k A-Z dictionary and
+# AFTER the 12 Google Drive dictionary downloads (which are after the imports).
+# The Compressor class delegates to these functions from methods t_cdd/r_cdd
+# defined directly after r59 (ID 59) inside the class body.
+# ----------------------------------------------------------------------------
+
+def cdd_derive(n4):
+    """All parameters from n4 alone. Deterministic on both sides."""
+    mid = n4 // 2 if n4 else 0
+    # golden-ratio mix of n4 → 32-bit key
+    key = ((n4 * 0x9E3779B9) ^ 0xDEADBEEF) & 0xFFFFFFFF
+    return mid, key
+
+def cdd_mask(i, mid):
+    """Symmetric diameter mask for circle index i."""
+    if mid == 0:
+        return 0
+    return ((abs(i - mid) * 255) // mid) & 0xFF
+
+def cdd_forward(d):
+    """Forward Circle-Diameter-Dot transform (headerless)."""
+    if not d:
+        return b''
+    L = len(d)
+    n4 = L // 4
+    tail = bytes(d[n4 * 4:])          # 0..3 trailing bytes, untouched
+    if n4 == 0:
+        # Too short to contain a circle: identity, still lossless.
+        return bytes(d)
+    t = bytearray(d[:n4 * 4])
+    mid, key = cdd_derive(n4)
+
+    # 1. Diameter: same mask on all 4 bytes of each circle.
+    for i in range(n4):
+        m = cdd_mask(i, mid)
+        if m:
+            b = i * 4
+            t[b]     ^= m
+            t[b + 1] ^= m
+            t[b + 2] ^= m
+            t[b + 3] ^= m
+
+    # 2. Dot: flip the middle byte of the centre circle.
+    t[mid * 4 + 2] ^= 0x5A
+
+    # 3. Every 3rd circle (idx 2, 5, 8, …): subtract the derived key.
+    for i in range(2, n4, 3):
+        b = i * 4
+        v = int.from_bytes(t[b:b + 4], 'little')
+        v = (v - key) & 0xFFFFFFFF
+        t[b:b + 4] = v.to_bytes(4, 'little')
+
+    return bytes(t) + tail
+
+def cdd_inverse(d):
+    """Inverse Circle-Diameter-Dot transform (headerless)."""
+    if not d:
+        return b''
+    L = len(d)
+    n4 = L // 4
+    tail = bytes(d[n4 * 4:])
+    if n4 == 0:
+        return bytes(d)
+    t = bytearray(d[:n4 * 4])
+    mid, key = cdd_derive(n4)
+
+    # 3'. Every 3rd circle: add the derived key back.
+    for i in range(2, n4, 3):
+        b = i * 4
+        v = int.from_bytes(t[b:b + 4], 'little')
+        v = (v + key) & 0xFFFFFFFF
+        t[b:b + 4] = v.to_bytes(4, 'little')
+
+    # 2'. Undo dot.
+    t[mid * 4 + 2] ^= 0x5A
+
+    # 1'. Undo diameter mask.
+    for i in range(n4):
+        m = cdd_mask(i, mid)
+        if m:
+            b = i * 4
+            t[b]     ^= m
+            t[b + 1] ^= m
+            t[b + 2] ^= m
+            t[b + 3] ^= m
+
+    return bytes(t) + tail
+# ============================================================================
+# ==================== END ID 61 BLOCK =======================================
+# ============================================================================
 
 # ==================== CONSTANTS ====================
 PRIMES = [p for p in range(2, 256) if all(p % d != 0 for d in range(2, int(p ** 0.5) + 1))]
@@ -2186,6 +2283,18 @@ class Compressor:
                 else: raise TransformError("t59 case 3")
         return bytes(out)
 
+    # ============ ID 61 (added right after ID 59): Circle-Diameter-Dot =======
+    # Delegates to the standalone module-level cdd_forward / cdd_inverse
+    # defined after the 260k A-Z dictionary and the 12 Google Drive dicts.
+    def t_cdd(self, d):
+        """Forward Circle-Diameter-Dot (headerless) — see cdd_forward()."""
+        return cdd_forward(d)
+
+    def r_cdd(self, d):
+        """Inverse Circle-Diameter-Dot (headerless) — see cdd_inverse()."""
+        return cdd_inverse(d)
+    # ========================================================================
+
     def t57(self, d):
         if len(d) < 4:
             pad = 4 - len(d); k = 0
@@ -2368,103 +2477,6 @@ class Compressor:
         for w in words: o.extend(w.to_bytes(wbytes, 'big'))
         return bytes(o[:ol])
 
-    # ============ HEADERLESS CIRCLE-DIAMETER-DOT TRANSFORM (ID 61) ============
-    #  • Operates on 4-byte "circles" (each in 0 .. 2^32-1)
-    #  • Symmetric "diameter" mask grows from the centre circle outward.
-    #    Same mask is XORed into all four bytes of a circle.
-    #  • "Dot" = the middle byte of the centre circle, XOR 0x5A.
-    #  • Every 3rd circle subtracts a 4-byte key.
-    #  • key, mid, and mask are ALL derived from n4 = len(d)//4, which is
-    #    invariant under the transform → no header, no stored state.
-    #  • Trailing 0..3 bytes (when len(d) is not a multiple of 4) are
-    #    passed through untouched.
-    # -----------------------------------------------------------------------
-
-    @staticmethod
-    def _cdd_derive(n4):
-        """All parameters from n4 alone. Deterministic on both sides."""
-        mid = n4 // 2 if n4 else 0
-        # golden-ratio mix of n4 → 32-bit key
-        key = ((n4 * 0x9E3779B9) ^ 0xDEADBEEF) & 0xFFFFFFFF
-        return mid, key
-
-    @staticmethod
-    def _cdd_mask(i, mid):
-        """Symmetric diameter mask for circle index i."""
-        if mid == 0:
-            return 0
-        return ((abs(i - mid) * 255) // mid) & 0xFF
-
-    def t_cdd(self, d):
-        """Forward Circle-Diameter-Dot transform (headerless)."""
-        if not d:
-            return b''
-        L = len(d)
-        n4 = L // 4
-        tail = bytes(d[n4 * 4:])          # 0..3 trailing bytes, untouched
-        if n4 == 0:
-            # Too short to contain a circle: identity, still lossless.
-            return bytes(d)
-        t = bytearray(d[:n4 * 4])
-        mid, key = self._cdd_derive(n4)
-
-        # 1. Diameter: same mask on all 4 bytes of each circle.
-        for i in range(n4):
-            m = self._cdd_mask(i, mid)
-            if m:
-                b = i * 4
-                t[b]   ^= m
-                t[b + 1] ^= m
-                t[b + 2] ^= m
-                t[b + 3] ^= m
-
-        # 2. Dot: flip the middle byte of the centre circle.
-        t[mid * 4 + 2] ^= 0x5A
-
-        # 3. Every 3rd circle (idx 2, 5, 8, …): subtract the derived key.
-        for i in range(2, n4, 3):
-            b = i * 4
-            v = int.from_bytes(t[b:b + 4], 'little')
-            v = (v - key) & 0xFFFFFFFF
-            t[b:b + 4] = v.to_bytes(4, 'little')
-
-        return bytes(t) + tail
-
-    def r_cdd(self, d):
-        """Inverse Circle-Diameter-Dot transform (headerless)."""
-        if not d:
-            return b''
-        L = len(d)
-        n4 = L // 4
-        tail = bytes(d[n4 * 4:])
-        if n4 == 0:
-            return bytes(d)
-        t = bytearray(d[:n4 * 4])
-        mid, key = self._cdd_derive(n4)
-
-        # 3'. Every 3rd circle: add the derived key back.
-        for i in range(2, n4, 3):
-            b = i * 4
-            v = int.from_bytes(t[b:b + 4], 'little')
-            v = (v + key) & 0xFFFFFFFF
-            t[b:b + 4] = v.to_bytes(4, 'little')
-
-        # 2'. Undo dot.
-        t[mid * 4 + 2] ^= 0x5A
-
-        # 1'. Undo diameter mask.
-        for i in range(n4):
-            m = self._cdd_mask(i, mid)
-            if m:
-                b = i * 4
-                t[b]   ^= m
-                t[b + 1] ^= m
-                t[b + 2] ^= m
-                t[b + 3] ^= m
-
-        return bytes(t) + tail
-    # =========================================================================
-
     def t256(self, d): return d
     r256 = t256
 
@@ -2499,7 +2511,7 @@ class Compressor:
 
         eager_f[60] = self.t_q; eager_r[60] = self.r_q
 
-        # Headerless Circle-Diameter-Dot transform at ID 61
+        # ID 61 — headerless Circle-Diameter-Dot (methods sit right after r59)
         eager_f[61] = self.t_cdd; eager_r[61] = self.r_cdd
 
         for i in (62,):
@@ -2774,7 +2786,6 @@ class Compressor:
 
         # --- Headerless Circle-Diameter-Dot transform (ID 61) ---
         print("  Testing headerless Circle-Diameter-Dot transform (ID 61) ...")
-        # Include all length-mod-4 residues to exercise the trailing-byte path.
         test61 = [b"", b"\x00", b"\xff", b"\x00\x00", b"\x00\x00\x00",
                   b"hello", b"hello world", b"hello world!",
                   os.urandom(3), os.urandom(4), os.urandom(5),
