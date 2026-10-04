@@ -4,11 +4,16 @@
 PPMD_1.2 — Unified PAQJP+PJP Lossless Tournament + Qiskit + cmix + Lepton
 =============================================================================
 NEW in this revision:
-  • Added "Circle-Diameter-Dot" transform (ID 61) simulating the provided image.
+  • Circle-Diameter-Dot transform (ID 61) rewritten HEADERLESS:
+      – operates on 4-byte "circles" (0 .. 2^32-1 range)
+      – symmetric "diameter" mask growing from the centre circle
+      – "dot" = middle byte of the centre circle (XOR 0x5A)
+      – every 3rd circle subtracts a 4-byte key
+      – key, mid, and mask all derive from len(d)//4 (invariant)
+      – no header at all → always 100% lossless
   • Lepton JPEG recompression (format 14) — ~22% lossless JPEG savings.
   • Lepton auto-install prompt (pip install lepton_jpeg_python).
   • Lepton only activates for valid JPEG files (FF D8 magic).
-  • For PNG/BMP: existing generic backends handle them.
   • cmix auto-install (Level 9) retained.
   • Bugfix retained: t_q / r_q / t62 / r62 apply gate list in REVERSE
     order in the inverse.
@@ -154,15 +159,12 @@ def _install_ccmx():
 CMIX_SRC_URL = "https://github.com/byronknoll/cmix/archive/refs/tags/v21.tar.gz"
 
 def _install_cmix():
-    """Ask user y/n, download cmix v21 source, compile with make.
-    Returns (True, path) on success, (False, None) on failure."""
     global HAS_CMIX
     if HAS_CMIX:
         p = shutil.which('cmix')
         print(f"cmix: OK ({p})")
         return True, p
 
-    # ---- Ask user ----
     print("\n" + "="*70)
     print("cmix (Level 9) installation")
     print("="*70)
@@ -183,7 +185,6 @@ def _install_cmix():
     try: os.makedirs(target_dir, exist_ok=True)
     except Exception: pass
 
-    # ---- Check compiler ----
     compiler = None
     for cc in ('g++', 'clang++', 'c++'):
         if shutil.which(cc):
@@ -194,7 +195,6 @@ def _install_cmix():
         return False, None
     print(f"cmix: using compiler: {compiler}")
 
-    # ---- Download source ----
     tmp_dir = tempfile.mkdtemp(prefix="cmix_build_")
     print(f"cmix: downloading {CMIX_SRC_URL} ...")
     try:
@@ -211,7 +211,6 @@ def _install_cmix():
     with open(tar_path, 'wb') as f:
         f.write(tarball)
 
-    # ---- Extract ----
     print("cmix: extracting ...")
     try:
         import tarfile
@@ -222,7 +221,6 @@ def _install_cmix():
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return False, None
 
-    # ---- Find source dir ----
     src_dir = None
     for name in os.listdir(tmp_dir):
         p = os.path.join(tmp_dir, name)
@@ -233,7 +231,6 @@ def _install_cmix():
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return False, None
 
-    # ---- Patch makefile compiler if needed ----
     mf = os.path.join(src_dir, 'makefile')
     try:
         with open(mf, 'r') as f: mf_text = f.read()
@@ -242,7 +239,6 @@ def _install_cmix():
         print(f"cmix: patched makefile -> CC = {compiler}")
     except Exception: pass
 
-    # ---- Compile ----
     print("cmix: compiling (this takes 3–10 minutes) ...")
     try:
         r = subprocess.run(['make'], cwd=src_dir,
@@ -261,7 +257,6 @@ def _install_cmix():
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return False, None
 
-    # ---- Locate binary ----
     binary_src = None
     for candidate in ('cmix', os.path.join('src', 'cmix'),
                       os.path.join('build', 'cmix')):
@@ -273,7 +268,6 @@ def _install_cmix():
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return False, None
 
-    # ---- Install ----
     target = os.path.join(target_dir, 'cmix')
     try:
         shutil.copy2(binary_src, target)
@@ -283,7 +277,6 @@ def _install_cmix():
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return False, None
 
-    # ---- Smoke test ----
     try:
         r = subprocess.run([target], capture_output=True, timeout=10)
         ok = True
@@ -824,10 +817,8 @@ class Compressor:
 
     # ---- Lepton JPEG recompression ----
     def _leptonc(self, d):
-        """Compress JPEG bytes with Lepton. Returns None if not a valid JPEG."""
         if not HAS_LEPTON:
             return None
-        # Lepton only works on JPEG; quick magic check
         if len(d) < 2 or d[:2] != b'\xff\xd8':
             return None
         try:
@@ -844,7 +835,6 @@ class Compressor:
             return None
 
     def _leptond(self, d):
-        """Decompress Lepton payload back to original JPEG."""
         if not HAS_LEPTON:
             return None
         try:
@@ -2378,53 +2368,102 @@ class Compressor:
         for w in words: o.extend(w.to_bytes(wbytes, 'big'))
         return bytes(o[:ol])
 
-    # ============ NEW CIRCLE-DIAMETER-DOT TRANSFORM ============
+    # ============ HEADERLESS CIRCLE-DIAMETER-DOT TRANSFORM (ID 61) ============
+    #  • Operates on 4-byte "circles" (each in 0 .. 2^32-1)
+    #  • Symmetric "diameter" mask grows from the centre circle outward.
+    #    Same mask is XORed into all four bytes of a circle.
+    #  • "Dot" = the middle byte of the centre circle, XOR 0x5A.
+    #  • Every 3rd circle subtracts a 4-byte key.
+    #  • key, mid, and mask are ALL derived from n4 = len(d)//4, which is
+    #    invariant under the transform → no header, no stored state.
+    #  • Trailing 0..3 bytes (when len(d) is not a multiple of 4) are
+    #    passed through untouched.
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _cdd_derive(n4):
+        """All parameters from n4 alone. Deterministic on both sides."""
+        mid = n4 // 2 if n4 else 0
+        # golden-ratio mix of n4 → 32-bit key
+        key = ((n4 * 0x9E3779B9) ^ 0xDEADBEEF) & 0xFFFFFFFF
+        return mid, key
+
+    @staticmethod
+    def _cdd_mask(i, mid):
+        """Symmetric diameter mask for circle index i."""
+        if mid == 0:
+            return 0
+        return ((abs(i - mid) * 255) // mid) & 0xFF
+
     def t_cdd(self, d):
-        """Transform: Circle (rotate), Diameter (XOR sweep), Dot (center XOR)."""
-        if not d: return b''
+        """Forward Circle-Diameter-Dot transform (headerless)."""
+        if not d:
+            return b''
         L = len(d)
-        t = bytearray(d)
-        
-        # 1. Circle: rotate right by L // 4
-        rot = L // 4
-        if rot > 0:
-            t = t[-rot:] + t[:-rot]
-            
-        # 2. Diameter: XOR sweep from center outward
-        mid = L // 2
-        if mid > 0:
-            for i in range(L):
-                mask = (abs(i - mid) * 255) // mid
-                t[i] ^= (mask & 0xFF)
-                
-        # 3. Dot: XOR the center element with a magic constant
-        t[mid] ^= 0x5A
-        
-        return bytes(t)
+        n4 = L // 4
+        tail = bytes(d[n4 * 4:])          # 0..3 trailing bytes, untouched
+        if n4 == 0:
+            # Too short to contain a circle: identity, still lossless.
+            return bytes(d)
+        t = bytearray(d[:n4 * 4])
+        mid, key = self._cdd_derive(n4)
+
+        # 1. Diameter: same mask on all 4 bytes of each circle.
+        for i in range(n4):
+            m = self._cdd_mask(i, mid)
+            if m:
+                b = i * 4
+                t[b]   ^= m
+                t[b + 1] ^= m
+                t[b + 2] ^= m
+                t[b + 3] ^= m
+
+        # 2. Dot: flip the middle byte of the centre circle.
+        t[mid * 4 + 2] ^= 0x5A
+
+        # 3. Every 3rd circle (idx 2, 5, 8, …): subtract the derived key.
+        for i in range(2, n4, 3):
+            b = i * 4
+            v = int.from_bytes(t[b:b + 4], 'little')
+            v = (v - key) & 0xFFFFFFFF
+            t[b:b + 4] = v.to_bytes(4, 'little')
+
+        return bytes(t) + tail
 
     def r_cdd(self, d):
-        """Inverse of t_cdd."""
-        if not d: return b''
+        """Inverse Circle-Diameter-Dot transform (headerless)."""
+        if not d:
+            return b''
         L = len(d)
-        t = bytearray(d)
-        mid = L // 2
-        
-        # 3. Dot inverse
-        t[mid] ^= 0x5A
-        
-        # 2. Diameter inverse
-        if mid > 0:
-            for i in range(L):
-                mask = (abs(i - mid) * 255) // mid
-                t[i] ^= (mask & 0xFF)
-                
-        # 1. Circle inverse: rotate left by L // 4
-        rot = L // 4
-        if rot > 0:
-            t = t[rot:] + t[:rot]
-            
-        return bytes(t)
-    # ===============================================================
+        n4 = L // 4
+        tail = bytes(d[n4 * 4:])
+        if n4 == 0:
+            return bytes(d)
+        t = bytearray(d[:n4 * 4])
+        mid, key = self._cdd_derive(n4)
+
+        # 3'. Every 3rd circle: add the derived key back.
+        for i in range(2, n4, 3):
+            b = i * 4
+            v = int.from_bytes(t[b:b + 4], 'little')
+            v = (v + key) & 0xFFFFFFFF
+            t[b:b + 4] = v.to_bytes(4, 'little')
+
+        # 2'. Undo dot.
+        t[mid * 4 + 2] ^= 0x5A
+
+        # 1'. Undo diameter mask.
+        for i in range(n4):
+            m = self._cdd_mask(i, mid)
+            if m:
+                b = i * 4
+                t[b]   ^= m
+                t[b + 1] ^= m
+                t[b + 2] ^= m
+                t[b + 3] ^= m
+
+        return bytes(t) + tail
+    # =========================================================================
 
     def t256(self, d): return d
     r256 = t256
@@ -2459,10 +2498,10 @@ class Compressor:
         eager_f[59] = self.t59; eager_r[59] = self.r59
 
         eager_f[60] = self.t_q; eager_r[60] = self.r_q
-        
-        # Register the new Circle-Diameter-Dot transform at ID 61
+
+        # Headerless Circle-Diameter-Dot transform at ID 61
         eager_f[61] = self.t_cdd; eager_r[61] = self.r_cdd
-        
+
         for i in (62,):
             f, r = self._dyn(i); eager_f[i] = f; eager_r[i] = r
         for i in range(63, 256):
@@ -2475,7 +2514,7 @@ class Compressor:
         dict.update(self.rev, eager_r)
         print(f"Registered eager transforms 1-256; user qubit transform at ID 60 "
               f"({self.QUBITS} qubits, {self.user_ngates} gates); "
-              f"Circle-Diameter-Dot transform at ID 61; "
+              f"headerless Circle-Diameter-Dot transform at ID 61; "
               f"lazy minus IDs 257..{self.MINUS_MAX_ID} (stride={self.STRIDE}).")
 
     def _pairs(self):
@@ -2733,18 +2772,25 @@ class Compressor:
                 print(f"  FAIL t_q len={len(tv)} tv={tv[:8]!r} rs={rs[:8]!r}"); return False
         print(f"  User qubit transform ({self.QUBITS}q): PASS")
 
-        # --- NEW: Test Circle-Diameter-Dot transform ---
-        print("  Testing Circle-Diameter-Dot transform (ID 61) ...")
-        for tv in [b"hello world", os.urandom(64), b"\x00"*32, b"\xff"*32, b"\x00"]:
+        # --- Headerless Circle-Diameter-Dot transform (ID 61) ---
+        print("  Testing headerless Circle-Diameter-Dot transform (ID 61) ...")
+        # Include all length-mod-4 residues to exercise the trailing-byte path.
+        test61 = [b"", b"\x00", b"\xff", b"\x00\x00", b"\x00\x00\x00",
+                  b"hello", b"hello world", b"hello world!",
+                  os.urandom(3), os.urandom(4), os.urandom(5),
+                  os.urandom(7), os.urandom(8), os.urandom(9),
+                  os.urandom(64), os.urandom(1000),
+                  b"\x00"*31, b"\x00"*32, b"\x00"*33,
+                  b"\xff"*32, b"\xff"*33, bytes(range(256))]
+        for tv in test61:
             tr = self.t_cdd(tv); rs = self.r_cdd(tr)
             if rs != tv:
                 print(f"  FAIL t_cdd len={len(tv)} tv={tv[:8]!r} rs={rs[:8]!r}"); return False
-        print("  Circle-Diameter-Dot transform: PASS")
-        # ----------------------------------------------
+        print("  Headerless Circle-Diameter-Dot transform: PASS")
+        # ---------------------------------------------------------
 
         print("  Testing Lepton JPEG round-trip (if available) ...")
         if HAS_LEPTON:
-            # Build a minimal valid JPEG via PIL if available
             try:
                 from PIL import Image
                 import io
