@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # PPMD_1.2 — Lossless Tournament + Qiskit + cmix + Lepton + XML/DOCX
+# v1.3-fast : parallel singles/pairs + fast unverified cback in tournament
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -260,6 +261,40 @@ print(f"\nBackends: zstd={'Y' if HAS_ZSTD else 'N'} lzma={'Y' if HAS_LZMA else '
       f"lepton={'Y' if HAS_LEPTON else 'N'} qiskit={'Y' if HAS_QISKIT else 'N'} "
       f"xml=Y lxml={'Y' if HAS_LXML else 'N'} defusedxml={'Y' if HAS_DEFUSEDXML else 'N'}")
 PROGNAME = "PPMD_1.2"
+
+_G = {}
+
+def _set_worker_globals(comp, data):
+    _G['c'] = comp
+    _G['data'] = data
+
+def _mp_eval_batch(batch):
+    c = _G.get('c'); data = _G.get('data')
+    if c is None or data is None:
+        return [(idx, ext, None, None) for idx, ext, _ in batch]
+    out = []
+    cache = {}
+    for idx, ext, seq in batch:
+        try:
+            if len(seq) == 1:
+                t = seq[0]
+                tr = c.fwd[t](data)
+            elif len(seq) == 2:
+                a, b = seq
+                ta = cache.get(a)
+                if ta is None:
+                    ta = c.fwd[a](data)
+                    cache[a] = ta
+                tr = c.fwd[b](ta)
+            else:
+                tr = data
+                for t in seq:
+                    tr = c.fwd[t](tr)
+            payload = c.cback_fast(tr)
+            out.append((idx, ext, payload, len(payload)))
+        except Exception:
+            out.append((idx, ext, None, None))
+    return out
 
 REF_TEXT = (
     "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. "
@@ -631,6 +666,11 @@ class Compressor:
         self.rep = 100
         self.mst = [[(v-400) & 0xFF for v in r] for r in PAQ]
         self.mask46 = [(b-10) & 0xFF for b in [1,2,4,8,16,32,64,128,3,6]] * 10
+
+        self._path_cmix = shutil.which('cmix')
+        self._path_zpaq = shutil.which('zpaq')
+        self._path_ccmx = shutil.which('ccmx')
+
         self._build_ref_dict(); self._build_user_circuit(); self._maps(); self._pairs()
 
     def _build_user_circuit(self):
@@ -694,9 +734,8 @@ class Compressor:
         except Exception: return None
 
     def _cmixc(self, d):
-        if not HAS_CMIX: return None
-        cmix = shutil.which('cmix')
-        if not cmix: return None
+        if not HAS_CMIX or not self._path_cmix: return None
+        cmix = self._path_cmix
         with tempfile.TemporaryDirectory() as td:
             inp = os.path.join(td, 'i'); out = os.path.join(td, 'o.cmix')
             with open(inp, 'wb') as f: f.write(d)
@@ -708,9 +747,8 @@ class Compressor:
                 except Exception: pass
         return None
     def _cmixd(self, d):
-        if not HAS_CMIX: return None
-        cmix = shutil.which('cmix')
-        if not cmix: return None
+        if not HAS_CMIX or not self._path_cmix: return None
+        cmix = self._path_cmix
         with tempfile.TemporaryDirectory() as td:
             inp = os.path.join(td, 'i.cmix'); out = os.path.join(td, 'o')
             with open(inp, 'wb') as f: f.write(d)
@@ -721,33 +759,36 @@ class Compressor:
             except Exception: pass
         return None
     def _zpc(self, d):
-        if not HAS_ZPAQ: return None
+        if not HAS_ZPAQ or not self._path_zpaq: return None
         with tempfile.TemporaryDirectory() as td:
             inp = os.path.join(td, 'i'); arc = os.path.join(td, 'a.zpaq')
             with open(inp, 'wb') as f: f.write(d)
             try:
-                r = subprocess.run(['zpaq','a',arc,inp,'-m5'], capture_output=True, timeout=300)
+                r = subprocess.run([self._path_zpaq,'a',arc,inp,'-m5'], capture_output=True, timeout=300)
                 if r.returncode != 0: return None
                 with open(arc, 'rb') as f: return f.read()
             except Exception: return None
     def _zpd(self, d):
-        if not HAS_ZPAQ: return None
+        if not HAS_ZPAQ or not self._path_zpaq: return None
         with tempfile.TemporaryDirectory() as td:
             arc = os.path.join(td, 'a.zpaq'); od = os.path.join(td, 'o'); os.makedirs(od)
             with open(arc, 'wb') as f: f.write(d)
             try:
-                r = subprocess.run(['zpaq','x',arc,'-to',od], capture_output=True, timeout=300)
+                r = subprocess.run([self._path_zpaq,'x',arc,'-to',od], capture_output=True, timeout=300)
                 if r.returncode != 0: return None
                 for n in os.listdir(od):
                     with open(os.path.join(od, n), 'rb') as f: return f.read()
             except Exception: return None
         return None
     def _ccmxc(self, d):
-        if not HAS_CCMX: return None
+        if not HAS_CCMX or not self._path_ccmx: return None
+        ccmx = self._path_ccmx
         with tempfile.TemporaryDirectory() as td:
             inp = os.path.join(td, 'i'); out = os.path.join(td, 'o.ccmx')
             with open(inp, 'wb') as f: f.write(d)
-            for args in (['ccmx', 'c', inp, out, '256'], ['ccmx', 'c', inp, out, '1024'], ['ccmx', 'c', inp, out], ['ccmx', '-c', inp, out], ['ccmx', 'c', inp], ['ccmx', inp]):
+            for args in ([ccmx, 'c', inp, out, '256'], [ccmx, 'c', inp, out, '1024'],
+                         [ccmx, 'c', inp, out], [ccmx, '-c', inp, out],
+                         [ccmx, 'c', inp], [ccmx, inp]):
                 try:
                     r = subprocess.run(args, capture_output=True, timeout=600)
                     if r.returncode != 0: continue
@@ -757,11 +798,13 @@ class Compressor:
                 except Exception: continue
         return None
     def _ccmxd(self, d):
-        if not HAS_CCMX: return None
+        if not HAS_CCMX or not self._path_ccmx: return None
+        ccmx = self._path_ccmx
         with tempfile.TemporaryDirectory() as td:
             inp = os.path.join(td, 'i.ccmx'); out = os.path.join(td, 'o')
             with open(inp, 'wb') as f: f.write(d)
-            for args in (['ccmx', 'd', inp, out], ['ccmx', '-d', inp, out], ['ccmx', 'd', inp], ['ccmx', 'x', inp]):
+            for args in ([ccmx, 'd', inp, out], [ccmx, '-d', inp, out],
+                         [ccmx, 'd', inp], [ccmx, 'x', inp]):
                 try:
                     r = subprocess.run(args, capture_output=True, timeout=600)
                     if r.returncode != 0: continue
@@ -828,6 +871,63 @@ class Compressor:
                 if self.dback(blob) == d: return blob
             except Exception: continue
         return bytes([0]) + d
+
+    def cback_fast(self, d):
+        cs = [(0, d)]
+        if HAS_ZSTD:
+            try:
+                c = zc.compress(d)
+                if len(c) >= 4 and c[:4] == b'\x28\xb5\x2f\xfd': c = c[4:]
+                cs.append((1, c))
+            except Exception: pass
+            if self._zc_dict is not None:
+                try:
+                    c = self._zc_dict.compress(d)
+                    if len(c) >= 4 and c[:4] == b'\x28\xb5\x2f\xfd': c = c[4:]
+                    cs.append((11, c))
+                except Exception: pass
+        if paq:
+            try:
+                pd = paq.compress(d)
+                if len(pd) >= 7 and pd[:4] == b'\x00\x63\x00\x00' and pd[-3:] == b'\xff\xff\xff': cs.append((3, pd[4:-3]))
+                else: cs.append((2, pd))
+            except Exception: pass
+        if HAS_BROTLI:
+            try: cs.append((4, brotli.compress(d, quality=11)))
+            except Exception: pass
+        if HAS_LZMA:
+            for fmt, kw in ((5, {"preset": 9 | lzma.PRESET_EXTREME}),
+                            (6, {"format": lzma.FORMAT_RAW, "filters": LF_RAW}),
+                            (7, {"format": lzma.FORMAT_RAW, "filters": LF_DELTA}),
+                            (9, {"format": lzma.FORMAT_RAW, "filters": LF_BCJ})):
+                try: cs.append((fmt, lzma.compress(d, **kw)))
+                except Exception: pass
+        if HAS_PPMD:
+            try: cs.append((8, pyppmd.compress(d, max_order=16, mem_size=256<<20)))
+            except Exception: pass
+        if HAS_ZPAQ:
+            try:
+                c = self._zpc(d)
+                if c: cs.append((10, c))
+            except Exception: pass
+        if HAS_CCMX:
+            try:
+                c = self._ccmxc(d)
+                if c: cs.append((12, c))
+            except Exception: pass
+        if HAS_CMIX:
+            try:
+                c = self._cmixc(d)
+                if c: cs.append((13, c))
+            except Exception: pass
+        if HAS_LEPTON:
+            try:
+                c = self._leptonc(d)
+                if c: cs.append((14, c))
+            except Exception: pass
+        fmt, comp = min(cs, key=lambda x: len(x[1]))
+        if fmt == 0: return bytes([0]) + comp
+        return bytes([fmt]) + comp
 
     def dback(self, d):
         if not d: return None
@@ -1797,6 +1897,7 @@ class Compressor:
             if isinstance(n, int): L[n] = d
             else: tr(n[0], d+1); tr(n[1], d+1)
         tr(hp[0][2], 0); return L
+
     @staticmethod
     def _hcc(L):
         sy = sorted(range(len(L)), key=lambda s: (L[s], s))
@@ -1808,6 +1909,7 @@ class Compressor:
             elif cl != pl: co <<= (cl-pl); pl = cl
             c[s] = (co, cl); co += 1
         return c
+
     def t45(self, d):
         if not d: return b''
         freq = [0]*256
@@ -2170,43 +2272,119 @@ class Compressor:
         print(f"\nInput: {len(data)} bytes"); print("="*64)
         print(f"Qubits       : {self.QUBITS:,}")
         print(f"Target pairs : {self.PAIRS}")
-        cands = []; st = time.time()
-        rc = self._mr() + self.cback(data)
-        cands.append(("_raw_", rc, "raw payload")); best = len(rc)
+        st = time.time()
+
+        cands = []
+        rc = self._mr() + self.cback_fast(data)
+        cands.append(("_raw_", rc, "raw payload"))
+        best = len(rc)
         print(f"  [raw] size={len(rc)} bytes  best={best}")
+
+        tp = len(self.pairs)
+        pair_cap = min(self.PAIRS, tp) if tp > 0 else 0
+
+        single_tasks = []
         for t in range(1, 257):
-            if timeout and time.time()-st > timeout: print("  Time limit reached (singles)"); break
+            single_tasks.append([(t - 1, f".a{t}", (t,))])
+
+        pair_tasks = []
+        if pair_cap > 0:
+            cur_a = None; cur = []; base = 256
+            for i in range(pair_cap):
+                a, b = self.pairs[i % tp]
+                if a != cur_a:
+                    if cur: pair_tasks.append(cur)
+                    cur = []; cur_a = a
+                cur.append((base + i, f".p{i+1}", (a, b)))
+            if cur: pair_tasks.append(cur)
+
+        all_tasks = single_tasks + pair_tasks
+        n_single = len(single_tasks)
+        n_pair   = len(pair_tasks)
+        print(f"  tasks: {n_single} singles + {n_pair} pair-batches "
+              f"({pair_cap} pairs capped at {tp} distinct)")
+
+        results = []
+        mp_ok = False
+        n_procs = 1
+        pool = None
+        try:
+            n_procs = mp.cpu_count()
+            if n_procs > 1:
+                _set_worker_globals(self, data)
+                pool = mp.Pool(processes=n_procs)
+                mp_ok = True
+        except Exception:
+            mp_ok = False
+
+        try:
+            if mp_ok:
+                print(f"  parallel: {n_procs} processes")
+                done = 0
+                total_tasks = len(all_tasks)
+                with pool as p:
+                    for batch_res in p.imap_unordered(_mp_eval_batch, all_tasks, chunksize=1):
+                        for idx, ext, payload, size in batch_res:
+                            results.append((idx, ext, payload, size))
+                            if payload is not None and size < best:
+                                best = size
+                                print(f"  [{ext}] size={size} bytes  <<< BEST {best}")
+                        done += 1
+                        if done % 32 == 0:
+                            print(f"  progress: {done}/{total_tasks} batches, best={best}")
+            else:
+                print("  serial fallback")
+                for batch in all_tasks:
+                    for idx, ext, payload, size in _mp_eval_batch(batch):
+                        results.append((idx, ext, payload, size))
+                        if payload is not None and size < best:
+                            best = size
+                            print(f"  [{ext}] size={size} bytes  <<< BEST {best}")
+        except Exception as e:
+            print(f"  pool error ({e}); finishing serially")
             try:
-                tr = self.fwd[t](data); p = self.cback(tr)
-                cands.append((f".a{t}", p, f"single #{t}")); size = len(p)
-                if size < best:
-                    best = size
-                    print(f"  [single {t:>3}/256] size={size} bytes  <<< BEST {best}")
-            except Exception as e: print(f"  [single {t:>3}/256] FAILED ({e})")
-        pair_count = self.PAIRS
-        print(f"  pairs: up to {pair_count} (manual counter)")
-        i = 0; tp = len(self.pairs)
-        while i < pair_count:
-            if timeout and time.time()-st > timeout: print(f"  Time limit reached at pair {i}/{pair_count}"); break
-            if tp > 0 and i >= tp: a, b = self.pairs[i % tp]
-            else: a, b = self.pairs[i]
-            try:
-                tr = self.fwd[b](self.fwd[a](data)); p = self.cback(tr)
-                cands.append((f".p{i+1}", p, f"pair #{i+1} (#{a}->#{b})")); size = len(p)
-                if size < best:
-                    best = size
-                    print(f"  [pair {i+1:>10} #{a:>3}->#{b:>3}] size={size}  <<< BEST {best}")
-                elif i < 500 or (i+1) % 10000 == 0:
-                    print(f"  [pair {i+1:>10} #{a:>3}->#{b:>3}] size={size}  best={best}")
-            except Exception as e:
-                if i < 500: print(f"  [pair {i+1}] FAILED ({e})")
-            i += 1
-        print(f"  pairs done: {i} of {pair_count}  best={best} bytes")
-        if not cands: print("Nothing to write"); return
-        ranked = sorted(cands, key=lambda x: len(x[1])); winner = None
+                if pool is not None:
+                    try: pool.terminate()
+                    except Exception: pass
+            except Exception: pass
+            have = {r[0] for r in results}
+            for batch in all_tasks:
+                if all(entry[0] in have for entry in batch): continue
+                for idx, ext, payload, size in _mp_eval_batch(batch):
+                    if idx in have: continue
+                    results.append((idx, ext, payload, size))
+                    if payload is not None and size < best:
+                        best = size
+
+        results.sort(key=lambda r: r[0])
+        for idx, ext, payload, size in results:
+            if payload is None: continue
+            cands.append((ext, payload, ""))
+
+        n_c = len(cands)
+        for k in range(1, n_c):
+            ext = cands[k][0]
+            if ext.startswith(".a"):
+                try: tn = int(ext[2:]); cands[k] = (ext, cands[k][1], f"single #{tn}")
+                except Exception: pass
+            elif ext.startswith(".p"):
+                try:
+                    pi = int(ext[2:]) - 1
+                    a, b = self.pairs[pi % tp] if tp > 0 else (0, 0)
+                    cands[k] = (ext, cands[k][1], f"pair #{pi+1} (#{a}->#{b})")
+                except Exception: pass
+
+        print(f"  evaluated {len(cands)} candidates  best={best} bytes")
+
+        if not cands:
+            print("Nothing to write"); return
+
+        ranked = sorted(cands, key=lambda x: len(x[1]))
+        winner = None
         for ext, payload, label in ranked:
             try:
-                if ext == "_raw_": chk, _ = self._auto(payload)
+                if ext == "_raw_":
+                    chk, _ = self._auto(payload)
                 elif ext.startswith(".p"):
                     idx = int(ext[2:]) - 1
                     if tp > 0 and idx >= tp: a, b = self.pairs[idx % tp]
@@ -2218,13 +2396,20 @@ class Compressor:
                     tn = int(ext[2:]); r = self.dback(payload)
                     if r is None: continue
                     chk = self.rev[tn](r)
-                else: continue
-                if chk == data: winner = (ext, payload, label); break
-            except Exception: continue
+                else:
+                    continue
+                if chk == data:
+                    winner = (ext, payload, label); break
+            except Exception:
+                continue
+
         if winner is None:
             print("  No candidate passed verify; raw fallback")
-            ext = "_raw_"; payload = self._mr() + self.cback(data); label = "raw fallback"
-        else: ext, payload, label = winner
+            ext = "_raw_"; payload = self._mr() + self.cback(data)
+            label = "raw fallback"
+        else:
+            ext, payload, label = winner
+
         out_dir = os.path.dirname(infile) or '.'
         if os.path.isdir(out_dir):
             for f in os.listdir(out_dir):
@@ -2232,7 +2417,9 @@ class Compressor:
                 if re.match(rf'^{re.escape(os.path.basename(infile))}\.[ap][\d-]+$', f):
                     try: os.remove(fp)
                     except Exception: pass
-        out = infile + ext; self._write(out, payload)
+
+        out = infile + ext
+        self._write(out, payload)
         print("\n" + "="*64)
         print(f"WINNER: {out}")
         print(f"  Method : {label}")
