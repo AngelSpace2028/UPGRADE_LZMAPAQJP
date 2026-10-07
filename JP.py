@@ -2450,7 +2450,7 @@ def main():
             if raw == "": continue
             try:
                 v = int(raw)
-                if not (1 <= v <= PAIR_LIMIT): print("Must be 1 .. 2^1,000,000."); continue
+                if not (1 <= v <= PAIR_LIMIT): print("Must be 1 .. 65535."); continue
                 c.PAIRS = v; print(f"PAIRS = {c.PAIRS}")
             except Exception: print("Invalid")
         elif ch == "0": break
