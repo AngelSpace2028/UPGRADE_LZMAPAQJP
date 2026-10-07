@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # PPMD_1.2 — Lossless Tournament + Qiskit + cmix + Lepton + XML/DOCX
+# NOTE: minus transforms (IDs 257+) removed. Only eager transforms 1..256 remain.
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -603,23 +604,11 @@ def apply_gatelist_to_int(v, gate_list, reverse=False):
             if ((v >> a) & 1) != ((v >> b) & 1): v ^= (1 << a) | (1 << b)
     return v
 
-class LazyTransformMap(dict):
-    def __init__(self, owner, reverse=False):
-        super().__init__(); self._owner = owner; self._reverse = reverse
-    def __missing__(self, key):
-        if not isinstance(key, int): raise KeyError(key)
-        if 257 <= key <= self._owner.MINUS_MAX_ID:
-            k, reps = self._owner.minus_params(key)
-            if self._reverse: fn = (lambda d, _k=k, _r=reps: self._owner._r_minus(d, _k, _r))
-            else: fn = (lambda d, _k=k, _r=reps: self._owner._t_minus(d, _k, _r))
-            self[key] = fn; return fn
-        raise KeyError(key)
-
 class Compressor:
     TIMEOUT = 300; VS = False; USE_MP = True
     TOP_K = 100; FAST = True; BLOCK = 4096
     MAX_TRANSFORM = 256; PROGRESS_EVERY = 500; STRIDE = 3
-    MINUS_MAX_ID = 16777472
+    MAX_EAGER_ID = 256
 
     def __init__(self, try_dl=True, qubits=8, pairs=65535):
         self.QUBITS = qubits; self.PAIRS = pairs
@@ -955,28 +944,6 @@ class Compressor:
             except TransformError: return body
         if mode == 3: return body
         raise TransformError(f"t_xml mode {mode}")
-
-    def _t_minus(self, d, k, reps):
-        if not d: return b''
-        total = (k * reps) & 0xFF
-        if total == 0: return bytes(d)
-        t = bytearray(d); S = self.STRIDE
-        for i in range(0, len(t), S): t[i] = (t[i] - total) & 0xFF
-        return bytes(t)
-    def _r_minus(self, d, k, reps):
-        if not d: return b''
-        total = (k * reps) & 0xFF
-        if total == 0: return bytes(d)
-        t = bytearray(d); S = self.STRIDE
-        for i in range(0, len(t), S): t[i] = (t[i] + total) & 0xFF
-        return bytes(t)
-    @staticmethod
-    def minus_params(t):
-        n = t - 257
-        if n < 0: n = 0
-        k = n % 256; reps = (n // 256) + 1
-        if reps > 65536: reps = 65536
-        return k, reps
 
     def t00(self, d):
         if not d: return struct.pack('>I', 0)
@@ -2103,14 +2070,13 @@ class Compressor:
         for i in range(64, 256):
             f, r = self._dyn(i); eager_f[i] = f; eager_r[i] = r
         eager_f[256] = self.t256; eager_r[256] = self.r256
-        self.fwd = LazyTransformMap(self, reverse=False)
-        self.rev = LazyTransformMap(self, reverse=True)
-        dict.update(self.fwd, eager_f); dict.update(self.rev, eager_r)
+        self.fwd = eager_f
+        self.rev = eager_r
         print(f"Registered eager transforms 1-256; user qubit transform at ID 60 "
               f"({self.QUBITS} qubits, {self.user_ngates} gates); "
               f"headerless Circle-Diameter-Dot at ID 61; "
-              f"8192-qubit Qiskit at ID 62; XML/DOCX/DOC tokenizer at ID 63; "
-              f"lazy minus IDs 257..{self.MINUS_MAX_ID} (stride={self.STRIDE}).")
+              f"8192-qubit Qiskit at ID 62; XML/DOCX/DOC tokenizer at ID 63. "
+              f"Minus transforms disabled.")
 
     def _pairs(self):
         self.pairs = []
@@ -2263,7 +2229,8 @@ class Compressor:
         m = re.search(r'\.a(\d+)$', infile, re.IGNORECASE)
         if m:
             tn = int(m.group(1))
-            if not (1 <= tn <= self.MINUS_MAX_ID): print(f"Error: transform out of range: {tn}"); return False
+            if not (1 <= tn <= self.MAX_EAGER_ID):
+                print(f"Error: transform out of range (must be 1..256): {tn}"); return False
             try: r = self.dback(blob)
             except Exception as e: print(f"Error: backend failed: {e}"); return False
             if r is None: print("Error: backend could not decode payload."); return False
@@ -2357,13 +2324,6 @@ class Compressor:
                 else: print("  Lepton JPEG round-trip: SKIP")
             except ImportError: print("  Lepton JPEG round-trip: SKIP (PIL not installed)")
         else: print("  Lepton JPEG round-trip: SKIP (lepton not installed)")
-        print("  Testing minus transforms (sampled) ...")
-        sample = [257, 258, 512, 513, 767, 768, 1023, 1024, 1000000, 10000000, 16777270, 16777472]
-        for t in sample:
-            for tv in [b"hello world", os.urandom(64), b"\x00"*32, b"\xff"*32]:
-                tr = self.fwd[t](tv); rs = self.rev[t](tr)
-                if rs != tv: print(f"  FAIL minus t={t}"); return False
-        print("  Minus transforms (sampled): PASS")
         pair_data = b"The quick brown fox jumped over."; n_ok = 0
         for i in range(min(1000, len(self.pairs))):
             a, b = self.pairs[i]
@@ -2395,7 +2355,7 @@ def main():
         print("3) Lossless self-test")
         print("4) Compress + multi-pair chains")
         print("5) Set TOP_K ({})".format(c.TOP_K))
-        print(f"6) Set MAX_TRANSFORM (now {c.MAX_TRANSFORM})")
+        print(f"6) Set MAX_TRANSFORM (now {c.MAX_TRANSFORM}, max 256)")
         print(f"7) Set STRIDE (now {c.STRIDE})")
         print(f"8) Set QUBITS (now {c.QUBITS:,})")
         print(f"9) Set PAIRS (now {c.PAIRS})")
@@ -2423,7 +2383,8 @@ def main():
             if raw == "": continue
             try:
                 v = int(raw)
-                if not (1 <= v <= Compressor.MINUS_MAX_ID): print(f"Must be 1..{Compressor.MINUS_MAX_ID}."); continue
+                if not (1 <= v <= Compressor.MAX_EAGER_ID):
+                    print(f"Must be 1..{Compressor.MAX_EAGER_ID} (minus transforms disabled)."); continue
                 c.MAX_TRANSFORM = v; print(f"MAX_TRANSFORM = {c.MAX_TRANSFORM}")
             except Exception: print("Invalid")
         elif ch == "7":
@@ -2451,7 +2412,7 @@ def main():
             try:
                 v = int(raw)
                 if not (1 <= v <= PAIR_LIMIT): print("Must be 1 .. 65535."); continue
-                c.PAIRS = v; print(f"PAIRS = {c.PAIRS}")
+                c.PAIRS = v; print(f"PAIRS = {v}")
             except Exception: print("Invalid")
         elif ch == "0": break
         else: print("Invalid")
