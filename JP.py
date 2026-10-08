@@ -221,8 +221,8 @@ if not HAS_LEPTON:
             try: import lepton_jpeg_python; HAS_LEPTON = True; print("lepton_jpeg_python: OK")
             except ImportError: print("lepton_jpeg_python: install failed")
 
-QUBIT_LIMIT = 1_000_000
-PAIR_LIMIT = 2 ** 1_000_000
+QUBIT_LIMIT = 4096
+PAIR_LIMIT = 2 ** 4096
 
 def ask_qubits():
     print("\n" + "="*70); print(f"Qubit count  (1 .. {QUBIT_LIMIT:,})"); print("="*70)
@@ -236,14 +236,14 @@ def ask_qubits():
         except ValueError: print("  Please enter a whole number.")
 
 def ask_pairs():
-    print("\n" + "="*70); print("Pair count  (1 .. 2^1,000,000)"); print("="*70)
+    print("\n" + "="*70); print("Pair count  (1 .. 2^4096)"); print("="*70)
     while True:
         raw = input("Pairs [65535]: ").strip()
         if raw == "": return 65535
         try:
             v = int(raw)
             if v < 1: print("  Must be at least 1."); continue
-            if v > PAIR_LIMIT: print("  Must not exceed 2^1,000,000."); continue
+            if v > PAIR_LIMIT: print("  Must not exceed 2^4096."); continue
             return v
         except ValueError: print("  Please enter a whole number.")
 
@@ -2450,7 +2450,7 @@ def main():
             if raw == "": continue
             try:
                 v = int(raw)
-                if not (1 <= v <= PAIR_LIMIT): print("Must be 1 .. 2^1,000,000."); continue
+                if not (1 <= v <= PAIR_LIMIT): print("Must be 1 .. 2^4096."); continue
                 c.PAIRS = v; print(f"PAIRS = {c.PAIRS}")
             except Exception: print("Invalid")
         elif ch == "0": break
