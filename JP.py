@@ -221,7 +221,7 @@ if not HAS_LEPTON:
             try: import lepton_jpeg_python; HAS_LEPTON = True; print("lepton_jpeg_python: OK")
             except ImportError: print("lepton_jpeg_python: install failed")
 
-QUBIT_LIMIT = 4096
+QUBIT_LIMIT = 4097
 PAIR_LIMIT = 2 ** 4096
 
 def ask_qubits():
