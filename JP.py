@@ -2984,96 +2984,26 @@ def main():
         print("1) Compress (lossless tournament)")
         print("2) Decompress")
         print("3) Lossless self-test")
-        print("4) Compress + multi-pair chains")
-        print("5) Set TOP_K ({})".format(c.TOP_K))
-        print(f"6) Set MAX_TRANSFORM (now {c.MAX_TRANSFORM}, max 256)")
-        print(f"7) Set STRIDE (now {c.STRIDE})")
-        print(f"8) Set QUBITS (now {c.QUBITS:,})")
-        print(f"9) Set PAIRS (now {c.PAIRS})")
-        print(f"c) Set PPMD_CORES workers (now {N_CORES}, restart required)")
-        print(f"r) Set PPMD_REPEATS runs (now {REPEATS}, restart required)")
-        print(f"k) Set PPMD_CHUNK (now {CHUNK}, restart required)")
-        print("0) Exit")
         ch = input("> ").strip()
         if ch == "1":
             f = input("Input file: ").strip()
-            if not f: print("No file given."); continue
+            if not f:
+                print("No file given.")
+                continue
             c.compress(f, pairs=True, multi=False)
+            print("\nCompression finished — exiting.")
+            return
         elif ch == "2":
             f = input("Compressed: ").strip()
-            if not f: print("No file given."); continue
+            if not f:
+                print("No file given.")
+                continue
             o = input("Output (blank=auto): ").strip()
             c.decompress(f, o)
-        elif ch == "3": c.selftest()
-        elif ch == "4":
-            f = input("Input file: ").strip()
-            if not f: print("No file given."); continue
-            c.compress(f, pairs=True, multi=True)
-        elif ch == "5":
-            try: c.TOP_K = max(1, int(input("New TOP_K: ").strip())); print(f"TOP_K = {c.TOP_K}")
-            except Exception: print("Invalid")
-        elif ch == "6":
-            raw = input(f"New MAX_TRANSFORM [{c.MAX_TRANSFORM}]: ").strip()
-            if raw == "": continue
-            try:
-                v = int(raw)
-                if not (1 <= v <= Compressor.MAX_EAGER_ID):
-                    print(f"Must be 1..{Compressor.MAX_EAGER_ID} (minus transforms disabled)."); continue
-                c.MAX_TRANSFORM = v; print(f"MAX_TRANSFORM = {c.MAX_TRANSFORM}")
-            except Exception: print("Invalid")
-        elif ch == "7":
-            raw = input(f"New STRIDE [{c.STRIDE}]: ").strip()
-            if raw == "": continue
-            try:
-                v = int(raw)
-                if not (1 <= v <= 4096): print("Must be 1..4096."); continue
-                c.STRIDE = v; print(f"STRIDE = {c.STRIDE}")
-            except Exception: print("Invalid")
-        elif ch == "8":
-            print(f"Range: 1 .. {QUBIT_LIMIT:,}")
-            raw = input(f"New QUBITS [{c.QUBITS:,}]: ").strip()
-            if raw == "": continue
-            try:
-                v = int(raw)
-                if not (1 <= v <= QUBIT_LIMIT): print(f"Must be 1..{QUBIT_LIMIT:,}."); continue
-                c.QUBITS = v; c._build_user_circuit()
-                c.fwd[60] = c.t_q; c.rev[60] = c.r_q
-                print(f"QUBITS = {c.QUBITS:,}")
-            except Exception: print("Invalid")
-        elif ch == "9":
-            raw = input(f"New PAIRS [{c.PAIRS}]: ").strip()
-            if raw == "": continue
-            try:
-                v = int(raw)
-                if not (1 <= v <= PAIR_LIMIT): print("Must be 1 .. 65535."); continue
-                c.PAIRS = v; print(f"PAIRS = {v}")
-            except Exception: print("Invalid")
-        elif ch == "c":
-            raw = input(f"PPMD_CORES [{N_CORES}] (restart needed to apply): ").strip()
-            if not raw: continue
-            try:
-                v = int(raw)
-                if v < 1: print("Must be >= 1."); continue
-                print(f"Set PPMD_CORES={v} in your environment and restart.")
-            except Exception: print("Invalid")
-        elif ch == "r":
-            raw = input(f"PPMD_REPEATS [{REPEATS}] (restart needed to apply): ").strip()
-            if not raw: continue
-            try:
-                v = int(raw)
-                if v < 1: print("Must be >= 1."); continue
-                print(f"Set PPMD_REPEATS={v} in your environment and restart.")
-            except Exception: print("Invalid")
-        elif ch == "k":
-            raw = input(f"PPMD_CHUNK [{CHUNK}] (restart needed to apply): ").strip()
-            if not raw: continue
-            try:
-                v = int(raw)
-                if v < 1: print("Must be >= 1."); continue
-                print(f"Set PPMD_CHUNK={v} in your environment and restart.")
-            except Exception: print("Invalid")
-        elif ch == "0": break
-        else: print("Invalid")
+        elif ch == "3":
+            c.selftest()
+        else:
+            print("Invalid")
 
 if __name__ == "__main__":
     main()
