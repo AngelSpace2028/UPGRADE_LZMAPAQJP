@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# PPMD_1.2 — Lossless Tournament + cmix + Lepton + XML/DOCX
+# PPMD_1.2 — Lossless Tournament + cmix + Lepton + XML/DOCX + Qiskit
 # DETERMINISTIC tournament, identical winner on any core count.
-# SPEED: IPC-lite (workers return sizes only) + cback memoized + parallel backends
-#        + C-level XOR + identity-pair skip + no thread oversubscription
-#        + cached byte-translate tables + closed-form parity folds (output-identical)
-#        + bytes-as-cache-key + Huffman shift-accumulator + precomputed ref bytes
-#        + fast fsync-free writes + varint fast paths
-#        + C-level XML null-escape + finditer tokenizer.
+# QISKIT: 16-qubit circuit → SHA-256 → deterministic permutation & byte mask.
+#         Only imports `qiskit` and `QuantumCircuit`.  No quantum_info,
+#         no Statevector, no Operator, no registers.
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -17,6 +14,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import xml, xml.etree.ElementTree as ET, xml.sax.saxutils as saxutils
 import zipfile, io
+
 try: import lxml.etree as _lxml_etree; HAS_LXML = True
 except ImportError: _lxml_etree = None; HAS_LXML = False
 try: import defusedxml.ElementTree as _defused_etree; HAS_DEFUSEDXML = True
@@ -29,6 +27,20 @@ try: import pyppmd; HAS_PPMD = True
 except ImportError: pyppmd = None; HAS_PPMD = False
 try: import lepton_jpeg_python; HAS_LEPTON = True
 except ImportError: lepton_jpeg_python = None; HAS_LEPTON = False
+
+# ─────────────── QISKIT — ONLY QuantumCircuit ───────────────
+try:
+    import qiskit
+    from qiskit import QuantumCircuit
+    HAS_QISKIT = True
+    QISKIT_VER = getattr(qiskit, "__version__", "?")
+except ImportError:
+    qiskit = None
+    QuantumCircuit = None
+    HAS_QISKIT = False
+    QISKIT_VER = None
+# ─────────────────────────────────────────────────────────────
+
 try:
     import lzma; HAS_LZMA = True
     LF_RAW = [{"id": lzma.FILTER_LZMA2, "preset": 9 | lzma.PRESET_EXTREME, "nice_len": 273, "mf": lzma.MF_BT4}]
@@ -36,6 +48,7 @@ try:
     LF_BCJ = [{"id": lzma.FILTER_X86}, LF_RAW[0]]
 except ImportError:
     lzma = None; HAS_LZMA = False; LF_RAW = LF_DELTA = LF_BCJ = None
+
 HAS_ZPAQ = shutil.which('zpaq') is not None
 HAS_CCMX = shutil.which('ccmx') is not None
 HAS_CMIX = shutil.which('cmix') is not None
@@ -276,22 +289,190 @@ if not HAS_LEPTON:
             try: import lepton_jpeg_python; HAS_LEPTON = True; print("lepton_jpeg_python: OK")
             except ImportError: print("lepton_jpeg_python: install failed")
 
-PAIR_LIMIT = 65535
+# ═══════════════════════════════════════════════════════════════════════════════
+#  QISKIT — circuit-only, deterministic permutation & byte mask
+#  (imports only `qiskit` and `QuantumCircuit`; no quantum_info, no Statevector,
+#   no Operator, no QuantumRegister, no ClassicalRegister)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def ask_pairs():
-    print("\n" + "="*70); print("Pair count  (1 .. 65535)"); print("="*70)
+def install_qiskit():
+    global HAS_QISKIT, qiskit, QuantumCircuit, QISKIT_VER
+    print("Installing qiskit (this can take a minute) ...")
+    for pkg in ("qiskit",):
+        for c in ([sys.executable, "-m", "pip", "install", "--no-input",
+                   "--disable-pip-version-check", pkg],
+                  [sys.executable, "-m", "pip", "install", "--user", "--no-input",
+                   "--disable-pip-version-check", pkg],
+                  [sys.executable, "-m", "pip", "install", "--break-system-packages",
+                   "--no-input", "--disable-pip-version-check", pkg]):
+            try: subprocess.check_call(c)
+            except Exception: pass
+    try:
+        import importlib
+        importlib.invalidate_caches()
+        import qiskit as _q
+        from qiskit import QuantumCircuit as _QC
+        qiskit = _q
+        QuantumCircuit = _QC
+        QISKIT_VER = getattr(_q, "__version__", "?")
+        HAS_QISKIT = True
+        return True
+    except ImportError:
+        HAS_QISKIT = False
+        return False
+
+
+def ask_qubits():
+    """Ask the user how many qubits to use. Hard cap: 16."""
+    print("\n" + "=" * 70)
+    print("Qiskit qubit count   (1 .. 16)")
+    print("=" * 70)
+    print("  65535 pairs need at least 16 qubits  (2^16 = 65536 states).")
     while True:
-        raw = input("Pairs [65535]: ").strip()
-        if raw == "": return 65535
+        raw = input("Qubits [16]: ").strip()
+        if raw == "":
+            return 16
         try:
             v = int(raw)
-            if v < 1: print("  Must be at least 1."); continue
-            if v > PAIR_LIMIT: print("  Must not exceed 65535."); continue
+            if v < 1:
+                print("  Must be at least 1."); continue
+            if v > 16:
+                print("  Must not exceed 16."); continue
             return v
-        except ValueError: print("  Please enter a whole number.")
+        except ValueError:
+            print("  Please enter a whole number.")
 
-PAIRS = ask_pairs()
-print(f"\nChosen: PAIRS = {PAIRS}")
+
+def _build_seed_circuit(n_qubits):
+    """
+    Build a fixed n_qubits QuantumCircuit using only QuantumCircuit.
+    Deterministic: same n_qubits → identical circuit → identical QASM.
+    """
+    qc = QuantumCircuit(n_qubits, name="ppmd_q")
+    for q in range(n_qubits):
+        qc.h(q)
+    for q in range(n_qubits):
+        qc.t(q)
+        qc.rz(math.pi / (q + 1.0), q)
+    for q in range(n_qubits - 1):
+        qc.cx(q, q + 1)
+        qc.rz(math.pi / (2.0 ** (q + 1)), q + 1)
+    for q in range(n_qubits):
+        qc.h(q)
+    return qc
+
+
+def _circuit_fingerprint(n_qubits):
+    """Deterministic SHA-256 fingerprint of the fixed circuit."""
+    qc = _build_seed_circuit(n_qubits)
+    try:
+        blob = qc.qasm().encode("utf-8")
+    except Exception:
+        # Fallback: stringify gate list
+        parts = []
+        for item in qc.data:
+            op = item.operation if hasattr(item, "operation") else item[0]
+            qargs = item.qubits if hasattr(item, "qubits") else item[1]
+            parts.append(f"{op.name}|{op.params}|{[qc.find_bit(q).index for q in qargs]}")
+        blob = ";;".join(parts).encode("utf-8")
+    return hashlib.sha256(b"PPMD_QS|" + str(n_qubits).encode() + b"|" + blob).digest()
+
+
+_QPERM_CACHE = {}
+_QMASK_CACHE = {}
+
+def quantum_pair_permutation(n_pairs, n_qubits):
+    """
+    Deterministic permutation of 0..n_pairs-1 derived from a fixed
+    n_qubits Qiskit circuit (circuit → QASM → SHA-256 → seeded Fisher-Yates).
+    Same input → same output on every machine.
+    """
+    key = (n_pairs, n_qubits)
+    hit = _QPERM_CACHE.get(key)
+    if hit is not None:
+        return hit
+    if not HAS_QISKIT or n_qubits < 1 or n_pairs <= 0:
+        perm = list(range(max(0, n_pairs)))
+        _QPERM_CACHE[key] = perm
+        return perm
+
+    fp = _circuit_fingerprint(n_qubits)
+    rng = random.Random(int.from_bytes(fp, "big"))
+    perm = list(range(n_pairs))
+    # Fisher–Yates
+    for i in range(n_pairs - 1, 0, -1):
+        j = rng.randrange(i + 1)
+        perm[i], perm[j] = perm[j], perm[i]
+    _QPERM_CACHE[key] = perm
+    return perm
+
+
+def quantum_bytes_mask(n_qubits, n_bytes):
+    """
+    Deterministic XOR mask of length n_bytes derived from the fixed
+    n_qubits Qiskit circuit (circuit → QASM → SHA-256 → PRNG bytes).
+    """
+    if not HAS_QISKIT or n_qubits < 1 or n_bytes <= 0:
+        return b"\x00" * max(0, n_bytes)
+    key = (n_qubits, n_bytes)
+    hit = _QMASK_CACHE.get(key)
+    if hit is not None:
+        return hit
+    fp = _circuit_fingerprint(n_qubits)
+    rng = random.Random(int.from_bytes(fp, "big") ^ 0x9E3779B97F4A7C15)
+    out = bytes(rng.randrange(256) for _ in range(n_bytes))
+    _QMASK_CACHE[key] = out
+    return out
+
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def install_qiskit_if_needed():
+    global HAS_QISKIT
+    if HAS_QISKIT:
+        print(f"qiskit: OK (version {QISKIT_VER})")
+        return
+    if input("Install qiskit? (y/n) [y]: ").strip().lower() != 'n':
+        install_qiskit()
+    if HAS_QISKIT:
+        print(f"qiskit: OK (version {QISKIT_VER})")
+    else:
+        print("qiskit: NOT available")
+
+install_qiskit_if_needed()
+
+PAIR_LIMIT = 65535
+QUBIT_LIMIT = 16
+
+def ask_pairs(n_qubits=16):
+    max_by_q = (1 << max(1, n_qubits)) - 1
+    cap = min(PAIR_LIMIT, max_by_q)
+    print("\n" + "="*70)
+    print(f"Pair count  (1 .. {cap})   [qubits = {n_qubits}, 2^{n_qubits}-1 = {max_by_q}]")
+    print("="*70)
+    while True:
+        raw = input(f"Pairs [{cap}]: ").strip()
+        if raw == "":
+            return cap
+        try:
+            v = int(raw)
+            if v < 1:
+                print("  Must be at least 1."); continue
+            if v > cap:
+                print(f"  Must not exceed {cap}."); continue
+            return v
+        except ValueError:
+            print("  Please enter a whole number.")
+
+QUBITS = ask_qubits() if HAS_QISKIT else QUBIT_LIMIT
+if HAS_QISKIT:
+    print(f"Qubits chosen: {QUBITS}  (state space 2^{QUBITS} = {1 << QUBITS})")
+else:
+    print(f"Qubits: classical fallback (16)")
+PAIRS = ask_pairs(QUBITS)
+print(f"\nChosen: QUBITS = {QUBITS}   PAIRS = {PAIRS}")
+if PAIRS > (1 << QUBITS) - 1:
+    print(f"FATAL: {PAIRS} pairs do not fit in {QUBITS} qubits (max {(1 << QUBITS) - 1}).")
+    sys.exit(1)
 if PAIRS > 10**9:
     if input("Continue anyway? (y/n) [n]: ").strip().lower() != 'y':
         print("Aborting."); sys.exit(0)
@@ -299,7 +480,7 @@ print(f"\nBackends: zstd={'Y' if HAS_ZSTD else 'N'} lzma={'Y' if HAS_LZMA else '
       f"paq={'Y' if paq else 'N'} brotli={'Y' if HAS_BROTLI else 'N'} "
       f"pyppmd={'Y' if HAS_PPMD else 'N'} zpaq={'Y' if HAS_ZPAQ else 'N'} "
       f"ccmx={'Y' if HAS_CCMX else 'N'} cmix={'Y' if HAS_CMIX else 'N'} "
-      f"lepton={'Y' if HAS_LEPTON else 'N'} "
+      f"lepton={'Y' if HAS_LEPTON else 'N'} qiskit={'Y' if HAS_QISKIT else 'N'} "
       f"xml=Y lxml={'Y' if HAS_LXML else 'N'} defusedxml={'Y' if HAS_DEFUSEDXML else 'N'}")
 PROGNAME = "PPMD_1.2"
 
@@ -621,8 +802,9 @@ class Compressor:
     MAX_TRANSFORM = 256; PROGRESS_EVERY = 500; STRIDE = 3
     MAX_EAGER_ID = 256
 
-    def __init__(self, try_dl=True, pairs=65535):
+    def __init__(self, try_dl=True, pairs=65535, qubits=16):
         self.PAIRS = pairs
+        self.QUBITS = qubits
         self._cback_cache = {}
         self._CBACK_CACHE_MAX = 65536
         self._fwd_cache = {}
@@ -635,10 +817,9 @@ class Compressor:
         self.PI_S = "3.14159265358979323846264338327950288419716939937510"
         self.rep = 100
         self.mst = [[(v-400) & 0xFF for v in r] for r in PAQ]
-        self.mask46 = [(b-10) & 0xFF for b in [1,2,4,8,16,32,64,128,3,6]] * 10
+        self.mask46 = [(b-10) & 0xFF for b in [1,2,4,8,16,32,64,128,3,6,10]] * 10
         self.pattern47 = bytes(row[0] & 0xFF for row in self.mst)
         self._xor_tables = {}
-        # --- fast caches (output-identical) ---
         self._t04_tab = None
         self._t06_tab = None
         self._t06_inv = None
@@ -655,7 +836,13 @@ class Compressor:
         self._m1_tab = bytes((b - 1) & 0xFF for b in range(256))
         self._p1_tab = bytes((b + 1) & 0xFF for b in range(256))
         self._np_tab = [nearest_prime(n) for n in range(600)]
-        # --------------------------------------
+        if HAS_QISKIT:
+            print(f"Building Qiskit {self.QUBITS}-qubit pair permutation for {self.PAIRS} pairs ...")
+            t0 = time.time()
+            self._qperm = quantum_pair_permutation(self.PAIRS, self.QUBITS)
+            print(f"  quantum permutation ready ({time.time()-t0:.3f}s)")
+        else:
+            self._qperm = list(range(self.PAIRS))
         self._build_ref_dict(); self._maps(); self._pairs()
 
     def _xor_table(self, k):
@@ -2233,6 +2420,15 @@ class Compressor:
         for w in words: o.extend(w.to_bytes(wbytes, 'big'))
         return bytes(o[:ol])
 
+    # ─── ID 62: quantum mask transform (XOR, self-inverse) ───
+    def t_quantum(self, d):
+        if not d or not HAS_QISKIT:
+            return d
+        nq = getattr(self, "QUBITS", 16)
+        mask = quantum_bytes_mask(nq, len(d))
+        return (int.from_bytes(d, "big") ^ int.from_bytes(mask, "big")).to_bytes(len(d), "big")
+    r_quantum = t_quantum
+
     def t256(self, d): return d
     r256 = t256
     def _dyn(self, n):
@@ -2265,14 +2461,16 @@ class Compressor:
         eager_f[59] = self.t59; eager_r[59] = self.r59
         eager_f[60] = self.t_cdd; eager_r[60] = self.r_cdd
         eager_f[61] = self.t_xml; eager_r[61] = self.r_xml
-        for i in range(62, 256):
+        eager_f[62] = self.t_quantum; eager_r[62] = self.r_quantum
+        for i in range(63, 256):
             f, r = self._dyn(i); eager_f[i] = f; eager_r[i] = r
         eager_f[256] = self.t256; eager_r[256] = self.r256
         self.fwd = eager_f
         self.rev = eager_r
         print(f"Registered eager transforms 1-256; "
               f"headerless Circle-Diameter-Dot at ID 60; "
-              f"XML/DOCX/DOC tokenizer at ID 61. "
+              f"XML/DOCX/DOC tokenizer at ID 61; "
+              f"Qiskit quantum-mask at ID 62. "
               f"Minus transforms disabled.")
 
     def _pairs(self):
@@ -2310,7 +2508,6 @@ class Compressor:
         for t in reversed(seq): r = self.rev[t](r)
         return r, seq
     def _write(self, path, data):
-        # Fast atomic write: mkstemp + write + rename. No fsync (huge save speedup).
         dd = os.path.dirname(path) or '.'
         fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path)+'.tmp', dir=dd)
         try: os.write(fd, data)
@@ -2355,6 +2552,7 @@ class Compressor:
         self.FAST = False; self.USE_MP = True
         print(f"\nInput: {len(data):,} bytes"); print("="*64)
         print(f"Target pairs : {self.PAIRS}")
+        print(f"Qubits       : {self.QUBITS}  (Qiskit permutation)")
         print(f"Workers      : {N_CORES}" + (" (fork)" if _HAS_FORK else " (spawn)"))
         print(f"cback thr    : {CBACK_WORKERS} (parent) / {CBACK_WORKERS_EFF} (worker)")
         print(f"Chunk size   : {CHUNK}")
@@ -2395,7 +2593,9 @@ class Compressor:
 
             pair_task_list = []
             skipped_id = 0
-            for i in range(pair_count):
+            perm = self._qperm if (HAS_QISKIT and len(self._qperm) >= pair_count) else list(range(pair_count))
+            for k in range(pair_count):
+                i = perm[k] if k < len(perm) else k
                 if tp > 0 and i >= tp: a, b = self.pairs[i % tp]
                 else: a, b = self.pairs[i]
                 if a in IDENTITY_IDS or b in IDENTITY_IDS:
@@ -2624,7 +2824,7 @@ class Compressor:
 
     def selftest(self):
         print("="*60); print("Lossless Self-Test"); print("="*60)
-        print(f"Pairs={self.PAIRS}  Stride={self.STRIDE}  Workers={N_CORES}")
+        print(f"Pairs={self.PAIRS}  Qubits={self.QUBITS}  Stride={self.STRIDE}  Workers={N_CORES}")
         tbs = [0x00, 0xFF, 0xAA, 0x55, 0x12, 0x34]
         for t in range(1, 257):
             for tb in tbs:
@@ -2676,6 +2876,18 @@ class Compressor:
         tr = self.t_xml(doc_bytes); rs = self.r_xml(tr)
         if rs != doc_bytes: print("  FAIL t_xml doc (OLE passthrough)"); return False
         print("  XML/DOCX/DOC transform: PASS")
+        print("  Testing Qiskit quantum-mask transform (ID 62) ...")
+        if HAS_QISKIT:
+            for tv in [b"", b"a", b"hello", b"hello world"*8, os.urandom(64)]:
+                tr = self.t_quantum(tv); rs = self.r_quantum(tr)
+                if rs != tv: print(f"  FAIL t_quantum len={len(tv)}"); return False
+            p1 = quantum_pair_permutation(min(self.PAIRS, 4096), self.QUBITS)
+            p2 = quantum_pair_permutation(min(self.PAIRS, 4096), self.QUBITS)
+            assert p1 == p2, "quantum permutation must be deterministic"
+            assert len(set(p1)) == len(p1), "quantum permutation must be a bijection"
+            print(f"  Qiskit {self.QUBITS}-qubit permutation & mask: PASS")
+        else:
+            print("  Qiskit transform: SKIP (qiskit not available)")
         print("  Testing Lepton JPEG round-trip (if available) ...")
         if HAS_LEPTON:
             try:
@@ -2724,7 +2936,7 @@ class Compressor:
             _GLOBAL_COMP = self; _GLOBAL_DATA = payload; _GLOBAL_FWD = {}
             try:
                 with _MP_CTX.Pool(N_CORES) as pool:
-                    singles = list(pool.imap_unordered(_worker_single, [1, 60, 61, 256], chunksize=1))
+                    singles = list(pool.imap_unordered(_worker_single, [1, 60, 61, 62, 256], chunksize=1))
                     pairs_r = list(pool.imap_unordered(_worker_pair,
                                                        [(i, self.pairs[i][0], self.pairs[i][1]) for i in range(8)],
                                                        chunksize=1))
@@ -2741,14 +2953,15 @@ class Compressor:
 def main():
     print(f"{PROGNAME}")
     print("* Target: 1 KB Lorem ipsum -> ~240 bytes, 100% lossless *")
-    print("* Deterministic · IPC-lite · C-level XOR · identity skip — same winner size *\n")
+    print("* Deterministic · IPC-lite · C-level XOR · identity skip *")
+    print(f"* Qiskit {QUBITS}-qubit circuit-driven pair order (same winner any core count) *\n")
     try:
         mp.set_start_method('fork', force=True)
         print(f"mp: fork, {N_CORES} workers (cpu_count={CPU_COUNT})")
     except (RuntimeError, ValueError):
         print(f"mp: spawn default, {N_CORES} workers")
     dl = input("Download 12 Google Drive dictionaries? (y/n) [y]: ").strip().lower()
-    c = Compressor(try_dl=(dl != 'n'), pairs=PAIRS)
+    c = Compressor(try_dl=(dl != 'n'), pairs=PAIRS, qubits=QUBITS)
     while True:
         print("\nMenu:")
         print("1) Compress (lossless tournament)")
