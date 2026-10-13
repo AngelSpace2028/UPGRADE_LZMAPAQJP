@@ -4,7 +4,9 @@
 # EXTENSION-AS-HEADER — saves the 2 bytes inside the file
 #
 # FILENAME:
-#   <original>.a-<h0hex>-<h1hex>    e.g.  .a-00-00  .a-00-ff  .a-fa-ff
+#   <original>.aXXXX    where XXXX = 4 hex digits (2 bytes as u16)
+#   Examples: .a0000  .a003d  .a00ff  .a0100  .afaff  .affff
+#
 #   The 2 bytes (h0,h1) encode the transform used:
 #     0x0000..0x00FF → single a1..a256  (id = u16 + 1)
 #     0x0100..0xFFFF → pair   b1..b65280 (idx = u16 - 0xFF)
@@ -618,7 +620,7 @@ def mod_inv(a, m):
     return x
 
 # ═══════════════════════════════════════════════════════════════════════
-# Extension-as-header helpers (no bytes stored inside the file)
+# Extension-as-header helpers — format .aXXXX (4 hex digits, no dashes)
 # ═══════════════════════════════════════════════════════════════════════
 def _encode_header(kind, ident):
     """Return the 2-byte header for (kind, ident) — used only for extension."""
@@ -637,17 +639,17 @@ def _decode_header(hdr):
     if v < 0x100: return "a", v + 1
     return "b", v - 0xFF
 
-_EXT_RE = re.compile(r'\.a-([0-9a-fA-F]{2})-([0-9a-fA-F]{2})$')
+_EXT_RE = re.compile(r'\.a([0-9a-fA-F]{4})$')
 
 def _ext_for(kind, ident):
     hdr = _encode_header(kind, ident)
-    return f".a-{hdr[0]:02x}-{hdr[1]:02x}"
+    return f".a{hdr[0]:02x}{hdr[1]:02x}"
 
 def _parse_ext(fname):
     m = _EXT_RE.search(fname)
     if not m: return None
-    b0 = int(m.group(1), 16); b1 = int(m.group(2), 16)
-    v = (b0 << 8) | b1
+    hexs = m.group(1)
+    v = int(hexs, 16)
     if v < 0x100: return "a", v + 1
     return "b", v - 0xFF
 
@@ -2484,7 +2486,7 @@ class Compressor:
         print(f"Mode: FAST ({'ON' if FAST_MODE else 'OFF'}) "
               f"full-pairs={'ON' if FULL_PAIRS else 'OFF'} "
               f"skip-slow={'ON' if SKIP_SLOW else 'OFF'}")
-        print(f"Header: extension only  <orig>.a-<h0>-<h1>")
+        print(f"Header: extension only  <orig>.aXXXX  (XXXX = 4 hex digits)")
         t_start = time.time()
 
         xml_enc = None
@@ -2650,8 +2652,8 @@ class Compressor:
 
         parsed = _parse_ext(infile)
         if parsed is None:
-            print("Error: filename must end with .a-HH-HH (extension is the header).")
-            print("       e.g.  file.bin.a-00-00  file.bin.a-fa-ff")
+            print("Error: filename must end with .aXXXX (extension is the header).")
+            print("       e.g.  file.bin.a0000  file.bin.afaff  file.bin.affff")
             return False
         kind, ident = parsed
         print(f"  header from extension: {kind}{ident}")
@@ -2729,14 +2731,15 @@ class Compressor:
         return True
 
     def selftest(self):
-        print("="*60); print("Self-Test (extension-as-header)"); print("="*60)
+        print("="*60); print("Self-Test (extension .aXXXX)"); print("="*60)
         # extension round-trips
         for kind, ident in [("a", 1), ("a", 62), ("a", 256), ("b", 1), ("b", MAX_PAIRS)]:
             ext = _ext_for(kind, ident)
             parsed = _parse_ext("foo.bin" + ext)
             if parsed != (kind, ident):
                 print(f"  FAIL ext {ext} → {parsed}"); return False
-        print(f"  Extension .a-HH-HH round-trips: PASS  (b cap: {MAX_PAIRS})")
+            print(f"    {kind}{ident}  →  {ext}")
+        print(f"  Extension .aXXXX round-trips: PASS  (b cap: {MAX_PAIRS})")
         # XML
         _z = io.BytesIO()
         with zipfile.ZipFile(_z, 'w', zipfile.ZIP_STORED) as z:
@@ -2759,7 +2762,7 @@ class Compressor:
             src = os.path.join(td, "sample.txt")
             with open(src, "wb") as f: f.write(b"hello world " * 50)
             self.compress(src)
-            outs = [n for n in os.listdir(td) if n.startswith("sample.txt.")]
+            outs = [n for n in os.listdir(td) if n.startswith("sample.txt.a")]
             if not outs: print("  FAIL no output file"); return False
             out_path = os.path.join(td, outs[0])
             dec = os.path.join(td, "decoded.txt")
@@ -2776,7 +2779,8 @@ def main():
     print("* Extension-as-header — no header bytes inside file")
     print(f"* 0x0000..0x00FF → single a1..a256")
     print(f"* 0x0100..0xFFFF → pair   b1..b{MAX_PAIRS}")
-    print("* Extension: <original>.a-<h0hex>-<h1hex>   e.g.  .a-00-00  .a-fa-ff")
+    print("* Extension: <original>.aXXXX  (XXXX = 4 hex digits, no dashes)")
+    print("* Examples:  .a0000  .a003d  .a00ff  .a0100  .afaff  .affff")
     try:
         mp.set_start_method('fork', force=True)
         print(f"mp: fork, {N_CORES} workers (cpu_count={CPU_COUNT})")
