@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# PPMD_1.5 — Lossless Tournament + XML structural v2 + Qiskit mask (FIXED)
+# PPMD_1.5 — Lossless Tournament + XML structural v2 + Qiskit mask
+# EXTENSION-AS-HEADER — saves the 2 bytes inside the file
 #
-# COMPACT HEADER LAYOUT
-# ─────────────────────
-#   Class A (singles, 1-byte):    a1..a255   → byte 0x00..0xFE
-#   Class A (single, 2-byte):     a256       → bytes 0xFF 0xFE
-#   Class B (pairs, 2-byte):      b1..b65535 → (n-1) big-endian
-#   Class C (escape, 2-byte):     c1..c255   → bytes 0xFF 0x01..0xFF
-#   Raw fallback:                 0xFF 0xFF + b"RAW" + data
+# FILENAME:
+#   <original>.a-<h0hex>-<h1hex>    e.g.  .a-00-00  .a-00-ff  .a-fa-ff
+#   The 2 bytes (h0,h1) encode the transform used:
+#     0x0000..0x00FF → single a1..a256  (id = u16 + 1)
+#     0x0100..0xFFFF → pair   b1..b65280 (idx = u16 - 0xFF)
 #
-# Fixes vs original:
-#   * t_byte_transpose / r_byte_transpose — now exact inverses (odd-length safe)
-#   * t_nibble_swap      / r_nibble_swap  — now exact inverses (was alias = broken)
-#   * t_delta_xor        / r_delta_xor    — now exact inverses (was alias = broken)
-#   * t_reverse_xor      / r_reverse_xor  — now exact inverses (was alias = broken)
-#   * compress()          — verifies every accepted winner end-to-end
-#   * selftest()          — sweeps all 256 singles + all pairs
+# FILE CONTENT:
+#   Just the backend-compressed payload (no header inside the file).
+#   Renaming the file breaks decompression — the extension IS the header.
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -78,9 +73,7 @@ except (ValueError, AttributeError):
 
 IDENTITY_IDS = frozenset((1, 31, 32, 256))
 
-SINGLE_ESCAPE_256 = b'\xff\xfe'
-RAW_ESCAPE_HEADER = b'\xff\xff'
-ESCAPE_C_BASE     = 0xFF
+MAX_PAIRS = 65280  # 0x100..0xFFFF → 65280 slots
 
 _GLOBAL_COMP = None; _GLOBAL_DATA = None; _GLOBAL_FWD = {}
 _IN_WORKER = False
@@ -267,7 +260,6 @@ def quantum_bytes_mask(n_qubits, n_bytes):
     out = bytes(rng.randrange(256) for _ in range(n_bytes))
     _QMASK_CACHE[key] = out; return out
 
-PAIR_LIMIT = 65535
 QUBIT_LIMIT = 16
 
 def ask_qubits():
@@ -283,9 +275,9 @@ def ask_qubits():
 
 def ask_pairs(n_qubits=16):
     max_by_q = (1 << max(1, n_qubits)) - 1
-    cap = min(PAIR_LIMIT, max_by_q)
+    cap = min(MAX_PAIRS, max_by_q)
     print("\n" + "="*70)
-    print(f"Pair count (1..{cap})  [qubits={n_qubits}]")
+    print(f"Pair count (1..{cap})  [qubits={n_qubits}, hard cap {MAX_PAIRS}]")
     print("="*70)
     while True:
         raw = input(f"Pairs [{cap}]: ").strip()
@@ -301,6 +293,8 @@ PAIRS = ask_pairs(QUBITS)
 print(f"\nChosen: QUBITS={QUBITS}  PAIRS={PAIRS}")
 if PAIRS > (1 << QUBITS) - 1:
     print(f"FATAL: {PAIRS} pairs exceed {QUBITS}-qubit space."); sys.exit(1)
+if PAIRS > MAX_PAIRS:
+    print(f"FATAL: {PAIRS} pairs exceed 2-byte header cap {MAX_PAIRS}."); sys.exit(1)
 
 print(f"\nBackends: zstd={'Y' if HAS_ZSTD else 'N'} lzma={'Y' if HAS_LZMA else 'N'} "
       f"paq={'Y' if paq else 'N'} brotli={'Y' if HAS_BROTLI else 'N'} "
@@ -623,44 +617,39 @@ def mod_inv(a, m):
     if x < 0: x += m0
     return x
 
-# ─── Compact header encode/decode ───
-def _encode_single_header(t):
-    if not (1 <= t <= 256): raise TransformError(f"single ID out of range: {t}")
-    if t == 256:
-        return SINGLE_ESCAPE_256
-    return bytes([t - 1])
-
-def _decode_single_header(hdr, pos=0):
-    if pos >= len(hdr): raise TransformError("short single header")
-    b0 = hdr[pos]
-    if b0 != 0xFF:
-        return b0 + 1, 1
-    if pos + 1 >= len(hdr): raise TransformError("short single escape")
-    b1 = hdr[pos + 1]
-    if b1 == 0xFE:
-        return 256, 2
-    raise TransformError(f"bad single escape 0xFF 0x{b1:02X}")
-
-def _encode_pair_header(n):
-    if not (1 <= n <= 65535): raise TransformError(f"pair index out of range: {n}")
-    v = n - 1
+# ═══════════════════════════════════════════════════════════════════════
+# Extension-as-header helpers (no bytes stored inside the file)
+# ═══════════════════════════════════════════════════════════════════════
+def _encode_header(kind, ident):
+    """Return the 2-byte header for (kind, ident) — used only for extension."""
+    if kind == "a":
+        if not (1 <= ident <= 256): raise TransformError(f"single ID out of range: {ident}")
+        v = ident - 1
+    else:
+        if not (1 <= ident <= MAX_PAIRS):
+            raise TransformError(f"pair index out of range: {ident} (max {MAX_PAIRS})")
+        v = 0x100 + (ident - 1)
     return bytes([(v >> 8) & 0xFF, v & 0xFF])
 
-def _decode_pair_header(hdr, pos=0):
-    if pos + 1 >= len(hdr): raise TransformError("short pair header")
-    v = (hdr[pos] << 8) | hdr[pos + 1]
-    n = v + 1
-    if n < 1 or n > 65535: raise TransformError(f"pair index out of range: {n}")
-    return n, 2
+def _decode_header(hdr):
+    if len(hdr) < 2: raise TransformError("short header")
+    v = (hdr[0] << 8) | hdr[1]
+    if v < 0x100: return "a", v + 1
+    return "b", v - 0xFF
 
-def _encode_c_header(n):
-    if not (1 <= n <= 255): raise TransformError(f"C-class out of range: {n}")
-    return bytes([0xFF, n & 0xFF])
+_EXT_RE = re.compile(r'\.a-([0-9a-fA-F]{2})-([0-9a-fA-F]{2})$')
 
-def _decode_c_header(hdr, pos=0):
-    if pos + 1 >= len(hdr): raise TransformError("short C header")
-    if hdr[pos] != 0xFF: raise TransformError("C header must start with 0xFF")
-    return hdr[pos + 1], 2
+def _ext_for(kind, ident):
+    hdr = _encode_header(kind, ident)
+    return f".a-{hdr[0]:02x}-{hdr[1]:02x}"
+
+def _parse_ext(fname):
+    m = _EXT_RE.search(fname)
+    if not m: return None
+    b0 = int(m.group(1), 16); b1 = int(m.group(2), 16)
+    v = (b0 << 8) | b1
+    if v < 0x100: return "a", v + 1
+    return "b", v - 0xFF
 
 # ═══════════════════════════════════════════════════════════════════════
 # COMPRESSOR
@@ -671,8 +660,8 @@ class Compressor:
     MAX_TRANSFORM = 256; PROGRESS_EVERY = 500; STRIDE = 3
     MAX_EAGER_ID = 256
 
-    def __init__(self, try_dl=True, pairs=65535, qubits=16):
-        self.PAIRS = pairs
+    def __init__(self, try_dl=True, pairs=MAX_PAIRS, qubits=16):
+        self.PAIRS = min(pairs, MAX_PAIRS)
         self.QUBITS = qubits
         self._cback_cache = {}
         self._CBACK_CACHE_MAX = 65536
@@ -858,13 +847,6 @@ class Compressor:
             except Exception: pass
         return None
 
-    def _get_fwd(self, t, data):
-        v = self._fwd_cache.get(t)
-        if v is None:
-            v = self.fwd[t](data)
-            if len(self._fwd_cache) < 512: self._fwd_cache[t] = v
-        return v
-
     def _ensure_pool(self):
         cur = os.getpid()
         if self._pool_cback is None or self._pool_pid != cur:
@@ -1016,7 +998,7 @@ class Compressor:
             except Exception: return None
         return None
 
-    # ─── XML transform (ID 61) ───
+    # ─── XML transform ───
     def t_xml(self, d):
         if not d: return b'\x00'
         if d[:8] == OLE_MAGIC: return b'\x03' + d
@@ -2242,7 +2224,6 @@ class Compressor:
         return bytes(a ^ b for a, b in zip(d, ks[:len(d)]))
     r_sha256_keystream = t_sha256_keystream
 
-    # ─── FIXED: byte_transpose (odd-length safe) ───
     def t_byte_transpose(self, d):
         if not d: return b''
         L = len(d); half = L // 2
@@ -2287,7 +2268,6 @@ class Compressor:
                 out.append(d[i]); i += 1
         return bytes(out)
 
-    # ─── FIXED: nibble_swap (real inverse, not alias) ───
     def t_nibble_swap(self, d):
         if not d: return b''
         out = bytearray(d)
@@ -2303,7 +2283,6 @@ class Compressor:
             out[i] = ((b << 4) | (b >> 4)) & 0xFF
         return bytes(out)
 
-    # ─── FIXED: delta_xor (real inverse, not alias) ───
     def t_delta_xor(self, d):
         if not d: return b''
         out = bytearray(d)
@@ -2317,7 +2296,6 @@ class Compressor:
             out[i] ^= out[i-1]
         return bytes(out)
 
-    # ─── FIXED: reverse_xor (real inverse, not alias) ───
     def t_reverse_xor(self, d):
         if not d: return b''
         L = len(d); out = bytearray(L)
@@ -2446,6 +2424,8 @@ class Compressor:
             for b in range(1, 257):
                 if a == 256 and b == 256: continue
                 self.pairs.append((a, b))
+                if len(self.pairs) >= MAX_PAIRS: break
+            if len(self.pairs) >= MAX_PAIRS: break
         self._pair_index = {p: i + 1 for i, p in enumerate(self.pairs)}
 
     def _write(self, path, data):
@@ -2462,7 +2442,6 @@ class Compressor:
         if not os.access(path, os.R_OK): print("Error: permission denied."); return False
         return True
 
-    # ─── Verification helpers ───
     def verify_single(self, data, t):
         try:
             tr = self.fwd[t](data)
@@ -2478,28 +2457,20 @@ class Compressor:
         except Exception:
             return False
 
-    def _decode_blob(self, blob, kind, label):
-        """Reverse a compressed blob back to the original bytes, or None."""
+    def _decode_blob(self, blob, kind, ident):
+        """Decode blob (which contains ONLY the backend payload)."""
         try:
+            r = self.dback(blob)
+            if r is None: return None
             if kind == "a":
-                tn = int(label[1:])
-                hdr_len = 2 if tn == 256 else 1
-                body = blob[hdr_len:]
-                r = self.dback(body)
-                if r is None: return None
-                return self.rev[tn](r)
-            elif kind == "b":
-                pn = int(label[1:])
-                body = blob[2:]
-                r = self.dback(body)
-                if r is None: return None
-                a_, b_ = self.pairs[pn - 1]
+                return self.rev[ident](r)
+            else:
+                a_, b_ = self.pairs[ident - 1]
                 return self.rev[a_](self.rev[b_](r))
         except Exception:
             return None
-        return None
 
-    # ─── Compress with compact A/B/C header + mandatory verify ───
+    # ─── Compress ───
     def compress(self, infile, pairs=True, multi=False, timeout=None):
         if not self._require_file(infile): return
         try:
@@ -2513,7 +2484,7 @@ class Compressor:
         print(f"Mode: FAST ({'ON' if FAST_MODE else 'OFF'}) "
               f"full-pairs={'ON' if FULL_PAIRS else 'OFF'} "
               f"skip-slow={'ON' if SKIP_SLOW else 'OFF'}")
-        print(f"Header: 1-byte singles a1..a255, 2-byte a256, 2-byte pairs b1..b65535")
+        print(f"Header: extension only  <orig>.a-<h0>-<h1>")
         t_start = time.time()
 
         xml_enc = None
@@ -2529,58 +2500,47 @@ class Compressor:
                 print(f"  XML pre-pass skipped ({e})")
                 xml_enc = None
 
-        # (total_size, kind, label, hdr_bytes, compressed_body)
         candidates = []
 
         def _add_single(t, tag):
             try:
                 if not self.verify_single(data, t):
-                    print(f"  [{tag}] NOT REVERSIBLE — skipped")
-                    return
+                    print(f"  [{tag}] NOT REVERSIBLE — skipped"); return
                 tr = self.fwd[t](data)
                 c = self.cback(tr)
-                hdr = _encode_single_header(t)
-                candidates.append((len(hdr) + len(c), "a", tag, hdr, c))
+                candidates.append((len(c), "a", t, tag, c))
             except Exception as e:
                 print(f"  [{tag}] failed: {e}")
 
         def _add_pair(a, b, tag):
             try:
                 if not self.verify_pair(data, a, b):
-                    print(f"  [{tag}] NOT REVERSIBLE — skipped")
-                    return
+                    print(f"  [{tag}] NOT REVERSIBLE — skipped"); return
                 ta = self.fwd[a](data)
                 tr = self.fwd[b](ta)
                 c = self.cback(tr)
                 pidx = self._pair_index[(a, b)]
-                hdr = _encode_pair_header(pidx)
-                candidates.append((len(hdr) + len(c), "b", tag, hdr, c))
+                candidates.append((len(c), "b", pidx, tag, c))
             except Exception as e:
                 print(f"  [{tag}] failed: {e}")
 
-        # a1 identity — always reversible
         _add_single(1, "a1")
 
-        # a61 XML — only if verified pre-pass
         if xml_enc is not None:
             try:
                 if self.verify_single(data, 61):
                     c2 = self.cback(xml_enc)
-                    hdr = _encode_single_header(61)
-                    candidates.append((len(hdr) + len(c2), "a", "a61", hdr, c2))
+                    candidates.append((len(c2), "a", 61, "a61", c2))
             except Exception as e:
                 print(f"  [a61] failed: {e}")
 
-        # quick singles
         for t in (62, 63, 66, 70, 75):
             _add_single(t, f"a{t}")
 
-        # key pairs
         for (a, b) in [(61, 1), (61, 62), (62, 1), (63, 1), (66, 1)]:
             if (a, b) in self._pair_index:
                 _add_pair(a, b, f"b{self._pair_index[(a, b)]}")
 
-        # full pair tournament
         if FULL_PAIRS:
             print(f"  FULL PAIRS mode: running tournament over {self.PAIRS} pairs ...")
             _GLOBAL_COMP = self; _GLOBAL_DATA = data; _GLOBAL_FWD = {}
@@ -2608,7 +2568,7 @@ class Compressor:
                 sized = []
                 for idx, a, b, size, err in results:
                     if err or size is None: continue
-                    sized.append((size + 2, idx, a, b))
+                    sized.append((size, idx, a, b))
                 sized.sort()
                 top_k = min(TOP_VERIFY, len(sized))
                 print(f"  tournament: {len(sized)} viable pairs; verifying top {top_k} ...")
@@ -2618,8 +2578,7 @@ class Compressor:
                             tr = self.fwd[b](self.fwd[a](data))
                             c = self.cback(tr)
                             pidx = idx + 1
-                            hdr = _encode_pair_header(pidx)
-                            candidates.append((len(hdr) + len(c), "b", f"b{pidx}", hdr, c))
+                            candidates.append((len(c), "b", pidx, f"b{pidx}", c))
                         except Exception as e:
                             print(f"  [b{idx+1}] failed on encode: {e}")
             finally:
@@ -2629,33 +2588,29 @@ class Compressor:
         if not candidates:
             print("  no candidates; falling back to a1")
             c = self.cback(data)
-            hdr = _encode_single_header(1)
-            candidates.append((len(hdr) + len(c), "a", "a1", hdr, c))
+            candidates.append((len(c), "a", 1, "a1", c))
 
         candidates.sort(key=lambda x: x[0])
-        best_size, kind, label, hdr, c = candidates[0]
-        best_blob = hdr + c
+        best_size, kind, ident, label, c = candidates[0]
+        best_blob = c  # no in-file header — extension carries it
 
-        # Full in-memory round-trip verify of the winner
-        check = self._decode_blob(best_blob, kind, label)
+        check = self._decode_blob(best_blob, kind, ident)
         if check != data:
             print(f"  [WARNING] winner {label} failed in-memory verify; falling back to a1")
             c = self.cback(data)
-            hdr = _encode_single_header(1)
-            best_blob = hdr + c
-            best_size = len(best_blob); kind, label = "a", "a1"
-            check = self._decode_blob(best_blob, kind, label)
+            best_blob = c
+            best_size = len(best_blob); kind, ident, label = "a", 1, "a1"
+            check = self._decode_blob(best_blob, kind, ident)
             if check != data:
                 print("  [FATAL] a1 verify failed; aborting without writing."); return
         print(f"  winner {label} round-trip: OK")
 
-        # Print candidate ranking
-        for sz, k_, lbl_, hdr_, c_ in candidates:
-            marker = " <<< BEST" if (lbl_ == label and k_ == kind) else ""
+        for sz, k_, id_, lbl_, c_ in candidates:
+            marker = " <<< BEST" if (lbl_ == label and k_ == kind and id_ == ident) else ""
             print(f"  [{lbl_}] size={sz}{marker}")
 
-        # Write
-        out = infile + f".{label}"
+        ext = _ext_for(kind, ident)
+        out = infile + ext
         self._write(out, best_blob)
 
         elapsed = time.time() - t_start
@@ -2667,14 +2622,14 @@ class Compressor:
         print(f"  Saved    : {len(data)-len(best_blob):,} bytes")
         print(f"  Time     : {elapsed:.4f} s")
         print(f"  Speed    : {len(data)/elapsed:,.0f} bytes/s")
-        print(f"  Header   : {best_blob[:2].hex()}")
+        print(f"  Header   : (in extension) {ext}")
+        print(f"  Note     : Do NOT rename the file — the extension IS the header.")
 
-        # Real end-to-end read-back verify
         try:
             with open(out, 'rb') as f: readback = f.read()
             if readback != best_blob:
                 print("  [VERIFICATION FAILED: readback bytes mismatch]"); return
-            orig = self._decode_blob(readback, kind, label)
+            orig = self._decode_blob(readback, kind, ident)
             if orig == data:
                 print("  [VERIFIED LOSSLESS: decode(readback) == original]")
             else:
@@ -2689,75 +2644,42 @@ class Compressor:
             with open(infile, 'rb') as f: blob = f.read()
         except (PermissionError, OSError) as e:
             print(f"Error reading {infile!r}: {e}"); return False
-        if len(blob) == 0: print(f"Error: empty."); return False
+        if len(blob) == 0:
+            print(f"Error: empty."); return False
         base = os.path.basename(infile)
 
-        m = re.search(r'\.a(\d+)$', infile, re.IGNORECASE)
-        if m:
-            tn = int(m.group(1))
-            if not (1 <= tn <= 256):
-                print(f"Error: single ID out of range: {tn}"); return False
-            hdr_len = 2 if tn == 256 else 1
-            body = blob[hdr_len:]
-            try:
-                hdr_t, _ = _decode_single_header(blob)
-                if hdr_t != tn:
-                    print(f"  warn: header says a{hdr_t}, filename says a{tn}; using filename")
-            except Exception as e:
-                print(f"  warn: header decode: {e}")
-            try: r = self.dback(body)
-            except Exception as e: print(f"Error: backend: {e}"); return False
-            if r is None: print("Error: decode failed."); return False
-            try: orig = self.rev[tn](r)
-            except Exception as e: print(f"Error: inverse a{tn}: {e}"); return False
-            if not outfile: outfile = re.sub(r'\.a\d+$', '', base, flags=re.IGNORECASE) or (base + ".out")
-            self._write(outfile, orig); print(f"-> {outfile} ({len(orig)} bytes)"); return True
+        parsed = _parse_ext(infile)
+        if parsed is None:
+            print("Error: filename must end with .a-HH-HH (extension is the header).")
+            print("       e.g.  file.bin.a-00-00  file.bin.a-fa-ff")
+            return False
+        kind, ident = parsed
+        print(f"  header from extension: {kind}{ident}")
 
-        m = re.search(r'\.b(\d+)$', infile, re.IGNORECASE)
-        if m:
-            pn = int(m.group(1))
-            if not (1 <= pn <= 65535):
-                print(f"Error: pair index out of range: {pn}"); return False
-            body = blob[2:]
-            try:
-                hdr_n, _ = _decode_pair_header(blob)
-                if hdr_n != pn:
-                    print(f"  warn: header says b{hdr_n}, filename says b{pn}; using filename")
-            except Exception as e:
-                print(f"  warn: header decode: {e}")
-            total = len(self.pairs)
-            if pn > total:
-                print(f"Error: pair index {pn} > total pairs {total}."); return False
-            a, b = self.pairs[pn - 1]
-            try: r = self.dback(body)
-            except Exception as e: print(f"Error: backend: {e}"); return False
-            if r is None: print("Error: decode failed."); return False
-            try: orig = self.rev[a](self.rev[b](r))
-            except Exception as e: print(f"Error: inverse pair b{pn}: {e}"); return False
-            if not outfile: outfile = re.sub(r'\.b\d+$', '', base, flags=re.IGNORECASE) or (base + ".out")
-            self._write(outfile, orig); print(f"-> {outfile} ({len(orig)} bytes)"); return True
+        if kind == "b" and ident > len(self.pairs):
+            print(f"Error: pair idx {ident} > total {len(self.pairs)}."); return False
 
-        m = re.search(r'\.c(\d+)$', infile, re.IGNORECASE)
-        if m:
-            cn = int(m.group(1))
-            print(f"Error: C-class escape c{cn} not handled as a transform."); return False
-
-        if len(blob) >= 2 and blob[0] == 0xFF and blob[1] == 0xFE:
-            body = blob[2:]; tn = 256
-        elif len(blob) >= 2 and blob[0] == 0xFF and blob[1] != 0xFE:
-            print("Error: file uses C-class escape; specify .cN extension."); return False
-        else:
-            tn = blob[0] + 1 if blob[0] != 0xFF else None
-            if tn is None:
-                print("Error: cannot infer header from file."); return False
-            body = blob[1:]
-        try: r = self.dback(body)
+        try: r = self.dback(blob)
         except Exception as e: print(f"Error: backend: {e}"); return False
         if r is None: print("Error: decode failed."); return False
-        try: orig = self.rev[tn](r)
-        except Exception as e: print(f"Error: inverse a{tn}: {e}"); return False
-        if not outfile: outfile = base + ".out"
-        self._write(outfile, orig); print(f"-> {outfile} ({len(orig)} bytes)")
+
+        try:
+            if kind == "a":
+                orig = self.rev[ident](r)
+            else:
+                a, b = self.pairs[ident - 1]
+                orig = self.rev[a](self.rev[b](r))
+        except Exception as e:
+            print(f"Error: inverse {kind}{ident}: {e}"); return False
+
+        if not outfile:
+            m = _EXT_RE.search(base)
+            if m: outfile = base[:m.start()]
+            else: outfile = base + ".out"
+            if not outfile: outfile = base + ".out"
+
+        self._write(outfile, orig)
+        print(f"-> {outfile} ({len(orig)} bytes)")
         return True
 
     # ─── Self-tests ───
@@ -2771,9 +2693,9 @@ class Compressor:
                 tr = self.fwd[t](sample)
                 back = self.rev[t](tr)
                 if back != sample:
-                    bad.append((t, "mismatch", len(sample), len(tr), len(back)))
+                    bad.append((t, "mismatch"))
             except Exception as e:
-                bad.append((t, repr(e), None, None, None))
+                bad.append((t, repr(e)))
         if bad:
             print(f"  FAIL: {len(bad)} transforms are NOT lossless:")
             for row in bad[:30]: print(f"    a{row[0]:>3}: {row[1]}")
@@ -2785,6 +2707,7 @@ class Compressor:
         if sample is None:
             sample = b"the quick brown fox " * 4
         limit = max_pairs if max_pairs is not None else len(self.pairs)
+        limit = min(limit, len(self.pairs))
         print("="*60); print(f"Sweep: {limit} of {len(self.pairs)} pairs"); print("="*60)
         bad = 0; tested = 0; errors = []
         for i, (a, b) in enumerate(self.pairs[:limit]):
@@ -2806,23 +2729,15 @@ class Compressor:
         return True
 
     def selftest(self):
-        print("="*60); print("Self-Test (A/B/C compact headers + XML + Qiskit)"); print("="*60)
-        for t in range(1, 257):
-            hdr = _encode_single_header(t)
-            got, used = _decode_single_header(hdr)
-            if got != t: print(f"  FAIL single a{t} hdr {hdr.hex()} → {got}"); return False
-        print("  A-class headers a1..a256: PASS")
-        for n in (1, 2, 255, 256, 257, 1000, 32767, 32768, 65535):
-            hdr = _encode_pair_header(n)
-            got, used = _decode_pair_header(hdr)
-            if got != n: print(f"  FAIL pair b{n} hdr {hdr.hex()} → {got}"); return False
-        print("  B-class headers b1..b65535: PASS")
-        for n in (1, 2, 127, 254, 255):
-            hdr = _encode_c_header(n)
-            got, used = _decode_c_header(hdr)
-            if got != n: print(f"  FAIL C c{n} hdr {hdr.hex()} → {got}"); return False
-        print("  C-class escape headers c1..c255: PASS")
-
+        print("="*60); print("Self-Test (extension-as-header)"); print("="*60)
+        # extension round-trips
+        for kind, ident in [("a", 1), ("a", 62), ("a", 256), ("b", 1), ("b", MAX_PAIRS)]:
+            ext = _ext_for(kind, ident)
+            parsed = _parse_ext("foo.bin" + ext)
+            if parsed != (kind, ident):
+                print(f"  FAIL ext {ext} → {parsed}"); return False
+        print(f"  Extension .a-HH-HH round-trips: PASS  (b cap: {MAX_PAIRS})")
+        # XML
         _z = io.BytesIO()
         with zipfile.ZipFile(_z, 'w', zipfile.ZIP_STORED) as z:
             z.writestr("word/document.xml",
@@ -2833,17 +2748,12 @@ class Compressor:
         tr = self.t_xml(docx_bytes); rs = self.r_xml(tr)
         if rs != docx_bytes: print("  FAIL t_xml docx"); return False
         print(f"  docx: {len(docx_bytes)} → {len(tr)} ({len(tr)/len(docx_bytes)*100:.1f}%)")
-
         for p in [b"hello world " * 20, b"\x00" * 1000, os.urandom(200)]:
             e = self.cback(p); d = self.dback(e)
             if d != p: print(f"  FAIL backend len={len(p)}"); return False
         print("  Backends: PASS")
-
-        if not self.selftest_all_transforms():
-            return False
-        if not self.selftest_all_pairs(max_pairs=min(5000, len(self.pairs))):
-            return False
-
+        if not self.selftest_all_transforms(): return False
+        if not self.selftest_all_pairs(max_pairs=min(5000, len(self.pairs))): return False
         import tempfile as _tf
         with _tf.TemporaryDirectory() as td:
             src = os.path.join(td, "sample.txt")
@@ -2863,8 +2773,10 @@ class Compressor:
 
 def main():
     print(f"{PROGNAME}")
-    print("* COMPACT headers: 1-byte singles a1..a255, 2-byte a256, 2-byte pairs b1..b65535, escape c1..c255 *")
-    print("* XML structural v2 at a61; Qiskit mask at a62 *")
+    print("* Extension-as-header — no header bytes inside file")
+    print(f"* 0x0000..0x00FF → single a1..a256")
+    print(f"* 0x0100..0xFFFF → pair   b1..b{MAX_PAIRS}")
+    print("* Extension: <original>.a-<h0hex>-<h1hex>   e.g.  .a-00-00  .a-fa-ff")
     try:
         mp.set_start_method('fork', force=True)
         print(f"mp: fork, {N_CORES} workers (cpu_count={CPU_COUNT})")
