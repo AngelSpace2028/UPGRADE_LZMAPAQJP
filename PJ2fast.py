@@ -867,6 +867,13 @@ class Compressor:
         if len(self._cback_cache) < self._CBACK_CACHE_MAX: self._cback_cache[d] = result
         return result
 
+    # ─────────────────────────────────────────────────────────────────
+    # FIXED: never returns an unverified blob.
+    # The previous version had an unsafe fast-path that returned a blob
+    # *after* verifying that it did NOT round-trip.  That is what caused
+    # "[FATAL] a1 verify failed" on the fallback (a1 is identity, so a
+    # bad cback(data) is what broke it).
+    # ─────────────────────────────────────────────────────────────────
     def _cback_compute(self, d):
         thunks = [("raw", lambda: (0, d))]
         if HAS_ZSTD:
@@ -942,14 +949,17 @@ class Compressor:
         cs.sort(key=lambda x: len(x[1]))
         raw_size = len(d)
         for fmt, comp in cs:
+            if fmt == 0:
+                return bytes([0]) + d
             blob = bytes([fmt]) + comp
-            if fmt == 0: return blob
-            if len(blob) >= raw_size: break
+            if len(blob) >= raw_size:
+                break
+            # ALWAYS verify; never trust an unverified blob.
             try:
-                if self.dback(blob) == d: return blob
-            except Exception: continue
-            if FAST_MODE and len(blob) < raw_size * EARLY_EXIT_GAIN:
-                return blob
+                if self.dback(blob) == d:
+                    return blob
+            except Exception:
+                continue
         return bytes([0]) + d
 
     def dback(self, d):
@@ -2593,18 +2603,29 @@ class Compressor:
             candidates.append((len(c), "a", 1, "a1", c))
 
         candidates.sort(key=lambda x: x[0])
-        best_size, kind, ident, label, c = candidates[0]
-        best_blob = c  # no in-file header — extension carries it
 
-        check = self._decode_blob(best_blob, kind, ident)
-        if check != data:
-            print(f"  [WARNING] winner {label} failed in-memory verify; falling back to a1")
+        # ─────────────────────────────────────────────────────────────
+        # FIXED: walk candidates from smallest to largest and take the
+        # first one that ACTUALLY round-trips in memory.  The old code
+        # trusted candidates[0] and, on failure, jumped to a1 (which was
+        # the same broken blob if cback was at fault).
+        # ─────────────────────────────────────────────────────────────
+        chosen = None
+        for sz, k_, id_, lbl_, c_ in candidates:
+            chk = self._decode_blob(c_, k_, id_)
+            if chk == data:
+                chosen = (sz, k_, id_, lbl_, c_)
+                break
+            print(f"  [{lbl_}] in-memory verify FAILED — skipping")
+
+        if chosen is None:
             c = self.cback(data)
-            best_blob = c
-            best_size = len(best_blob); kind, ident, label = "a", 1, "a1"
-            check = self._decode_blob(best_blob, kind, ident)
-            if check != data:
-                print("  [FATAL] a1 verify failed; aborting without writing."); return
+            if self._decode_blob(c, "a", 1) != data:
+                print("  [FATAL] all candidates (including a1) failed verify; aborting without writing.")
+                return
+            chosen = (len(c), "a", 1, "a1", c)
+
+        best_size, kind, ident, label, best_blob = chosen
         print(f"  winner {label} round-trip: OK")
 
         for sz, k_, id_, lbl_, c_ in candidates:
@@ -2732,7 +2753,6 @@ class Compressor:
 
     def selftest(self):
         print("="*60); print("Self-Test (extension .aXXXX)"); print("="*60)
-        # extension round-trips
         for kind, ident in [("a", 1), ("a", 62), ("a", 256), ("b", 1), ("b", MAX_PAIRS)]:
             ext = _ext_for(kind, ident)
             parsed = _parse_ext("foo.bin" + ext)
@@ -2740,7 +2760,6 @@ class Compressor:
                 print(f"  FAIL ext {ext} → {parsed}"); return False
             print(f"    {kind}{ident}  →  {ext}")
         print(f"  Extension .aXXXX round-trips: PASS  (b cap: {MAX_PAIRS})")
-        # XML
         _z = io.BytesIO()
         with zipfile.ZipFile(_z, 'w', zipfile.ZIP_STORED) as z:
             z.writestr("word/document.xml",
