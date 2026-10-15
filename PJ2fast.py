@@ -867,13 +867,6 @@ class Compressor:
         if len(self._cback_cache) < self._CBACK_CACHE_MAX: self._cback_cache[d] = result
         return result
 
-    # ─────────────────────────────────────────────────────────────────
-    # FIXED: never returns an unverified blob.
-    # The previous version had an unsafe fast-path that returned a blob
-    # *after* verifying that it did NOT round-trip.  That is what caused
-    # "[FATAL] a1 verify failed" on the fallback (a1 is identity, so a
-    # bad cback(data) is what broke it).
-    # ─────────────────────────────────────────────────────────────────
     def _cback_compute(self, d):
         thunks = [("raw", lambda: (0, d))]
         if HAS_ZSTD:
@@ -954,7 +947,6 @@ class Compressor:
             blob = bytes([fmt]) + comp
             if len(blob) >= raw_size:
                 break
-            # ALWAYS verify; never trust an unverified blob.
             try:
                 if self.dback(blob) == d:
                     return blob
@@ -1010,28 +1002,47 @@ class Compressor:
             except Exception: return None
         return None
 
-    # ─── XML transform ───
+    # ─── XML transform (FIXED — mode 0x04 for raw ZIP) ───
     def t_xml(self, d):
-        if not d: return b'\x00'
-        if d[:8] == OLE_MAGIC: return b'\x03' + d
+        if not d:
+            return b'\x00'
+        if d[:8] == OLE_MAGIC:
+            return b'\x03' + d
         if d[:4] == ZIP_MAGIC:
             payload = _xml_encode_v2(d)
-            if payload is not None: return b'\x02' + payload
-            return b'\x02' + d
-        if not _xml_is_plausible(d): return b'\x00' + d
+            if payload is not None:
+                try:
+                    if _xml_decode_v2(payload) == d:
+                        return b'\x02' + payload
+                except Exception:
+                    pass
+            return b'\x04' + d
+        if not _xml_is_plausible(d):
+            return b'\x00' + d
         payload = _xml_encode_v2(d)
-        if payload is None: return b'\x00' + d
+        if payload is None:
+            return b'\x00' + d
+        try:
+            if _xml_decode_v2(payload) != d:
+                return b'\x00' + d
+        except Exception:
+            return b'\x00' + d
         return b'\x01' + payload
+
     def r_xml(self, d):
-        if not d: return b''
+        if not d:
+            return b''
         mode = d[0]; body = d[1:]
-        if mode == 0: return body
-        if mode == 1: return _xml_decode_v2(body)
-        if mode == 2:
-            if body[:4] == ZIP_MAGIC: return body
-            try: return _xml_decode_v2(body)
-            except TransformError: return body
-        if mode == 3: return body
+        if mode == 0x00:
+            return body
+        if mode == 0x01:
+            return _xml_decode_v2(body)
+        if mode == 0x02:
+            return _xml_decode_v2(body)
+        if mode == 0x03:
+            return body
+        if mode == 0x04:
+            return body
         raise TransformError(f"t_xml mode {mode}")
 
     # ─── All 256 transforms ───
@@ -1751,33 +1762,43 @@ class Compressor:
             if inv is None: raise TransformError(f"FLT27 {e200}")
             for i in range(BS): dec.append((pow(ch[i]+1, inv, 257)-1) & 0xFF)
         return bytes(dec[:ol])
+
+    # ─── FIXED Transform 38 — store per-block original length ───
     def _t38(self, d):
         BS = 1024
         if not d:
             ch = b'\x00'*BS; c = self.cback(ch)
-            o = bytearray(struct.pack('>I', 0)); o += b'\x01\x00' + bytes([(len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
+            o = bytearray(b'\x00' + struct.pack('>I', 0))
+            o += b'\x01\x00' + bytes([(len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
             return bytes(o)
         tb = (len(d)+BS-1)//BS
-        o = bytearray(); o.extend(len(d).to_bytes(4, 'big'))
+        o = bytearray(b'\x00' + struct.pack('>I', len(d)))
         for bi in range(tb):
             s = bi*BS; e = min(s+BS, len(d))
-            ch = d[s:e] + b'\x00'*(BS-len(d[s:e]))
+            blk_len = e - s
+            ch = d[s:e] + b'\x00'*(BS-blk_len)
             n = ((len(d)*7 + bi*13 + 1) & 0xFFFF) | 1
             e_ = pow(n, 16777216, 257) | 1; e200 = pow(e_, 200, 257)
             t = bytearray(ch)
             for i in range(BS): t[i] = (pow(t[i]+1, e200, 257)-1) & 0xFF
             c = self.cback(bytes(t))
-            o += bytes([n & 0xFF, (n>>8) & 0xFF, (len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
+            o += bytes([n & 0xFF, (n>>8) & 0xFF, (len(c)>>8) & 0xFF, len(c) & 0xFF])
+            o += bytes([(blk_len>>8) & 0xFF, blk_len & 0xFF])
+            o += c
         return bytes(o)
+
     def _r38(self, d):
-        if len(d) < 4: raise TransformError("FLT28")
-        ol = int.from_bytes(d[:4], 'big'); p = d[4:]
+        if len(d) < 5: raise TransformError("FLT28")
+        if d[0] != 0: raise TransformError("FLT28 magic")
+        ol = int.from_bytes(d[1:5], 'big'); p = d[5:]
         pos = 0; dec = bytearray()
         while pos < len(p):
             if pos+2 > len(p): raise TransformError("FLT28 hdr")
             n = p[pos] | (p[pos+1]<<8); pos += 2
             if pos+2 > len(p): raise TransformError("FLT28 len")
             cl = (p[pos]<<8) | p[pos+1]; pos += 2
+            if pos+2 > len(p): raise TransformError("FLT28 blk")
+            blk_len = (p[pos]<<8) | p[pos+1]; pos += 2
             cb = p[pos:pos+cl]; pos += cl
             b = self.dback(cb)
             if b is None: raise TransformError("FLT28 body")
@@ -1786,55 +1807,74 @@ class Compressor:
             if inv is None: raise TransformError(f"FLT28 {e200}")
             t = bytearray(b)
             for i in range(len(t)): t[i] = (pow(t[i]+1, inv, 257)-1) & 0xFF
-            dec.extend(t)
+            dec.extend(t[:blk_len])
         return bytes(dec[:ol])
+
+    # ─── FIXED Transform 39 — store per-block original length ───
     def _t39(self, d):
         BS = 32
         if not d:
             ch = b'\x00'*BS; c = self.cback(ch)
-            o = bytearray(struct.pack('>I', 0)); o += b'\x01\x00' + bytes([(len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
+            o = bytearray(b'\x00' + struct.pack('>I', 0))
+            o += b'\x01\x00' + bytes([(len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
             return bytes(o)
         tb = (len(d)+BS-1)//BS
-        o = bytearray(); o.extend(len(d).to_bytes(4, 'big'))
+        o = bytearray(b'\x00' + struct.pack('>I', len(d)))
         for bi in range(tb):
             s = bi*BS; e = min(s+BS, len(d))
-            ch = d[s:e] + b'\x00'*(BS-len(d[s:e]))
+            blk_len = e - s
+            ch = d[s:e] + b'\x00'*(BS-blk_len)
             n = ((len(d)*7 + bi*13 + 1) & 0xFFFF) | 1
             c = self.cback(bytes(ch))
-            o += bytes([n & 0xFF, (n>>8) & 0xFF, (len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
+            o += bytes([n & 0xFF, (n>>8) & 0xFF, (len(c)>>8) & 0xFF, len(c) & 0xFF])
+            o += bytes([(blk_len>>8) & 0xFF, blk_len & 0xFF])
+            o += c
         return bytes(o)
+
     def _r39(self, d):
-        if len(d) < 4: raise TransformError("FLT29")
-        ol = int.from_bytes(d[:4], 'big'); p = d[4:]
+        if len(d) < 5: raise TransformError("FLT29")
+        if d[0] != 0: raise TransformError("FLT29 magic")
+        ol = int.from_bytes(d[1:5], 'big'); p = d[5:]
         pos = 0; dec = bytearray()
         while pos < len(p):
             if pos+2 > len(p): raise TransformError("FLT29 hdr")
-            pos += 2
+            pos += 2  # skip n
             if pos+2 > len(p): raise TransformError("FLT29 len")
             cl = (p[pos]<<8) | p[pos+1]; pos += 2
+            if pos+2 > len(p): raise TransformError("FLT29 blk")
+            blk_len = (p[pos]<<8) | p[pos+1]; pos += 2
             cb = p[pos:pos+cl]; pos += cl
             b = self.dback(cb)
             if b is None: raise TransformError("FLT29 body")
-            dec.extend(b)
+            dec.extend(b[:blk_len])
         return bytes(dec[:ol])
+
+    # ─── FIXED Transform 40 — store per-block original length ───
     def _t40(self, d):
         BS = 33
         if not d:
             ch = b'\x00'*BS; c = self.cback(ch)
-            o = bytearray(struct.pack('>I', 0)); o += b'\x01\x01' + bytes([(len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
+            o = bytearray(b'\x00' + struct.pack('>I', 0))
+            o += b'\x01\x01' + bytes([(len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
             return bytes(o)
         tb = (len(d)+BS-1)//BS
-        o = bytearray(); o.extend(len(d).to_bytes(4, 'big'))
+        o = bytearray(b'\x00' + struct.pack('>I', len(d)))
         for bi in range(tb):
             s = bi*BS; e = min(s+BS, len(d))
-            ch = d[s:e] + b'\x00'*(BS-len(d[s:e]))
+            blk_len = e - s
+            ch = d[s:e] + b'\x00'*(BS-blk_len)
             h = hashlib.sha256(ch + bytes([bi&0xFF, (len(d)>>8)&0xFF, len(d)&0xFF])).digest()
-            enc = bytes([32]) + h; c = self.cback(ch)
-            o += enc + bytes([(len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
+            enc = bytes([32]) + h
+            c = self.cback(ch)
+            o += enc + bytes([(len(c)>>8) & 0xFF, len(c) & 0xFF])
+            o += bytes([(blk_len>>8) & 0xFF, blk_len & 0xFF])
+            o += c
         return bytes(o)
+
     def _r40(self, d):
-        if len(d) < 4: raise TransformError("FLT30")
-        ol = int.from_bytes(d[:4], 'big'); p = d[4:]
+        if len(d) < 5: raise TransformError("FLT30")
+        if d[0] != 0: raise TransformError("FLT30 magic")
+        ol = int.from_bytes(d[1:5], 'big'); p = d[5:]
         pos = 0; dec = bytearray()
         while pos < len(p):
             Ln = p[pos]; pos += 1
@@ -1842,10 +1882,12 @@ class Compressor:
             pos += Ln
             if pos+2 > len(p): raise TransformError("FLT30 hdr")
             cl = (p[pos]<<8) | p[pos+1]; pos += 2
+            if pos+2 > len(p): raise TransformError("FLT30 blk")
+            blk_len = (p[pos]<<8) | p[pos+1]; pos += 2
             cb = p[pos:pos+cl]; pos += cl
             b = self.dback(cb)
             if b is None: raise TransformError("FLT30 body")
-            dec.extend(b)
+            dec.extend(b[:blk_len])
         return bytes(dec[:ol])
 
     def t41(self, d):
@@ -1989,6 +2031,8 @@ class Compressor:
                 elif c == 2: out += rup[i]
                 else: raise TransformError("t59 case 3")
         return bytes(out)
+
+    # ─── FIXED Transform 60 (CDD) — guaranteed lossless with mode byte ───
     def _cdd_masks(self, n4):
         c = self._cdd_cache.get(n4)
         if c is None:
@@ -1996,10 +2040,13 @@ class Compressor:
             masks = bytes(cdd_mask(i, mid) for i in range(n4))
             c = (mid, key, masks); self._cdd_cache[n4] = c
         return c
+
     def t_cdd(self, d):
-        if not d: return b''
+        if not d:
+            return b'\x00'
         L = len(d); n4 = L // 4; tail = bytes(d[n4 * 4:])
-        if n4 == 0: return bytes(d)
+        if n4 == 0:
+            return b'\x01' + struct.pack('>I', L) + bytes(d)
         mid, key, masks = self._cdd_masks(n4)
         t = bytearray(d[:n4 * 4])
         for i in range(n4):
@@ -2013,13 +2060,26 @@ class Compressor:
             v = int.from_bytes(t[b:b+4], 'little')
             v = (v - key) & 0xFFFFFFFF
             t[b:b+4] = v.to_bytes(4, 'little')
-        return bytes(t) + tail
+        return b'\x02' + bytes(t) + tail
+
     def r_cdd(self, d):
-        if not d: return b''
-        L = len(d); n4 = L // 4; tail = bytes(d[n4 * 4:])
-        if n4 == 0: return bytes(d)
+        if not d:
+            return b''
+        mode = d[0]; body = d[1:]
+        if mode == 0x00:
+            return b''
+        if mode == 0x01:
+            if len(body) < 4:
+                raise TransformError("cdd short raw")
+            L = struct.unpack('>I', body[:4])[0]
+            return body[4:4+L]
+        if mode != 0x02:
+            raise TransformError(f"cdd mode {mode}")
+        L = len(body); n4 = L // 4; tail = bytes(body[n4 * 4:])
+        if n4 == 0:
+            return bytes(body)
         mid, key, masks = self._cdd_masks(n4)
-        t = bytearray(d[:n4 * 4])
+        t = bytearray(body[:n4 * 4])
         for i in range(2, n4, 3):
             b = i * 4
             v = int.from_bytes(t[b:b+4], 'little')
@@ -2198,10 +2258,14 @@ class Compressor:
         for w in words: o.extend(w.to_bytes(wbytes, 'big'))
         return bytes(o[:ol])
 
+    # ─── FIXED Transform 62 (Quantum) — guaranteed lossless ───
     def t_quantum(self, d):
-        if not d or not HAS_QISKIT: return d
+        if not d or not HAS_QISKIT:
+            return d
         nq = getattr(self, "QUBITS", 16)
         mask = quantum_bytes_mask(nq, len(d))
+        if len(mask) != len(d):
+            return d
         return (int.from_bytes(d, "big") ^ int.from_bytes(mask, "big")).to_bytes(len(d), "big")
     r_quantum = t_quantum
 
@@ -2470,7 +2534,6 @@ class Compressor:
             return False
 
     def _decode_blob(self, blob, kind, ident):
-        """Decode blob (which contains ONLY the backend payload)."""
         try:
             r = self.dback(blob)
             if r is None: return None
@@ -2482,7 +2545,6 @@ class Compressor:
         except Exception:
             return None
 
-    # ─── Compress ───
     def compress(self, infile, pairs=True, multi=False, timeout=None):
         if not self._require_file(infile): return
         try:
@@ -2604,12 +2666,6 @@ class Compressor:
 
         candidates.sort(key=lambda x: x[0])
 
-        # ─────────────────────────────────────────────────────────────
-        # FIXED: walk candidates from smallest to largest and take the
-        # first one that ACTUALLY round-trips in memory.  The old code
-        # trusted candidates[0] and, on failure, jumped to a1 (which was
-        # the same broken blob if cback was at fault).
-        # ─────────────────────────────────────────────────────────────
         chosen = None
         for sz, k_, id_, lbl_, c_ in candidates:
             chk = self._decode_blob(c_, k_, id_)
@@ -2660,7 +2716,6 @@ class Compressor:
         except Exception as e:
             print(f"  [VERIFICATION ERROR: {e}]")
 
-    # ─── Decompress ───
     def decompress(self, infile, outfile=""):
         if not self._require_file(infile): return False
         try:
@@ -2705,7 +2760,6 @@ class Compressor:
         print(f"-> {outfile} ({len(orig)} bytes)")
         return True
 
-    # ─── Self-tests ───
     def selftest_all_transforms(self, sample=None):
         if sample is None:
             sample = b"the quick brown fox " * 8 + bytes(range(64))
