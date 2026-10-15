@@ -7,49 +7,10 @@
 #   <original>.aXXXX    where XXXX = 4 hex digits (2 bytes as u16)
 #   Examples: .a0000  .a003d  .a00ff  .a0100  .afaff  .affff
 #
-#   The 2 bytes (h0,h1) encode the transform used:
-#     0x0000..0x00FF → single a1..a256  (id = u16 + 1)
-#     0x0100..0xFFFF → pair   b1..b65280 (idx = u16 - 0xFF)
-#
-# FILE CONTENT:
-#   Just the backend-compressed payload (no header inside the file).
-#   Renaming the file breaks decompression — the extension IS the header.
-#
-# CORRECTIONS IN THIS REVISION (vs. the posted version):
-#   [C1]  Fixed ALL syntax errors in selftest_fixed, selftest, main.
-#   [C2]  nearest_prime fully byte-safe (never returns 257); all call sites
-#         go through _np() or an explicit & 0xFF.
-#   [C3]  t_rle_xor decoder rejects run==0 (raises TransformError).
-#   [C4]  t45/r45 Huffman code-length cap raised to 64 AND checked on both
-#         sides; encoder refuses to emit if any code length > 64.
-#   [C5]  t_quantum (a62) now embeds a Qiskit version tag; if the tag
-#         differs at decode time, the transform is refused instead of
-#         silently producing garbage.
-#   [C6]  t61 (XML) never raises out of t_xml — every failure path returns
-#         a safe mode-0x00 passthrough.
-#   [C7]  t58 encoder refuses to emit if the raw fallback isn't strictly
-#         shorter; decoder validates length before slicing.
-#   [C8]  _pairs() now enumerates all 65535 non-identity pairs (256×256-1)
-#         and the header cap is enforced only at write time.
-#   [C9]  _verify_all_transforms: ACTUAL fail-fast. Any transform that fails
-#         the boundary-input round-trip is replaced with identity, so the
-#         pipeline cannot silently corrupt data.
-#   [C10] decompress() validates the declared length against the decoded
-#         length for length-prefixed transforms (t00 now included).
-#   [C11] t45/r45: explicit mode byte kills the 0x00-collision that made
-#         Huffman output unreadable on every input < 16 MiB.
-#
-# HONEST CLAIMS:
-#   * 65280 pairs are ADDRESSABLE by the 2-byte header; the pair space is
-#     65535 (256×256−1). The other 255 are enumerated but skipped at write.
-#   * "Always lossless" holds WITHIN A FROZEN ENVIRONMENT (same script,
-#     same dictionary, same optional backends). The 12 Drive dictionaries
-#     and system word lists can change, and HAS_ZSTD/HAS_BROTLI/etc.
-#     are runtime-dependent. Files written on one machine may not decode
-#     on another if those differ.
-#   * The construction-time verifier + per-candidate _decode_blob round-trip
-#     + post-write readback equality are the three guarantees that make
-#     "lossless" checkable rather than aspirational.
+# CORRECTIONS:
+#   [C1]..[C11] as before.
+#   [C12] a38/a39: 2-byte FNV-1a losslessness tag per block, verified on decode.
+#   [C13] a40: 32-byte SHA-256 header verified on decode; block index tracked.
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -110,10 +71,7 @@ except (ValueError, AttributeError):
     _MP_CTX = mp.get_context(); _HAS_FORK = False
 
 IDENTITY_IDS = frozenset((1, 31, 32, 256))
-
-MAX_PAIRS = 65280  # 0x100..0xFFFF → 65280 slots
-# [C8] The full non-identity pair space is 256*256 - 1 = 65535.
-# MAX_PAIRS is the *header* cap; we keep the enumeration honest.
+MAX_PAIRS = 65280
 
 _GLOBAL_COMP = None; _GLOBAL_DATA = None; _GLOBAL_FWD = {}
 _IN_WORKER = False
@@ -257,7 +215,6 @@ if not HAS_LEPTON:
             try: import lepton_jpeg_python; HAS_LEPTON = True; print("lepton_jpeg_python: OK")
             except ImportError: print("lepton_jpeg_python: install failed")
 
-# ─── Qiskit helpers ───
 def _build_seed_circuit(n_qubits):
     qc = QuantumCircuit(n_qubits, name="ppmd_q")
     for q in range(n_qubits): qc.h(q)
@@ -630,11 +587,7 @@ def _xml_decode_v2(payload):
 PRIMES = [p for p in range(2, 256) if all(p % d != 0 for d in range(2, int(p**0.5) + 1))]
 PI_DIGITS = [79, 17, 111]
 
-# ═══════════════════════════════════════════════════════════════════════
-# [C2] nearest_prime — always returns a value in 0..255
-# ═══════════════════════════════════════════════════════════════════════
 def nearest_prime(n):
-    """Return the nearest prime to n, clamped/masked to 0..255."""
     n &= 0xFF
     if n < 2:
         return 2
@@ -670,9 +623,6 @@ def mod_inv(a, m):
     if x < 0: x += m0
     return x
 
-# ═══════════════════════════════════════════════════════════════════════
-# Extension-as-header helpers — format .aXXXX (4 hex digits, no dashes)
-# ═══════════════════════════════════════════════════════════════════════
 def _encode_header(kind, ident):
     if kind == "a":
         if not (1 <= ident <= 256): raise TransformError(f"single ID out of range: {ident}")
@@ -711,7 +661,7 @@ class Compressor:
     TOP_K = 100; FAST = True; BLOCK = 4096
     MAX_TRANSFORM = 256; PROGRESS_EVERY = 500; STRIDE = 3
     MAX_EAGER_ID = 256
-    HUFF_MAX_LEN = 64  # [C4]
+    HUFF_MAX_LEN = 64
 
     def __init__(self, try_dl=True, pairs=MAX_PAIRS, qubits=16):
         self.PAIRS = min(pairs, MAX_PAIRS)
@@ -746,12 +696,9 @@ class Compressor:
             self._qperm = list(range(self.PAIRS))
         self._build_ref_dict(); self._maps(); self._pairs()
         self._pair_index = {p: i + 1 for i, p in enumerate(self.pairs)}
-        # [C9] ACTUAL fail-fast: replace every non-round-tripping transform
-        # with identity so the pipeline cannot silently corrupt data.
         self._verify_all_transforms()
 
     def _verify_all_transforms(self):
-        # [C9] Four boundary inputs per transform. Any failure => identity.
         sample = (b"the quick brown fox jumps over the lazy dog " * 3
                   + bytes(range(256)) + os.urandom(64))
         tests = [b"", b"\x00", b"\xff", sample]
@@ -805,6 +752,13 @@ class Compressor:
         return (int.from_bytes(d, 'big') ^ int.from_bytes(mask, 'big')).to_bytes(L, 'big')
     def _np(self, n):
         return (self._np_tab[n] if n < 600 else nearest_prime(n)) & 0xFF
+
+    @staticmethod
+    def _blk_check(b):
+        h = 0x811c9dc5
+        for byte in b:
+            h = ((h ^ byte) * 0x01000193) & 0xFFFFFFFF
+        return (h ^ (h >> 16)) & 0xFFFF
 
     def _sbox_perm(self, key_bytes):
         cache_key = bytes(key_bytes)
@@ -1100,8 +1054,6 @@ class Compressor:
             except Exception: return None
         return None
 
-    # ─── XML transform ───
-    # [C6] t_xml never raises: every failure returns a mode-0x00 passthrough.
     def t_xml(self, d):
         if not d:
             return b'\x00'
@@ -1143,7 +1095,6 @@ class Compressor:
             return body
         raise TransformError(f"t_xml mode {mode}")
 
-    # ─── All 256 transforms ───
     def t00(self, d):
         if not d: return struct.pack('>I', 0)
         br, bl, bsh = None, float('inf'), []
@@ -1196,7 +1147,6 @@ class Compressor:
         ol = struct.unpack('>I', cd[:4])[0]; cd = cd[4:]
         if not cd: return b''
         if cd[0] == 0:
-            # [C10] validate declared length
             if 1 + ol > len(cd):
                 raise TransformError(f"T00 raw len {len(cd)-1}<{ol}")
             return cd[1:ol+1]
@@ -1205,7 +1155,6 @@ class Compressor:
         sh = list(cd[1:1+np]); rle = cd[1+np:]
         dec = self._unrle(rle)
         if dec is None: raise TransformError("T00 dec")
-        # [C10] validate decoded length
         if len(dec) < ol:
             raise TransformError(f"T00 short decoded {len(dec)}<{ol}")
         cur = bytearray(dec[:ol])
@@ -1977,126 +1926,149 @@ class Compressor:
 
     def _t38(self, d):
         BS = 1024
-        if not d:
-            ch = b'\x00'*BS; c = self.cback(ch)
-            o = bytearray(b'\x00' + struct.pack('>I', 0))
-            o += b'\x01\x00' + bytes([(len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
-            return bytes(o)
-        tb = (len(d)+BS-1)//BS
+        tb = (len(d) + BS - 1) // BS
         o = bytearray(b'\x00' + struct.pack('>I', len(d)))
         for bi in range(tb):
-            s = bi*BS; e = min(s+BS, len(d))
+            s = bi * BS
+            e = min(s + BS, len(d))
             blk_len = e - s
-            ch = d[s:e] + b'\x00'*(BS-blk_len)
-            n = ((len(d)*7 + bi*13 + 1) & 0xFFFF) | 1
-            e_ = pow(n, 16777216, 257) | 1; e200 = pow(e_, 200, 257)
+            ch = d[s:e] + b'\x00' * (BS - blk_len)
+            n = ((len(d) * 7 + bi * 13 + 1) & 0xFFFF) | 1
+            e_ = pow(n, 16777216, 257) | 1
+            e200 = pow(e_, 200, 257)
             t = bytearray(ch)
-            for i in range(BS): t[i] = (pow(t[i]+1, e200, 257)-1) & 0xFF
-            c = self.cback(bytes(t))
-            o += bytes([n & 0xFF, (n>>8) & 0xFF, (len(c)>>8) & 0xFF, len(c) & 0xFF])
-            o += bytes([(blk_len>>8) & 0xFF, blk_len & 0xFF])
+            for i in range(BS):
+                t[i] = (pow(t[i] + 1, e200, 257) - 1) & 0xFF
+            tb_bytes = bytes(t)
+            c = self.cback(tb_bytes)
+            ck = self._blk_check(tb_bytes)
+            o += bytes([n & 0xFF, (n >> 8) & 0xFF,
+                        (len(c) >> 8) & 0xFF, len(c) & 0xFF,
+                        (blk_len >> 8) & 0xFF, blk_len & 0xFF,
+                        (ck >> 8) & 0xFF, ck & 0xFF])
             o += c
         return bytes(o)
 
     def _r38(self, d):
-        if len(d) < 5: raise TransformError("FLT28")
+        if len(d) < 5: raise TransformError("FLT28 short")
         if d[0] != 0: raise TransformError("FLT28 magic")
         ol = int.from_bytes(d[1:5], 'big'); p = d[5:]
         pos = 0; dec = bytearray()
         while pos < len(p):
-            if pos+2 > len(p): raise TransformError("FLT28 hdr")
-            n = p[pos] | (p[pos+1]<<8); pos += 2
-            if pos+2 > len(p): raise TransformError("FLT28 len")
-            cl = (p[pos]<<8) | p[pos+1]; pos += 2
-            if pos+2 > len(p): raise TransformError("FLT28 blk")
-            blk_len = (p[pos]<<8) | p[pos+1]; pos += 2
-            cb = p[pos:pos+cl]; pos += cl
+            if pos + 8 > len(p): raise TransformError("FLT28 hdr")
+            n = p[pos] | (p[pos + 1] << 8)
+            cl = (p[pos + 2] << 8) | p[pos + 3]
+            blk_len = (p[pos + 4] << 8) | p[pos + 5]
+            ck = (p[pos + 6] << 8) | p[pos + 7]
+            pos += 8
+            if pos + cl > len(p): raise TransformError("FLT28 body")
+            cb = p[pos:pos + cl]; pos += cl
             b = self.dback(cb)
-            if b is None: raise TransformError("FLT28 body")
-            n |= 1; e_ = pow(n, 16777216, 257) | 1; e200 = pow(e_, 200, 257)
+            if b is None: raise TransformError("FLT28 decode")
+            if len(b) != 1024: raise TransformError(f"FLT28 blk len {len(b)}")
+            if self._blk_check(b) != ck:
+                raise TransformError("FLT28 checksum")
+            n |= 1
+            e_ = pow(n, 16777216, 257) | 1
+            e200 = pow(e_, 200, 257)
             inv = mod_inv(e200, 256)
             if inv is None: raise TransformError(f"FLT28 {e200}")
             t = bytearray(b)
-            for i in range(len(t)): t[i] = (pow(t[i]+1, inv, 257)-1) & 0xFF
+            for i in range(len(t)):
+                t[i] = (pow(t[i] + 1, inv, 257) - 1) & 0xFF
+            if blk_len > len(t): raise TransformError("FLT28 blk_len")
             dec.extend(t[:blk_len])
+        if len(dec) < ol: raise TransformError(f"FLT28 short {len(dec)}<{ol}")
         return bytes(dec[:ol])
 
     def _t39(self, d):
         BS = 32
-        if not d:
-            ch = b'\x00'*BS; c = self.cback(ch)
-            o = bytearray(b'\x00' + struct.pack('>I', 0))
-            o += b'\x01\x00' + bytes([(len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
-            return bytes(o)
-        tb = (len(d)+BS-1)//BS
+        tb = (len(d) + BS - 1) // BS
         o = bytearray(b'\x00' + struct.pack('>I', len(d)))
         for bi in range(tb):
-            s = bi*BS; e = min(s+BS, len(d))
+            s = bi * BS
+            e = min(s + BS, len(d))
             blk_len = e - s
-            ch = d[s:e] + b'\x00'*(BS-blk_len)
-            n = ((len(d)*7 + bi*13 + 1) & 0xFFFF) | 1
+            ch = d[s:e] + b'\x00' * (BS - blk_len)
+            n = ((len(d) * 7 + bi * 13 + 1) & 0xFFFF) | 1
             c = self.cback(bytes(ch))
-            o += bytes([n & 0xFF, (n>>8) & 0xFF, (len(c)>>8) & 0xFF, len(c) & 0xFF])
-            o += bytes([(blk_len>>8) & 0xFF, blk_len & 0xFF])
+            ck = self._blk_check(bytes(ch))
+            o += bytes([n & 0xFF, (n >> 8) & 0xFF,
+                        (len(c) >> 8) & 0xFF, len(c) & 0xFF,
+                        (blk_len >> 8) & 0xFF, blk_len & 0xFF,
+                        (ck >> 8) & 0xFF, ck & 0xFF])
             o += c
         return bytes(o)
 
     def _r39(self, d):
-        if len(d) < 5: raise TransformError("FLT29")
+        if len(d) < 5: raise TransformError("FLT29 short")
         if d[0] != 0: raise TransformError("FLT29 magic")
         ol = int.from_bytes(d[1:5], 'big'); p = d[5:]
         pos = 0; dec = bytearray()
         while pos < len(p):
-            if pos+2 > len(p): raise TransformError("FLT29 hdr")
-            pos += 2
-            if pos+2 > len(p): raise TransformError("FLT29 len")
-            cl = (p[pos]<<8) | p[pos+1]; pos += 2
-            if pos+2 > len(p): raise TransformError("FLT29 blk")
-            blk_len = (p[pos]<<8) | p[pos+1]; pos += 2
-            cb = p[pos:pos+cl]; pos += cl
+            if pos + 8 > len(p): raise TransformError("FLT29 hdr")
+            n = p[pos] | (p[pos + 1] << 8)
+            cl = (p[pos + 2] << 8) | p[pos + 3]
+            blk_len = (p[pos + 4] << 8) | p[pos + 5]
+            ck = (p[pos + 6] << 8) | p[pos + 7]
+            pos += 8
+            if pos + cl > len(p): raise TransformError("FLT29 body")
+            cb = p[pos:pos + cl]; pos += cl
             b = self.dback(cb)
-            if b is None: raise TransformError("FLT29 body")
+            if b is None: raise TransformError("FLT29 decode")
+            if len(b) != 32: raise TransformError(f"FLT29 blk len {len(b)}")
+            if self._blk_check(b) != ck:
+                raise TransformError("FLT29 checksum")
+            if blk_len > len(b): raise TransformError("FLT29 blk_len")
             dec.extend(b[:blk_len])
+        if len(dec) < ol: raise TransformError(f"FLT29 short {len(dec)}<{ol}")
         return bytes(dec[:ol])
 
     def _t40(self, d):
         BS = 33
-        if not d:
-            ch = b'\x00'*BS; c = self.cback(ch)
-            o = bytearray(b'\x00' + struct.pack('>I', 0))
-            o += b'\x01\x01' + bytes([(len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
-            return bytes(o)
-        tb = (len(d)+BS-1)//BS
+        tb = (len(d) + BS - 1) // BS
         o = bytearray(b'\x00' + struct.pack('>I', len(d)))
         for bi in range(tb):
-            s = bi*BS; e = min(s+BS, len(d))
+            s = bi * BS
+            e = min(s + BS, len(d))
             blk_len = e - s
-            ch = d[s:e] + b'\x00'*(BS-blk_len)
-            h = hashlib.sha256(ch + bytes([bi&0xFF, (len(d)>>8)&0xFF, len(d)&0xFF])).digest()
+            ch = d[s:e] + b'\x00' * (BS - blk_len)
+            h = hashlib.sha256(
+                ch + bytes([bi & 0xFF, (len(d) >> 8) & 0xFF, len(d) & 0xFF])
+            ).digest()
             enc = bytes([32]) + h
             c = self.cback(ch)
-            o += enc + bytes([(len(c)>>8) & 0xFF, len(c) & 0xFF])
-            o += bytes([(blk_len>>8) & 0xFF, blk_len & 0xFF])
+            o += enc + bytes([(len(c) >> 8) & 0xFF, len(c) & 0xFF])
+            o += bytes([(blk_len >> 8) & 0xFF, blk_len & 0xFF])
             o += c
         return bytes(o)
 
     def _r40(self, d):
-        if len(d) < 5: raise TransformError("FLT30")
+        if len(d) < 5: raise TransformError("FLT30 short")
         if d[0] != 0: raise TransformError("FLT30 magic")
         ol = int.from_bytes(d[1:5], 'big'); p = d[5:]
-        pos = 0; dec = bytearray()
+        pos = 0; dec = bytearray(); bi = 0
         while pos < len(p):
+            if pos >= len(p): raise TransformError("FLT30 eof")
             Ln = p[pos]; pos += 1
-            if Ln > 32 or pos+Ln > len(p): raise TransformError("FLT30 n")
-            pos += Ln
-            if pos+2 > len(p): raise TransformError("FLT30 hdr")
-            cl = (p[pos]<<8) | p[pos+1]; pos += 2
-            if pos+2 > len(p): raise TransformError("FLT30 blk")
-            blk_len = (p[pos]<<8) | p[pos+1]; pos += 2
-            cb = p[pos:pos+cl]; pos += cl
+            if Ln != 32 or pos + Ln > len(p): raise TransformError("FLT30 n")
+            stored_h = p[pos:pos + Ln]; pos += Ln
+            if pos + 4 > len(p): raise TransformError("FLT30 hdr")
+            cl = (p[pos] << 8) | p[pos + 1]; pos += 2
+            blk_len = (p[pos] << 8) | p[pos + 1]; pos += 2
+            if pos + cl > len(p): raise TransformError("FLT30 body")
+            cb = p[pos:pos + cl]; pos += cl
             b = self.dback(cb)
-            if b is None: raise TransformError("FLT30 body")
+            if b is None: raise TransformError("FLT30 decode")
+            expected_h = hashlib.sha256(
+                b + bytes([bi & 0xFF, (ol >> 8) & 0xFF, ol & 0xFF])
+            ).digest()
+            if expected_h != stored_h:
+                raise TransformError("FLT30 checksum")
+            if blk_len > len(b): raise TransformError("FLT30 blk_len")
             dec.extend(b[:blk_len])
+            bi += 1
+        if len(dec) < ol: raise TransformError(f"FLT30 short {len(dec)}<{ol}")
         return bytes(dec[:ol])
 
     def t41(self, d):
@@ -2148,16 +2120,14 @@ class Compressor:
             c[s] = (co, cl); co += 1
         return c
 
-    # [C4] + [C11] Huffman with explicit mode byte (kills the 0x00-collision)
     def t45(self, d):
         if not d:
-            return b'\x02'                                    # [C11] empty marker
+            return b'\x02'
         freq = [0]*256
         for b in d: freq[b] += 1
         cl = self._hcl(freq)
-        # [C4] refuse to emit if any code length exceeds HUFF_MAX_LEN
         if max(cl) > self.HUFF_MAX_LEN:
-            return b'\x00' + struct.pack('>I', len(d)) + d  # raw fallback
+            return b'\x00' + struct.pack('>I', len(d)) + d
         codes = self._hcc(cl)
         hdr = bytearray(len(d).to_bytes(4, 'big')); hdr.extend(cl)
         acc = 0; nbits = 0; o = bytearray()
@@ -2169,12 +2139,12 @@ class Compressor:
                 nbits -= 8
                 o.append((acc >> nbits) & 0xFF)
         if nbits: o.append((acc << (8 - nbits)) & 0xFF)
-        return b'\x01' + bytes(hdr) + bytes(o)              # [C11] explicit mode
+        return b'\x01' + bytes(hdr) + bytes(o)
 
     def r45(self, d):
         if not d:
             raise TransformError("Huff empty")
-        mode = d[0]; body = d[1:]                            # [C11] dispatch on mode
+        mode = d[0]; body = d[1:]
         if mode == 0x02:
             return b''
         if mode == 0x00:
@@ -2329,9 +2299,12 @@ class Compressor:
         n = len(d); pad = (4 - n % 4) % 4; p = d + b'\x00'*pad
         blocks = [p[i:i+4] for i in range(0, len(p), 4)]
         mc, _ = Counter(blocks).most_common(1)[0]
-        k = int.from_bytes(mc, 'little'); o = bytearray()
-        for blk in blocks: o.extend((int.from_bytes(blk, 'little') ^ k).to_bytes(4, 'little'))
+        k = int.from_bytes(mc, 'little')
+        o = bytearray()
+        for blk in blocks:
+            o.extend((int.from_bytes(blk, 'little') ^ k).to_bytes(4, 'little'))
         return bytes([pad]) + k.to_bytes(4, 'little') + bytes(o)
+
     def r57(self, d):
         if len(d) < 5: raise TransformError("T57")
         pad = d[0]; k = int.from_bytes(d[1:5], 'little'); p = d[5:]
@@ -2349,7 +2322,6 @@ class Compressor:
             enc = self._t58_encode(d)
             if enc is None:
                 return raw
-            # [C7] only accept if round-trips AND is strictly shorter
             if self._t58_decode(enc) != d:
                 return raw
             if len(enc) >= len(raw):
@@ -2366,7 +2338,6 @@ class Compressor:
             if len(body) < 8:
                 raise TransformError("a58 raw short")
             L = int.from_bytes(body[:8], 'big')
-            # [C7] validate declared length
             if 8 + L > len(body):
                 raise TransformError("a58 raw len")
             return body[8:8+L]
@@ -2396,7 +2367,6 @@ class Compressor:
                      for i in range(0, len(p), wbytes)]
             mask = (1 << bd) - 1
 
-        n = len(words)
         fibs = self.fib or [0, 1]
         Lf = len(fibs)
         const = Counter(words).most_common(1)[0][0]
@@ -2624,7 +2594,6 @@ class Compressor:
             o.extend(w.to_bytes(wbytes, 'big'))
         return bytes(o[:ol])
 
-    # [C5] quantum transform — refuses on version mismatch
     def t_quantum(self, d):
         if not d or not HAS_QISKIT:
             return d
@@ -2752,7 +2721,6 @@ class Compressor:
             out[j] = d[k] ^ ((k * 0x1F + 0x7A) & 0xFF)
         return bytes(out)
 
-    # [C3] decoder rejects run == 0
     def t_rle_xor(self, d):
         if not d: return b'\x00'
         out = bytearray(); i = 0; n = len(d)
@@ -2865,8 +2833,6 @@ class Compressor:
         print(f"Transforms registered: 1-76 explicit + 77-255 dynamic + 256 identity.")
 
     def _pairs(self):
-        # [C8] Enumerate ALL 65535 non-identity pairs. Header cap is enforced
-        # only at write time, so the tournament can *see* every pair.
         self.pairs = []
         for a in range(1, 257):
             for b in range(1, 257):
@@ -3182,7 +3148,6 @@ class Compressor:
         return True
 
     def selftest_fixed(self, n=500):
-        # [C1] fixed syntax
         import os as _os
         fixed = [7, 8, 9, 33, 35, 36, 37, 45, 58, 72]
         print("="*60); print("Targeted sweep: FIXED transforms"); print("="*60)
