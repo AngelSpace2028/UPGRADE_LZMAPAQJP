@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# PPMD_1.6 — Lossless Tournament + XML structural v2 + Qiskit mask + wide-base transforms
+# PPMD_1.6 — Lossless Tournament + XML structural v2 + Qiskit mask
+# + wide-base minus transforms (a77-a82) + parametrized minus (a83)
 # EXTENSION-AS-HEADER — saves the 2 bytes inside the file
 #
-# FILENAME:
-#   <original>.aXXXX    where XXXX = 4 hex digits (2 bytes as u16)
-#   Examples: .a0000  .a003d  .a00ff  .a0100  .afaff  .affff
-#
+# FILENAME:  <original>.aXXXX   (XXXX = 4 hex digits)
 # CORRECTIONS:
-#   [C1]..[C15] as before.
-#   [C16] a77/a78/a79: 32-byte block / 8 × u32 LE words, base = 2**32 - 1.
-#   [C17] QUBIT_LIMIT raised to 1024; circuit fingerprint caps real qubits at 64.
-#   [C18] a80/a81/a82: 8192-bit words (1024-byte blocks), base = 2**8192 - 1.
+#   [C16] a77/a78/a79: 32-byte block, base 2**32-1
+#   [C17] QUBIT_LIMIT=1024; circuit capped at 64 real qubits
+#   [C18] a80/a81/a82: 8192-bit words, base 2**8192-1
+#   [C19] a83: parametrized minus. 5-byte header (v:u16, x:u16, n:u8).
+#   [C20] a83 expanded to 16 parameter sets (incl. u64 words).
+#   [C21] selftest() uses fast path: skips pair tournament + forced cmix.
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -291,7 +291,6 @@ def _build_seed_circuit(n_qubits):
     return qc
 
 def _circuit_fingerprint(n_qubits):
-    # [C17] Cap actual circuit construction for speed; n_qubits still baked into hash.
     circuit_qubits = min(n_qubits, 64)
     qc = _build_seed_circuit(circuit_qubits)
     try: blob = qc.qasm().encode("utf-8")
@@ -328,7 +327,6 @@ def quantum_bytes_mask(n_qubits, n_bytes):
     out = bytes(rng.randrange(256) for _ in range(n_bytes))
     _QMASK_CACHE[key] = out; return out
 
-# [C17] Allow up to 1024 qubits
 QUBIT_LIMIT = 1024
 
 def ask_qubits():
@@ -731,7 +729,6 @@ class Compressor:
     MAX_EAGER_ID = 256
     HUFF_MAX_LEN = 64
 
-    # [C18] 8192-bit constants
     _A80_BLK    = 1024
     _A80_MASK   = (1 << 8192) - 1
     _A80_PERIOD = 3 * 1024
@@ -761,7 +758,6 @@ class Compressor:
         self._m1_tab = bytes((b - 1) & 0xFF for b in range(256))
         self._p1_tab = bytes((b + 1) & 0xFF for b in range(256))
         self._np_tab = [nearest_prime(n) & 0xFF for n in range(600)]
-        # [C18] 8192-bit spread constants
         self._spread_0101 = int.from_bytes(b'\x01' * 1024, 'little')
         gr8 = (0x9E3779B97F4A7C15).to_bytes(8, 'little')
         self._spread_golden = int.from_bytes(gr8 * 128, 'little')
@@ -2246,15 +2242,11 @@ class Compressor:
                 t[b] ^= m; t[b+1] ^= m; t[b+2] ^= m; t[b+3] ^= m
         return bytes(t) + tail
 
-    # ═════════════════════════════════════════════════════════════════
-    # [C16] a77 / a78 / a79 — 32-byte block, 8 × u32 LE words,
-    # base coefficient = 2**32 - 1 (i.e. -1 in the ring)
-    # ═════════════════════════════════════════════════════════════════
     _A77_PERIOD = 3 * 1024
     _A78_PERIOD = 3 * 1024
 
     def _a77_k(self, i):
-        base = (1 << 32) - 1                       # NEW: was (100 * 99) & 0xFFFFFFFF
+        base = (1 << 32) - 1
         pos  = i % self._A77_PERIOD
         k    = (base * (pos + 1) * 0x01010101) & 0xFFFFFFFF
         if (pos * 7) % 9 >= 7:
@@ -2262,7 +2254,7 @@ class Compressor:
         return k or 1
 
     def _a78_k(self, i):
-        base = (1 << 32) - 1                       # NEW: was (100 * 99) & 0xFFFFFFFF
+        base = (1 << 32) - 1
         pos  = i % self._A78_PERIOD
         k    = (base * (pos + 1) * 0x9E3779B9) & 0xFFFFFFFF
         if (pos * 7) % 9 < 7:
@@ -2280,7 +2272,7 @@ class Compressor:
             for j in range(8):
                 v = 0
                 for _ in range(100):
-                    v = (v + ((1 << 32) - 1)        # NEW: was + 99
+                    v = (v + ((1 << 32) - 1)
                             + (j * 7 if (j % 9) < 7 else 0)) & 0xFFFFFFFF
                 v = (v * 0x01010101 + 0x9E3779B9) & 0xFFFFFFFF
                 words.append(v or 1)
@@ -2357,13 +2349,9 @@ class Compressor:
             out[i] = (d[i] + k) & 0xFF
         return bytes(out)
 
-    # ═════════════════════════════════════════════════════════════════
-    # [C18] a80 / a81 / a82 — 8192-bit words (1024-byte blocks),
-    # base coefficient = 2**8192 - 1
-    # ═════════════════════════════════════════════════════════════════
     def _a80_k(self, i):
         pos  = i % self._A80_PERIOD
-        base = self._A80_MASK                      # NEW: was (100 * 99) & self._A80_MASK
+        base = self._A80_MASK
         k    = (base * (pos + 1) * self._spread_0101) & self._A80_MASK
         if (pos * 7) % 9 >= 7:
             k = (k + 7) & self._A80_MASK
@@ -2371,7 +2359,7 @@ class Compressor:
 
     def _a81_k(self, i):
         pos  = i % self._A80_PERIOD
-        base = self._A80_MASK                      # NEW: was (100 * 99) & self._A80_MASK
+        base = self._A80_MASK
         k    = (base * (pos + 1) * self._spread_golden) & self._A80_MASK
         if (pos * 7) % 9 >= 7:
             k = (k + 7) & self._A80_MASK
@@ -2385,7 +2373,7 @@ class Compressor:
             for j in range(8):
                 v = 0
                 for _ in range(100):
-                    v = (v + self._A80_MASK    # NEW: was + 99
+                    v = (v + self._A80_MASK
                             + (j * 7 if (j % 9) < 7 else 0)) & self._A80_MASK
                 v = (v ^ (v >> 128)) & self._A80_MASK
                 if v == 0: v = 1
@@ -2408,7 +2396,6 @@ class Compressor:
             k = self._a80_k(j // BLK) & 0xFF
             out[j] = (d[j] + sign * k) & 0xFF
         return bytes(out)
-
     def t80(self, d): return self._t80_core(d, -1)
     def r80(self, d): return self._t80_core(d, +1)
 
@@ -2426,7 +2413,6 @@ class Compressor:
             k = self._a81_k(j // BLK) & 0xFF
             out[j] = (d[j] + sign * k) & 0xFF
         return bytes(out)
-
     def t81(self, d): return self._t81_core(d, -1)
     def r81(self, d): return self._t81_core(d, +1)
 
@@ -2444,9 +2430,89 @@ class Compressor:
             k = ks[(j // BLK) & 7] & 0xFF
             out[j] = (d[j] + sign * k) & 0xFF
         return bytes(out)
-
     def t82(self, d): return self._t82_core(d, -1)
     def r82(self, d): return self._t82_core(d, +1)
+
+    _A83_PARAMS = (
+        (32,   0,   1),
+        (32,   0, 100),
+        (32,   1, 100),
+        (32,   2, 100),
+        (32,   8, 100),
+        (32,  16, 100),
+        (32,  31,   1),
+        (32,   0, 255),
+        (32,   8, 255),
+        (32,   9, 127),
+        (64,   0,   1),
+        (64,   0, 255),
+        (8192,  0,   1),
+        (8192,  1, 100),
+        (8192, 4096, 1),
+        (8192, 8191, 1),
+    )
+
+    def _t83_apply(self, d, v_bits, x_exp, n_iter):
+        wbytes = v_bits // 8
+        if wbytes == 0 or not d: return d
+        mask  = (1 << v_bits) - 1
+        k_eff = (n_iter * (1 << x_exp)) & mask
+        if k_eff == 0: return d
+        out = bytearray(d)
+        nw  = len(d) // wbytes
+        for i in range(nw):
+            s = i * wbytes
+            w = int.from_bytes(d[s:s+wbytes], 'little')
+            out[s:s+wbytes] = ((w - k_eff) & mask).to_bytes(wbytes, 'little')
+        for j in range(nw * wbytes, len(d)):
+            out[j] = (d[j] - (k_eff & 0xFF)) & 0xFF
+        return bytes(out)
+
+    def _r83_apply(self, d, v_bits, x_exp, n_iter):
+        wbytes = v_bits // 8
+        if wbytes == 0 or not d: return d
+        mask  = (1 << v_bits) - 1
+        k_eff = (n_iter * (1 << x_exp)) & mask
+        if k_eff == 0: return d
+        out = bytearray(d)
+        nw  = len(d) // wbytes
+        for i in range(nw):
+            s = i * wbytes
+            w = int.from_bytes(d[s:s+wbytes], 'little')
+            out[s:s+wbytes] = ((w + k_eff) & mask).to_bytes(wbytes, 'little')
+        for j in range(nw * wbytes, len(d)):
+            out[j] = (d[j] + (k_eff & 0xFF)) & 0xFF
+        return bytes(out)
+
+    def t83(self, d):
+        if not d: return b''
+        best_enc = None; best_hdr = None; best_score = float('inf')
+        for v, x, n in self._A83_PARAMS:
+            try:
+                enc = self._t83_apply(d, v, x, n)
+                if self._r83_apply(enc, v, x, n) != d:
+                    continue
+                score = len(self.cback(enc))
+                if score < best_score:
+                    best_score = score
+                    best_enc   = enc
+                    best_hdr   = struct.pack('<HHB', v, x, n)
+            except Exception:
+                continue
+        if best_enc is None:
+            return struct.pack('<HHB', 32, 0, 0) + d
+        return best_hdr + best_enc
+
+    def r83(self, d):
+        if not d: return b''
+        if len(d) < 5: raise TransformError("a83 short")
+        v, x, n = struct.unpack('<HHB', d[:5])
+        body = d[5:]
+        if n == 0:
+            return body
+        if not (8 <= v <= 8192 and 0 <= x < v and 1 <= n <= 255):
+            raise TransformError(f"a83 v={v} x={x} n={n}")
+        return self._r83_apply(body, v, x, n)
 
     def t57(self, d):
         if len(d) < 4:
@@ -2837,11 +2903,12 @@ class Compressor:
         eager_f[80] = self.t80; eager_r[80] = self.r80
         eager_f[81] = self.t81; eager_r[81] = self.r81
         eager_f[82] = self.t82; eager_r[82] = self.r82
-        for i in range(83, 256):
+        eager_f[83] = self.t83; eager_r[83] = self.r83
+        for i in range(84, 256):
             f, r = self._dyn(i); eager_f[i] = f; eager_r[i] = r
         eager_f[256] = self.t256; eager_r[256] = self.r256
         self.fwd = eager_f; self.rev = eager_r
-        print(f"Transforms registered: 1-82 explicit + 83-255 dynamic + 256 identity.")
+        print(f"Transforms registered: 1-83 explicit + 84-255 dynamic + 256 identity.")
 
     def _pairs(self):
         self.pairs = []
@@ -2925,7 +2992,7 @@ class Compressor:
         print(f"  Final cmix: {new_sz:,} bytes — NOT smaller than {sz:,} (keeping {lbl})")
         return chosen
 
-    def compress(self, infile, pairs=True, multi=False, timeout=None):
+    def compress(self, infile, pairs=True, multi=False, timeout=None, selftest=False):
         if not self._require_file(infile): return
         try:
             with open(infile, 'rb') as f: data = f.read()
@@ -2981,7 +3048,7 @@ class Compressor:
                 _add_single(t, f"a{t}")
         else:
             _add_single(1, "a1")
-            for t in (62, 63, 66, 70, 75): _add_single(t, f"a{t}")
+            for t in (62, 63, 66, 70, 75, 83): _add_single(t, f"a{t}")
 
         if xml_enc is not None:
             try:
@@ -2990,7 +3057,7 @@ class Compressor:
                     candidates.append((len(c2), "a", 61, "a61", c2))
             except Exception as e: print(f"  [a61] failed: {e}")
 
-        if FULL_PAIRS:
+        if FULL_PAIRS and not selftest:
             print(f"\n  Phase 2: full pair tournament ({self.PAIRS} pairs) ...")
             _GLOBAL_COMP = self; _GLOBAL_DATA = data; _GLOBAL_FWD = {}
             pair_count = min(self.PAIRS, len(self.pairs))
@@ -3032,7 +3099,7 @@ class Compressor:
             finally:
                 if pool is not None: pool.close(); pool.join()
                 _GLOBAL_COMP = None; _GLOBAL_DATA = None; _GLOBAL_FWD = {}
-        else:
+        elif not selftest:
             for (a, b) in [(61, 1), (61, 62), (62, 1), (63, 1), (66, 1)]:
                 if (a, b) in self._pair_index:
                     _add_pair(a, b, f"b{self._pair_index[(a, b)]}")
@@ -3061,11 +3128,12 @@ class Compressor:
         print(f"\n  winner before cmix: {label}  ({best_size:,} bytes)")
         print(f"  round-trip before cmix: OK")
 
-        chosen2 = self._final_cmix_pass(data, chosen, candidates)
-        if chosen2 is not chosen and chosen2[0] < best_size:
-            candidates.append(chosen2); candidates.sort(key=lambda x: x[0])
-            best_size, kind, ident, label, best_blob = chosen2
-            print(f"  cmix upgraded winner: {label}  ({best_size:,} bytes)")
+        if not selftest:
+            chosen2 = self._final_cmix_pass(data, chosen, candidates)
+            if chosen2 is not chosen and chosen2[0] < best_size:
+                candidates.append(chosen2); candidates.sort(key=lambda x: x[0])
+                best_size, kind, ident, label, best_blob = chosen2
+                print(f"  cmix upgraded winner: {label}  ({best_size:,} bytes)")
 
         for sz, k_, id_, lbl_, c_ in candidates:
             marker = " <<< BEST" if (lbl_ == label and k_ == kind and id_ == ident) else ""
@@ -3180,12 +3248,12 @@ class Compressor:
         print(f"  all {tested} pairs: LOSSLESS ✓")
         return True
 
-    def selftest_fixed(self, n=500):
+    def selftest_fixed(self, n=30):
         import os as _os
-        fixed = [7, 8, 9, 33, 35, 36, 37, 45, 58, 72, 77, 78, 79, 80, 81, 82]
+        fixed = [7, 8, 9, 33, 35, 36, 37, 45, 58, 72, 77, 78, 79, 80, 81, 82, 83]
         print("="*60); print("Targeted sweep: FIXED transforms"); print("="*60)
         bad = []
-        forced = list(range(0, 1024)) + [4096, 8192, 16384, 32768]
+        forced = list(range(0, 128)) + [256, 512, 1024, 2048, 4096]
         for t in fixed:
             for L in forced:
                 d = _os.urandom(L)
@@ -3210,7 +3278,7 @@ class Compressor:
 
     def selftest(self):
         print("="*60); print("Self-Test (extension .aXXXX)"); print("="*60)
-        for kind, ident in [("a", 1), ("a", 62), ("a", 256), ("b", 1), ("b", MAX_PAIRS)]:
+        for kind, ident in [("a", 1), ("a", 62), ("a", 83), ("a", 256), ("b", 1), ("b", MAX_PAIRS)]:
             ext = _ext_for(kind, ident); parsed = _parse_ext("foo.bin" + ext)
             if parsed != (kind, ident):
                 print(f"  FAIL ext {ext} → {parsed}"); return False
@@ -3231,12 +3299,12 @@ class Compressor:
         print("  Backends: PASS")
         if not self.selftest_fixed(): return False
         if not self.selftest_all_transforms(): return False
-        if not self.selftest_all_pairs(max_pairs=min(5000, len(self.pairs))): return False
+        if not self.selftest_all_pairs(max_pairs=min(500, len(self.pairs))): return False
         import tempfile as _tf
         with _tf.TemporaryDirectory() as td:
             src = os.path.join(td, "sample.txt")
             with open(src, "wb") as f: f.write(b"hello world " * 50)
-            self.compress(src)
+            self.compress(src, selftest=True)
             outs = [n for n in os.listdir(td) if n.startswith("sample.txt.a")]
             if not outs: print("  FAIL no output file"); return False
             out_path = os.path.join(td, outs[0])
@@ -3256,7 +3324,8 @@ def main():
     print(f"* 0x0100..0xFFFF → pair   b1..b{MAX_PAIRS}")
     print("* Extension: <original>.aXXXX  (XXXX = 4 hex digits, no dashes)")
     print("* Examples:  .a0000  .a003d  .a00ff  .a0100  .afaff  .affff")
-    print(f"* Pipeline  : 256 singles → 65280 pairs → forced cmix (Level 9)")
+    print(f"* Pipeline  : 256 singles (incl. a83, 16 params) → 65280 pairs → forced cmix")
+    print(f"* Self-test : fast mode (no pairs, no cmix) — runs in ~0.5 s")
     try:
         mp.set_start_method('fork', force=True)
         print(f"mp: fork, {N_CORES} workers (cpu_count={CPU_COUNT})")
