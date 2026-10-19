@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# PPMD_1.5 — Lossless Tournament + XML structural v2 + Qiskit mask
+# PPMD_1.6 — Lossless Tournament + XML structural v2 + Qiskit mask + wide-base transforms
 # EXTENSION-AS-HEADER — saves the 2 bytes inside the file
 #
 # FILENAME:
@@ -8,12 +8,10 @@
 #   Examples: .a0000  .a003d  .a00ff  .a0100  .afaff  .affff
 #
 # CORRECTIONS:
-#   [C1]..[C11] as before.
-#   [C12] a38/a39: 2-byte FNV-1a losslessness tag per block, verified on decode.
-#   [C13] a40: 32-byte SHA-256 header verified on decode; block index tracked.
-#   [C14] FULL_SINGLES + FULL_PAIRS sweeps run by default; final forced cmix pass.
-#   [C15] cmix usage now matches PPMD_1.3: build-from-source installer,
-#         _cmixc tries "-c" then plain, _cmixd uses "-d".
+#   [C1]..[C15] as before.
+#   [C16] a77/a78/a79: 32-byte block / 8 × u32 LE words, base = 2**32 - 1.
+#   [C17] QUBIT_LIMIT raised to 1024; circuit fingerprint caps real qubits at 64.
+#   [C18] a80/a81/a82: 8192-bit words (1024-byte blocks), base = 2**8192 - 1.
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -126,7 +124,7 @@ def _ins_zstd():
         except Exception: pass
     return False
 
-print("="*70); print("PPMD_1.5 — Checking backends"); print("="*70)
+print("="*70); print("PPMD_1.6 — Checking backends"); print("="*70)
 print(f"parallelism : {N_CORES} cores" + (" (fork)" if _HAS_FORK else " (spawn)"))
 print(f"cpu count   : {CPU_COUNT}")
 print(f"fast mode   : {'ON' if FAST_MODE else 'OFF'}")
@@ -199,7 +197,6 @@ def _install_ccmx():
         except Exception as e: print(f"ccmx: mirror failed ({e})"); continue
     print("ccmx: NOT available"); return False, None
 
-# ── [C15] cmix installer — matches PPMD_1.3 (source build, "Level 9") ──
 def _install_cmix():
     global HAS_CMIX
     if HAS_CMIX:
@@ -278,7 +275,6 @@ if not HAS_BROTLI:
             except ImportError: pass
 if not HAS_CCMX:
     if input("Install ccmx? (y/n) [n]: ").strip().lower() == 'y': _install_ccmx()
-# [C15] unconditional — _install_cmix handles its own prompt, matching 1.3
 _install_cmix()
 if not HAS_LEPTON:
     if input("Install lepton_jpeg_python? (y/n) [n]: ").strip().lower() == 'y':
@@ -295,7 +291,9 @@ def _build_seed_circuit(n_qubits):
     return qc
 
 def _circuit_fingerprint(n_qubits):
-    qc = _build_seed_circuit(n_qubits)
+    # [C17] Cap actual circuit construction for speed; n_qubits still baked into hash.
+    circuit_qubits = min(n_qubits, 64)
+    qc = _build_seed_circuit(circuit_qubits)
     try: blob = qc.qasm().encode("utf-8")
     except Exception:
         parts = []
@@ -330,21 +328,22 @@ def quantum_bytes_mask(n_qubits, n_bytes):
     out = bytes(rng.randrange(256) for _ in range(n_bytes))
     _QMASK_CACHE[key] = out; return out
 
-QUBIT_LIMIT = 16
+# [C17] Allow up to 1024 qubits
+QUBIT_LIMIT = 1024
 
 def ask_qubits():
-    print("\n" + "="*70); print("Qiskit qubit count (1..16)"); print("="*70)
+    print("\n" + "="*70); print("Qiskit qubit count (1..1024)"); print("="*70)
     while True:
-        raw = input("Qubits [16]: ").strip()
-        if raw == "": return 16
+        raw = input("Qubits [1024]: ").strip()
+        if raw == "": return 1024
         try:
             v = int(raw)
-            if 1 <= v <= 16: return v
+            if 1 <= v <= 1024: return v
         except ValueError: pass
-        print("  Enter a whole number 1..16.")
+        print("  Enter a whole number 1..1024.")
 
 def ask_pairs(n_qubits=16):
-    max_by_q = (1 << max(1, n_qubits)) - 1
+    max_by_q = (1 << max(1, min(n_qubits, 31))) - 1
     cap = min(MAX_PAIRS, max_by_q)
     print("\n" + "="*70)
     print(f"Pair count (1..{cap})  [qubits={n_qubits}, hard cap {MAX_PAIRS}]")
@@ -361,8 +360,6 @@ def ask_pairs(n_qubits=16):
 QUBITS = ask_qubits() if HAS_QISKIT else QUBIT_LIMIT
 PAIRS = ask_pairs(QUBITS)
 print(f"\nChosen: QUBITS={QUBITS}  PAIRS={PAIRS}")
-if PAIRS > (1 << QUBITS) - 1:
-    print(f"FATAL: {PAIRS} pairs exceed {QUBITS}-qubit space."); sys.exit(1)
 if PAIRS > MAX_PAIRS:
     print(f"FATAL: {PAIRS} pairs exceed 2-byte header cap {MAX_PAIRS}."); sys.exit(1)
 
@@ -371,7 +368,7 @@ print(f"\nBackends: zstd={'Y' if HAS_ZSTD else 'N'} lzma={'Y' if HAS_LZMA else '
       f"pyppmd={'Y' if HAS_PPMD else 'N'} zpaq={'Y' if HAS_ZPAQ else 'N'} "
       f"ccmx={'Y' if HAS_CCMX else 'N'} cmix={'Y' if HAS_CMIX else 'N'} "
       f"lepton={'Y' if HAS_LEPTON else 'N'} qiskit={'Y' if HAS_QISKIT else 'N'}")
-PROGNAME = "PPMD_1.5"
+PROGNAME = "PPMD_1.6"
 
 REF_TEXT = (
     "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. "
@@ -734,6 +731,11 @@ class Compressor:
     MAX_EAGER_ID = 256
     HUFF_MAX_LEN = 64
 
+    # [C18] 8192-bit constants
+    _A80_BLK    = 1024
+    _A80_MASK   = (1 << 8192) - 1
+    _A80_PERIOD = 3 * 1024
+
     def __init__(self, try_dl=True, pairs=MAX_PAIRS, qubits=16):
         self.PAIRS = min(pairs, MAX_PAIRS)
         self.QUBITS = qubits
@@ -759,6 +761,11 @@ class Compressor:
         self._m1_tab = bytes((b - 1) & 0xFF for b in range(256))
         self._p1_tab = bytes((b + 1) & 0xFF for b in range(256))
         self._np_tab = [nearest_prime(n) & 0xFF for n in range(600)]
+        # [C18] 8192-bit spread constants
+        self._spread_0101 = int.from_bytes(b'\x01' * 1024, 'little')
+        gr8 = (0x9E3779B97F4A7C15).to_bytes(8, 'little')
+        self._spread_golden = int.from_bytes(gr8 * 128, 'little')
+        self._a82_ks_cache = None
         if HAS_QISKIT:
             t0 = time.time()
             self._qperm = quantum_pair_permutation(self.PAIRS, self.QUBITS)
@@ -901,7 +908,6 @@ class Compressor:
             dc = lepton_jpeg_python.decompress_bytes(d); return dc if dc else None
         except Exception: return None
 
-    # ── [C15] cmix helpers now match PPMD_1.3: try "-c" then plain ─────
     def _cmixc(self, d, force=False):
         if not HAS_CMIX: return None
         if not force and SKIP_SLOW: return None
@@ -2240,6 +2246,208 @@ class Compressor:
                 t[b] ^= m; t[b+1] ^= m; t[b+2] ^= m; t[b+3] ^= m
         return bytes(t) + tail
 
+    # ═════════════════════════════════════════════════════════════════
+    # [C16] a77 / a78 / a79 — 32-byte block, 8 × u32 LE words,
+    # base coefficient = 2**32 - 1 (i.e. -1 in the ring)
+    # ═════════════════════════════════════════════════════════════════
+    _A77_PERIOD = 3 * 1024
+    _A78_PERIOD = 3 * 1024
+
+    def _a77_k(self, i):
+        base = (1 << 32) - 1                       # NEW: was (100 * 99) & 0xFFFFFFFF
+        pos  = i % self._A77_PERIOD
+        k    = (base * (pos + 1) * 0x01010101) & 0xFFFFFFFF
+        if (pos * 7) % 9 >= 7:
+            k = (k + 7) & 0xFFFFFFFF
+        return k or 1
+
+    def _a78_k(self, i):
+        base = (1 << 32) - 1                       # NEW: was (100 * 99) & 0xFFFFFFFF
+        pos  = i % self._A78_PERIOD
+        k    = (base * (pos + 1) * 0x9E3779B9) & 0xFFFFFFFF
+        if (pos * 7) % 9 < 7:
+            k = (k + 0) & 0xFFFFFFFF
+        else:
+            k = (k + 7) & 0xFFFFFFFF
+        if (pos % 7) == 0:
+            k ^= 7
+        return k or 1
+
+    def _ks79_u32(self):
+        ks = getattr(self, "_ks79_u32_cache", None)
+        if ks is None:
+            words = []
+            for j in range(8):
+                v = 0
+                for _ in range(100):
+                    v = (v + ((1 << 32) - 1)        # NEW: was + 99
+                            + (j * 7 if (j % 9) < 7 else 0)) & 0xFFFFFFFF
+                v = (v * 0x01010101 + 0x9E3779B9) & 0xFFFFFFFF
+                words.append(v or 1)
+            ks = tuple(words)
+            self._ks79_u32_cache = ks
+        return ks
+
+    def t77(self, d):
+        if not d: return b''
+        n = len(d); nw = n // 4
+        out = bytearray(d)
+        for i in range(nw):
+            w = int.from_bytes(d[i*4:i*4+4], 'little')
+            out[i*4:i*4+4] = ((w - self._a77_k(i)) & 0xFFFFFFFF).to_bytes(4, 'little')
+        for i in range(nw * 4, n):
+            k = self._a77_k(i // 4) & 0xFF
+            out[i] = (d[i] - k) & 0xFF
+        return bytes(out)
+    def r77(self, d):
+        if not d: return b''
+        n = len(d); nw = n // 4
+        out = bytearray(d)
+        for i in range(nw):
+            w = int.from_bytes(d[i*4:i*4+4], 'little')
+            out[i*4:i*4+4] = ((w + self._a77_k(i)) & 0xFFFFFFFF).to_bytes(4, 'little')
+        for i in range(nw * 4, n):
+            k = self._a77_k(i // 4) & 0xFF
+            out[i] = (d[i] + k) & 0xFF
+        return bytes(out)
+
+    def t78(self, d):
+        if not d: return b''
+        n = len(d); nw = n // 4
+        out = bytearray(d)
+        for i in range(nw):
+            w = int.from_bytes(d[i*4:i*4+4], 'little')
+            out[i*4:i*4+4] = ((w - self._a78_k(i)) & 0xFFFFFFFF).to_bytes(4, 'little')
+        for i in range(nw * 4, n):
+            k = self._a78_k(i // 4) & 0xFF
+            out[i] = (d[i] - k) & 0xFF
+        return bytes(out)
+    def r78(self, d):
+        if not d: return b''
+        n = len(d); nw = n // 4
+        out = bytearray(d)
+        for i in range(nw):
+            w = int.from_bytes(d[i*4:i*4+4], 'little')
+            out[i*4:i*4+4] = ((w + self._a78_k(i)) & 0xFFFFFFFF).to_bytes(4, 'little')
+        for i in range(nw * 4, n):
+            k = self._a78_k(i // 4) & 0xFF
+            out[i] = (d[i] + k) & 0xFF
+        return bytes(out)
+
+    def t79(self, d):
+        if not d: return b''
+        n = len(d); nw = n // 4; ks = self._ks79_u32()
+        out = bytearray(d)
+        for i in range(nw):
+            w = int.from_bytes(d[i*4:i*4+4], 'little')
+            out[i*4:i*4+4] = ((w - ks[i & 7]) & 0xFFFFFFFF).to_bytes(4, 'little')
+        for i in range(nw * 4, n):
+            k = ks[(i // 4) & 7] & 0xFF
+            out[i] = (d[i] - k) & 0xFF
+        return bytes(out)
+    def r79(self, d):
+        if not d: return b''
+        n = len(d); nw = n // 4; ks = self._ks79_u32()
+        out = bytearray(d)
+        for i in range(nw):
+            w = int.from_bytes(d[i*4:i*4+4], 'little')
+            out[i*4:i*4+4] = ((w + ks[i & 7]) & 0xFFFFFFFF).to_bytes(4, 'little')
+        for i in range(nw * 4, n):
+            k = ks[(i // 4) & 7] & 0xFF
+            out[i] = (d[i] + k) & 0xFF
+        return bytes(out)
+
+    # ═════════════════════════════════════════════════════════════════
+    # [C18] a80 / a81 / a82 — 8192-bit words (1024-byte blocks),
+    # base coefficient = 2**8192 - 1
+    # ═════════════════════════════════════════════════════════════════
+    def _a80_k(self, i):
+        pos  = i % self._A80_PERIOD
+        base = self._A80_MASK                      # NEW: was (100 * 99) & self._A80_MASK
+        k    = (base * (pos + 1) * self._spread_0101) & self._A80_MASK
+        if (pos * 7) % 9 >= 7:
+            k = (k + 7) & self._A80_MASK
+        return k or 1
+
+    def _a81_k(self, i):
+        pos  = i % self._A80_PERIOD
+        base = self._A80_MASK                      # NEW: was (100 * 99) & self._A80_MASK
+        k    = (base * (pos + 1) * self._spread_golden) & self._A80_MASK
+        if (pos * 7) % 9 >= 7:
+            k = (k + 7) & self._A80_MASK
+        if (pos % 7) == 0:
+            k ^= 7
+        return k or 1
+
+    def _a82_ks(self):
+        if self._a82_ks_cache is None:
+            words = []
+            for j in range(8):
+                v = 0
+                for _ in range(100):
+                    v = (v + self._A80_MASK    # NEW: was + 99
+                            + (j * 7 if (j % 9) < 7 else 0)) & self._A80_MASK
+                v = (v ^ (v >> 128)) & self._A80_MASK
+                if v == 0: v = 1
+                words.append(v)
+            self._a82_ks_cache = tuple(words)
+        return self._a82_ks_cache
+
+    def _t80_core(self, d, sign):
+        if not d: return b''
+        n = len(d); BLK = self._A80_BLK; M = self._A80_MASK
+        nw = n // BLK
+        out = bytearray(d)
+        for i in range(nw):
+            s = i * BLK
+            w = int.from_bytes(d[s:s+BLK], 'little')
+            k = self._a80_k(i)
+            val = (w + sign * k) & M
+            out[s:s+BLK] = val.to_bytes(BLK, 'little')
+        for j in range(nw * BLK, n):
+            k = self._a80_k(j // BLK) & 0xFF
+            out[j] = (d[j] + sign * k) & 0xFF
+        return bytes(out)
+
+    def t80(self, d): return self._t80_core(d, -1)
+    def r80(self, d): return self._t80_core(d, +1)
+
+    def _t81_core(self, d, sign):
+        if not d: return b''
+        n = len(d); BLK = self._A80_BLK; M = self._A80_MASK
+        nw = n // BLK
+        out = bytearray(d)
+        for i in range(nw):
+            s = i * BLK
+            w = int.from_bytes(d[s:s+BLK], 'little')
+            k = self._a81_k(i)
+            out[s:s+BLK] = ((w + sign * k) & M).to_bytes(BLK, 'little')
+        for j in range(nw * BLK, n):
+            k = self._a81_k(j // BLK) & 0xFF
+            out[j] = (d[j] + sign * k) & 0xFF
+        return bytes(out)
+
+    def t81(self, d): return self._t81_core(d, -1)
+    def r81(self, d): return self._t81_core(d, +1)
+
+    def _t82_core(self, d, sign):
+        if not d: return b''
+        n = len(d); BLK = self._A80_BLK; M = self._A80_MASK
+        nw = n // BLK; ks = self._a82_ks()
+        out = bytearray(d)
+        for i in range(nw):
+            s = i * BLK
+            w = int.from_bytes(d[s:s+BLK], 'little')
+            k = ks[i & 7]
+            out[s:s+BLK] = ((w + sign * k) & M).to_bytes(BLK, 'little')
+        for j in range(nw * BLK, n):
+            k = ks[(j // BLK) & 7] & 0xFF
+            out[j] = (d[j] + sign * k) & 0xFF
+        return bytes(out)
+
+    def t82(self, d): return self._t82_core(d, -1)
+    def r82(self, d): return self._t82_core(d, +1)
+
     def t57(self, d):
         if len(d) < 4:
             pad = 4 - len(d); k = 0
@@ -2623,11 +2831,17 @@ class Compressor:
         eager_f[74] = self.t_bitplane_shuffle; eager_r[74] = self.r_bitplane_shuffle
         eager_f[75] = self.t_sha512_keystream; eager_r[75] = self.r_sha512_keystream
         eager_f[76] = self.t_mirror_xor; eager_r[76] = self.r_mirror_xor
-        for i in range(77, 256):
+        eager_f[77] = self.t77; eager_r[77] = self.r77
+        eager_f[78] = self.t78; eager_r[78] = self.r78
+        eager_f[79] = self.t79; eager_r[79] = self.r79
+        eager_f[80] = self.t80; eager_r[80] = self.r80
+        eager_f[81] = self.t81; eager_r[81] = self.r81
+        eager_f[82] = self.t82; eager_r[82] = self.r82
+        for i in range(83, 256):
             f, r = self._dyn(i); eager_f[i] = f; eager_r[i] = r
         eager_f[256] = self.t256; eager_r[256] = self.r256
         self.fwd = eager_f; self.rev = eager_r
-        print(f"Transforms registered: 1-76 explicit + 77-255 dynamic + 256 identity.")
+        print(f"Transforms registered: 1-82 explicit + 83-255 dynamic + 256 identity.")
 
     def _pairs(self):
         self.pairs = []
@@ -2968,7 +3182,7 @@ class Compressor:
 
     def selftest_fixed(self, n=500):
         import os as _os
-        fixed = [7, 8, 9, 33, 35, 36, 37, 45, 58, 72]
+        fixed = [7, 8, 9, 33, 35, 36, 37, 45, 58, 72, 77, 78, 79, 80, 81, 82]
         print("="*60); print("Targeted sweep: FIXED transforms"); print("="*60)
         bad = []
         forced = list(range(0, 1024)) + [4096, 8192, 16384, 32768]
