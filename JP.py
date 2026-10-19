@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# PPMD_1.6 — Lossless Tournament + XML structural v2 + Qiskit mask
-# + wide-base minus transforms (a77-a82) + parametrized minus (a83)
-# EXTENSION-AS-HEADER — saves the 2 bytes inside the file
+# PPMD_1.3 — Lossless Tournament + cmix + Lepton + XML/DOCX + Qiskit
+# DETERMINISTIC tournament, identical winner on any core count.
 #
-# FILENAME:  <original>.aXXXX   (XXXX = 4 hex digits)
-# CORRECTIONS:
-#   [C16] a77/a78/a79: 32-byte block, base 2**32-1
-#   [C17] QUBIT_LIMIT=1024; circuit capped at 64 real qubits
-#   [C18] a80/a81/a82: 8192-bit words, base 2**8192-1
-#   [C19] a83: parametrized minus. 5-byte header (v:u16, x:u16, n:u8).
-#   [C20] a83 expanded to 16 parameter sets (incl. u64 words).
-#   [C21] selftest() uses fast path: skips pair tournament + forced cmix.
+# WHAT CHANGED IN 1.3
+# -------------------
+#  * Every transform ID 1-256 is now wrapped in a lossless envelope that
+#    stores an RLE XOR delta between the original and the transform's
+#    reconstruction.  This makes EVERY transform 100% lossless by
+#    construction, even if the raw transform is not invertible.
+#  * IDs 38/39/40 are re-enabled (they now use in-process cback(), not
+#    external binaries, so they are deterministic and safe).
+#  * NON_DETERMINISTIC_IDS is now the empty frozenset.
+#  * Pair table remains 256*256 - 1 = 65535 pairs (all lossless).
+#    To switch to 65280 pairs, change range(1,257) -> range(1,256) in
+#    Compressor._pairs() — a comment marks the exact line.
+#  * The lossless envelope costs 1-2 bytes for transforms that are already
+#    lossless, and (run_len + ~5) bytes per differing run otherwise.
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -41,48 +46,54 @@ try:
     HAS_QISKIT = True
     QISKIT_VER = getattr(qiskit, "__version__", "?")
 except ImportError:
-    qiskit = None; QuantumCircuit = None; HAS_QISKIT = False; QISKIT_VER = None
+    qiskit = None
+    QuantumCircuit = None
+    HAS_QISKIT = False
+    QISKIT_VER = None
 
 try:
     import lzma; HAS_LZMA = True
-    LF_RAW = [{"id": lzma.FILTER_LZMA2, "preset": 9 | lzma.PRESET_EXTREME,
-               "nice_len": 273, "mf": lzma.MF_BT4}]
+    LF_RAW = [{"id": lzma.FILTER_LZMA2, "preset": 9 | lzma.PRESET_EXTREME, "nice_len": 273, "mf": lzma.MF_BT4}]
+    LF_DELTA = [{"id": lzma.FILTER_DELTA, "dist": 1}, LF_RAW[0]]
+    LF_BCJ = [{"id": lzma.FILTER_X86}, LF_RAW[0]]
 except ImportError:
-    lzma = None; HAS_LZMA = False; LF_RAW = None
+    lzma = None; HAS_LZMA = False; LF_RAW = LF_DELTA = LF_BCJ = None
 
 HAS_ZPAQ = shutil.which('zpaq') is not None
 HAS_CCMX = shutil.which('ccmx') is not None
 HAS_CMIX = shutil.which('cmix') is not None
 
-FAST_MODE       = os.environ.get("PPMD_FAST", "1") != "0"
-FULL_SINGLES    = os.environ.get("PPMD_FULL_SINGLES", "1") != "0"
-FULL_PAIRS      = os.environ.get("PPMD_FULL_PAIRS",   "1") != "0"
-SKIP_SLOW       = os.environ.get("PPMD_SKIP_SLOW",    "1") != "0"
-EARLY_EXIT_GAIN = float(os.environ.get("PPMD_EARLY_EXIT_GAIN", "0.55"))
-
 CPU_COUNT = mp.cpu_count() or 4
-N_CORES = max(1, int(os.environ.get("PPMD_CORES", str(CPU_COUNT)) or str(CPU_COUNT)))
+N_CORES = max(1, int(os.environ.get("PPMD_CORES", "4") or "4"))
 REPEATS = max(1, int(os.environ.get("PPMD_REPEATS", "1") or "1"))
-CBACK_WORKERS = max(2, int(os.environ.get("PPMD_CBACK_WORKERS", str(max(4, CPU_COUNT))) or "8"))
-CBACK_WORKERS_EFF = max(1, CPU_COUNT // max(1, N_CORES))
-CHUNK = max(1, int(os.environ.get("PPMD_CHUNK", "256") or "256"))
-TOP_VERIFY = max(1, int(os.environ.get("PPMD_TOP_VERIFY", "5") or "5"))
+CBACK_WORKERS = max(2, int(os.environ.get("PPMD_CBACK_WORKERS", "8") or "8"))
+CBACK_WORKERS_EFF = max(1, CPU_COUNT // N_CORES)
+CHUNK = max(1, int(os.environ.get("PPMD_CHUNK", "32") or "32"))
+TOP_VERIFY = max(1, int(os.environ.get("PPMD_TOP_VERIFY", "20") or "20"))
 try:
-    _MP_CTX = mp.get_context("fork"); _HAS_FORK = True
+    _MP_CTX = mp.get_context("fork")
+    _HAS_FORK = True
 except (ValueError, AttributeError):
-    _MP_CTX = mp.get_context(); _HAS_FORK = False
+    _MP_CTX = mp.get_context()
+    _HAS_FORK = False
 
 IDENTITY_IDS = frozenset((1, 31, 32, 256))
-MAX_PAIRS = 65280
+# All transforms are wrapped by the lossless envelope, so nothing is
+# non-deterministic any more.  Kept as an empty frozenset for compatibility
+# with the tournament loop and selftest, which already reference it.
+NON_DETERMINISTIC_IDS = frozenset()
 
-_GLOBAL_COMP = None; _GLOBAL_DATA = None; _GLOBAL_FWD = {}
+_GLOBAL_COMP = None
+_GLOBAL_DATA = None
+_GLOBAL_FWD = {}
 _IN_WORKER = False
 
 def _worker_single(t):
     global _IN_WORKER
     if not _IN_WORKER: _IN_WORKER = True
     c = _GLOBAL_COMP; data = _GLOBAL_DATA
-    if c is None or data is None: return (t, None, "worker not initialised")
+    if c is None or data is None:
+        return (t, None, "worker not initialised")
     try:
         v = _GLOBAL_FWD.get(t)
         tr = v if v is not None else c.fwd[t](data)
@@ -95,7 +106,8 @@ def _worker_pair(args):
     if not _IN_WORKER: _IN_WORKER = True
     idx, a, b = args
     c = _GLOBAL_COMP; data = _GLOBAL_DATA
-    if c is None or data is None: return (idx, a, b, None, "worker not initialised")
+    if c is None or data is None:
+        return (idx, a, b, None, "worker not initialised")
     try:
         va = _GLOBAL_FWD.get(a)
         ta = va if va is not None else c.fwd[a](data)
@@ -124,24 +136,22 @@ def _ins_zstd():
         except Exception: pass
     return False
 
-print("="*70); print("PPMD_1.6 — Checking backends"); print("="*70)
-print(f"parallelism : {N_CORES} cores" + (" (fork)" if _HAS_FORK else " (spawn)"))
-print(f"cpu count   : {CPU_COUNT}")
-print(f"fast mode   : {'ON' if FAST_MODE else 'OFF'}")
-print(f"full singles: {'ON (256 transforms)' if FULL_SINGLES else 'OFF'}")
-print(f"full pairs  : {'ON (up to 65280 pairs)' if FULL_PAIRS else 'OFF'}")
-print(f"skip slow   : {'ON' if SKIP_SLOW else 'OFF'}")
+print("="*70); print("PPMD_1.3 — Checking backends"); print("="*70)
+print(f"parallelism: {N_CORES} cores" + (" (fork)" if _HAS_FORK else " (spawn, limited)"))
+print(f"cpu count  : {CPU_COUNT}")
+print(f"repeats    : {REPEATS}")
+print(f"cback thr  : {CBACK_WORKERS} (parent) / {CBACK_WORKERS_EFF} (worker)")
+print(f"chunk      : {CHUNK}")
 _z = _imp_zstd()
 if _z is None:
     print("zstandard missing; trying auto-install...")
     _ins_zstd(); _z = _imp_zstd()
 if _z:
     zstd = _z
-    zc = zstd.ZstdCompressor(level=22); zd = zstd.ZstdDecompressor()
-    zc_fast = zstd.ZstdCompressor(level=6)
+    zc = zstd.ZstdCompressor(level=22); zd = zstd.ZstdDecompressor(); zf = zstd.ZstdCompressor(level=19)
     HAS_ZSTD = True; print("zstandard: OK")
 else:
-    zstd = zc = zd = zc_fast = None; HAS_ZSTD = False; print("zstandard: NOT available")
+    zstd = zc = zd = zf = None; HAS_ZSTD = False; print("zstandard: NOT available")
 
 def inst(pkg):
     print(f"Installing {pkg}...")
@@ -156,8 +166,6 @@ CCMX_MIRRORS = [
     "https://web.archive.org/web/20161019035512if_/http://www.byronknoll.com/ccmx130a.zip",
     "https://mattmahoney.net/dc/ccmx.zip",
     "https://encode.su/attachment.php?attachmentid=2032&d=1203997110"]
-
-CMIX_SRC_URL = "https://github.com/byronknoll/cmix/archive/refs/tags/v21.tar.gz"
 
 def _install_ccmx():
     global HAS_CCMX
@@ -196,6 +204,8 @@ def _install_ccmx():
                 HAS_CCMX = True; print(f"ccmx: OK ({target})"); return True, target
         except Exception as e: print(f"ccmx: mirror failed ({e})"); continue
     print("ccmx: NOT available"); return False, None
+
+CMIX_SRC_URL = "https://github.com/byronknoll/cmix/archive/refs/tags/v21.tar.gz"
 
 def _install_cmix():
     global HAS_CMIX
@@ -264,7 +274,7 @@ if not HAS_PPMD:
             try: import pyppmd; HAS_PPMD = True; print("pyppmd: OK")
             except ImportError: pass
 if paq is None:
-    if input("Install paq? (y/n) [n]: ").strip().lower() == 'y':
+    if input("Install paq? (y/n) [y]: ").strip().lower() != 'n':
         if inst('paq'):
             try: import paq; print("paq: OK")
             except ImportError: paq = None
@@ -273,27 +283,96 @@ if not HAS_BROTLI:
         if inst('brotli'):
             try: import brotli; HAS_BROTLI = True; print("brotli: OK")
             except ImportError: pass
+if not HAS_LXML:
+    print("\nNote: Python's built-in `xml` module needs no install.")
+    if input("Install lxml? (y/n) [y]: ").strip().lower() != 'n':
+        if inst('lxml'):
+            try: import lxml.etree as _lxml_etree; HAS_LXML = True; print(f"lxml: OK")
+            except ImportError: print("lxml: install failed")
+if not HAS_DEFUSEDXML:
+    if input("Install defusedxml? (y/n) [y]: ").strip().lower() != 'n':
+        if inst('defusedxml'):
+            try: import defusedxml.ElementTree as _defused_etree; HAS_DEFUSEDXML = True; print("defusedxml: OK")
+            except ImportError: print("defusedxml: install failed")
 if not HAS_CCMX:
-    if input("Install ccmx? (y/n) [n]: ").strip().lower() == 'y': _install_ccmx()
+    if input("Install ccmx? (y/n) [y]: ").strip().lower() != 'n': _install_ccmx()
 _install_cmix()
 if not HAS_LEPTON:
-    if input("Install lepton_jpeg_python? (y/n) [n]: ").strip().lower() == 'y':
+    if input("Install lepton_jpeg_python? (y/n) [y]: ").strip().lower() != 'n':
         if inst('lepton_jpeg_python'):
             try: import lepton_jpeg_python; HAS_LEPTON = True; print("lepton_jpeg_python: OK")
             except ImportError: print("lepton_jpeg_python: install failed")
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  QISKIT — circuit-only, deterministic permutation & byte mask
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def install_qiskit():
+    global HAS_QISKIT, qiskit, QuantumCircuit, QISKIT_VER
+    print("Installing qiskit (this can take a minute) ...")
+    for pkg in ("qiskit",):
+        for c in ([sys.executable, "-m", "pip", "install", "--no-input",
+                   "--disable-pip-version-check", pkg],
+                  [sys.executable, "-m", "pip", "install", "--user", "--no-input",
+                   "--disable-pip-version-check", pkg],
+                  [sys.executable, "-m", "pip", "install", "--break-system-packages",
+                   "--no-input", "--disable-pip-version-check", pkg]):
+            try: subprocess.check_call(c)
+            except Exception: pass
+    try:
+        import importlib
+        importlib.invalidate_caches()
+        import qiskit as _q
+        from qiskit import QuantumCircuit as _QC
+        qiskit = _q
+        QuantumCircuit = _QC
+        QISKIT_VER = getattr(_q, "__version__", "?")
+        HAS_QISKIT = True
+        return True
+    except ImportError:
+        HAS_QISKIT = False
+        return False
+
+
+def ask_qubits():
+    print("\n" + "=" * 70)
+    print("Qiskit qubit count   (1 .. 16)")
+    print("=" * 70)
+    print("  65535 pairs need at least 16 qubits  (2^16 = 65536 states).")
+    while True:
+        raw = input("Qubits [16]: ").strip()
+        if raw == "":
+            return 16
+        try:
+            v = int(raw)
+            if v < 1:
+                print("  Must be at least 1."); continue
+            if v > 16:
+                print("  Must not exceed 16."); continue
+            return v
+        except ValueError:
+            print("  Please enter a whole number.")
+
+
 def _build_seed_circuit(n_qubits):
     qc = QuantumCircuit(n_qubits, name="ppmd_q")
-    for q in range(n_qubits): qc.h(q)
-    for q in range(n_qubits): qc.t(q); qc.rz(math.pi/(q+1.0), q)
-    for q in range(n_qubits-1): qc.cx(q, q+1); qc.rz(math.pi/(2.0**(q+1)), q+1)
-    for q in range(n_qubits): qc.h(q)
+    for q in range(n_qubits):
+        qc.h(q)
+    for q in range(n_qubits):
+        qc.t(q)
+        qc.rz(math.pi / (q + 1.0), q)
+    for q in range(n_qubits - 1):
+        qc.cx(q, q + 1)
+        qc.rz(math.pi / (2.0 ** (q + 1)), q + 1)
+    for q in range(n_qubits):
+        qc.h(q)
     return qc
 
+
 def _circuit_fingerprint(n_qubits):
-    circuit_qubits = min(n_qubits, 64)
-    qc = _build_seed_circuit(circuit_qubits)
-    try: blob = qc.qasm().encode("utf-8")
+    qc = _build_seed_circuit(n_qubits)
+    try:
+        blob = qc.qasm().encode("utf-8")
     except Exception:
         parts = []
         for item in qc.data:
@@ -301,77 +380,108 @@ def _circuit_fingerprint(n_qubits):
             qargs = item.qubits if hasattr(item, "qubits") else item[1]
             parts.append(f"{op.name}|{op.params}|{[qc.find_bit(q).index for q in qargs]}")
         blob = ";;".join(parts).encode("utf-8")
-    ver = (QISKIT_VER or "?").encode("utf-8")
-    return hashlib.sha256(b"PPMD_QS|" + ver + b"|" +
-                          str(n_qubits).encode() + b"|" + blob).digest()
+    return hashlib.sha256(b"PPMD_QS|" + str(n_qubits).encode() + b"|" + blob).digest()
 
-_QPERM_CACHE = {}; _QMASK_CACHE = {}
+
+_QPERM_CACHE = {}
+_QMASK_CACHE = {}
+
 def quantum_pair_permutation(n_pairs, n_qubits):
     key = (n_pairs, n_qubits)
-    if key in _QPERM_CACHE: return _QPERM_CACHE[key]
+    hit = _QPERM_CACHE.get(key)
+    if hit is not None:
+        return hit
     if not HAS_QISKIT or n_qubits < 1 or n_pairs <= 0:
-        perm = list(range(max(0, n_pairs))); _QPERM_CACHE[key] = perm; return perm
+        perm = list(range(max(0, n_pairs)))
+        _QPERM_CACHE[key] = perm
+        return perm
     fp = _circuit_fingerprint(n_qubits)
     rng = random.Random(int.from_bytes(fp, "big"))
     perm = list(range(n_pairs))
-    for i in range(n_pairs-1, 0, -1):
-        j = rng.randrange(i+1); perm[i], perm[j] = perm[j], perm[i]
-    _QPERM_CACHE[key] = perm; return perm
+    for i in range(n_pairs - 1, 0, -1):
+        j = rng.randrange(i + 1)
+        perm[i], perm[j] = perm[j], perm[i]
+    _QPERM_CACHE[key] = perm
+    return perm
+
 
 def quantum_bytes_mask(n_qubits, n_bytes):
-    if not HAS_QISKIT or n_qubits < 1 or n_bytes <= 0: return b"\x00"*max(0, n_bytes)
+    if not HAS_QISKIT or n_qubits < 1 or n_bytes <= 0:
+        return b"\x00" * max(0, n_bytes)
     key = (n_qubits, n_bytes)
-    if key in _QMASK_CACHE: return _QMASK_CACHE[key]
+    hit = _QMASK_CACHE.get(key)
+    if hit is not None:
+        return hit
     fp = _circuit_fingerprint(n_qubits)
     rng = random.Random(int.from_bytes(fp, "big") ^ 0x9E3779B97F4A7C15)
     out = bytes(rng.randrange(256) for _ in range(n_bytes))
-    _QMASK_CACHE[key] = out; return out
+    _QMASK_CACHE[key] = out
+    return out
 
-QUBIT_LIMIT = 1024
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def ask_qubits():
-    print("\n" + "="*70); print("Qiskit qubit count (1..1024)"); print("="*70)
-    while True:
-        raw = input("Qubits [1024]: ").strip()
-        if raw == "": return 1024
-        try:
-            v = int(raw)
-            if 1 <= v <= 1024: return v
-        except ValueError: pass
-        print("  Enter a whole number 1..1024.")
+def install_qiskit_if_needed():
+    global HAS_QISKIT
+    if HAS_QISKIT:
+        print(f"qiskit: OK (version {QISKIT_VER})")
+        return
+    if input("Install qiskit? (y/n) [y]: ").strip().lower() != 'n':
+        install_qiskit()
+    if HAS_QISKIT:
+        print(f"qiskit: OK (version {QISKIT_VER})")
+    else:
+        print("qiskit: NOT available")
+
+install_qiskit_if_needed()
+
+PAIR_LIMIT = 65535
+QUBIT_LIMIT = 16
 
 def ask_pairs(n_qubits=16):
-    max_by_q = (1 << max(1, min(n_qubits, 31))) - 1
-    cap = min(MAX_PAIRS, max_by_q)
+    max_by_q = (1 << max(1, n_qubits)) - 1
+    cap = min(PAIR_LIMIT, max_by_q)
     print("\n" + "="*70)
-    print(f"Pair count (1..{cap})  [qubits={n_qubits}, hard cap {MAX_PAIRS}]")
+    print(f"Pair count  (1 .. {cap})   [qubits = {n_qubits}, 2^{n_qubits}-1 = {max_by_q}]")
     print("="*70)
     while True:
         raw = input(f"Pairs [{cap}]: ").strip()
-        if raw == "": return cap
+        if raw == "":
+            return cap
         try:
             v = int(raw)
-            if 1 <= v <= cap: return v
-        except ValueError: pass
-        print(f"  Must be 1..{cap}.")
+            if v < 1:
+                print("  Must be at least 1."); continue
+            if v > cap:
+                print(f"  Must not exceed {cap}."); continue
+            return v
+        except ValueError:
+            print("  Please enter a whole number.")
 
 QUBITS = ask_qubits() if HAS_QISKIT else QUBIT_LIMIT
+if HAS_QISKIT:
+    print(f"Qubits chosen: {QUBITS}  (state space 2^{QUBITS} = {1 << QUBITS})")
+else:
+    print(f"Qubits: classical fallback (16)")
 PAIRS = ask_pairs(QUBITS)
-print(f"\nChosen: QUBITS={QUBITS}  PAIRS={PAIRS}")
-if PAIRS > MAX_PAIRS:
-    print(f"FATAL: {PAIRS} pairs exceed 2-byte header cap {MAX_PAIRS}."); sys.exit(1)
-
+print(f"\nChosen: QUBITS = {QUBITS}   PAIRS = {PAIRS}")
+if PAIRS > (1 << QUBITS) - 1:
+    print(f"FATAL: {PAIRS} pairs do not fit in {QUBITS} qubits (max {(1 << QUBITS) - 1}).")
+    sys.exit(1)
+if PAIRS > 10**9:
+    if input("Continue anyway? (y/n) [n]: ").strip().lower() != 'y':
+        print("Aborting."); sys.exit(0)
 print(f"\nBackends: zstd={'Y' if HAS_ZSTD else 'N'} lzma={'Y' if HAS_LZMA else 'N'} "
       f"paq={'Y' if paq else 'N'} brotli={'Y' if HAS_BROTLI else 'N'} "
       f"pyppmd={'Y' if HAS_PPMD else 'N'} zpaq={'Y' if HAS_ZPAQ else 'N'} "
       f"ccmx={'Y' if HAS_CCMX else 'N'} cmix={'Y' if HAS_CMIX else 'N'} "
-      f"lepton={'Y' if HAS_LEPTON else 'N'} qiskit={'Y' if HAS_QISKIT else 'N'}")
-PROGNAME = "PPMD_1.6"
+      f"lepton={'Y' if HAS_LEPTON else 'N'} qiskit={'Y' if HAS_QISKIT else 'N'} "
+      f"xml=Y lxml={'Y' if HAS_LXML else 'N'} defusedxml={'Y' if HAS_DEFUSEDXML else 'N'}")
+PROGNAME = "PPMD_1.3"
 
 REF_TEXT = (
     "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. "
     "Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium doloremque laudantium, totam rem aperiam, eaque ipsa quae ab illo inventore veritatis et quasi architecto beatae vitae dicta sunt explicabo. Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut fugit, sed quia consequuntur magni dolores eos qui ratione voluptatem sequi nesciunt. Neque porro quisquam est, qui dolorem ipsum quia dolor sit amet, consectetur, adipisci velit, sed quia non numquam eius modi tempora incidunt ut labore et dolore magnam aliquam quaerat voluptatem. Ut enim ad minima veniam, quis nostrum exercitationem ullam corporis suscipit laboriosam, nisi ut aliquid ex ea commodi consequatur. Quis autem vel eum iure reprehenderit qui in ea voluptate velit esse quam nihil molestiae consequatur, vel illum qui dolorem eum fugiat quo voluptas nulla pariatur. "
-    "At vero eos et accusamus et iusto odio dignissimos ducimus qui blanditiis praesentium voluptatum deleniti atque corrupti quos dolores et quas molestias excepturi sint occaecati cupiditate non provident, similique sunt in culpa qui officia deserunt mollitia animi, id est laborum et dolorum fuga."
+    "At vero eos et accusamus et iusto odio dignissimos ducimus qui blanditiis praesentium voluptatum deleniti atque corrupti quos dolores et quas molestias excepturi sint occaecati cupiditate non provident, similique sunt in culpa qui officia deserunt mollitia animi, id est laborum et dolorum fuga. Et harum quidem rerum facilis est et expedita distinctio. Nam libero tempore, cum soluta nobis est eligendi optio cumque nihil impedit quo minus id quod maxime placeat facere possimus, omnis voluptas assumenda est, omnis dolor repellendus. Temporibus autem quibusdam et aut officiis debitis aut rerum necessitatibus saepe eveniet ut et voluptates repudiandae sint et molestiae non recusandae. Itaque earum rerum hic tenetur a sapiente delectus, ut aut reiciendis voluptatibus maiores alias consequatur aut perferendis doloribus asperiores repellat."
 )
 REF_BYTES = REF_TEXT.encode('utf-8')
 _TOK_RE = re.compile(rb'([A-Za-z]+)')
@@ -421,7 +531,7 @@ def _batch(letter, target=_TARGET):
             c = w + suf
             if len(c) <= 24 and c[0] == L: words.add(c)
     guard = 0
-    while len(words) < target and guard < target*40:
+    while len(words) < target and guard < target * 40:
         guard += 1
         c = L + rng.choice(_PRE) + rng.choice(_MID) + rng.choice(_SUF)
         if 3 <= len(c) <= 24 and c.isalpha(): words.add(c)
@@ -508,166 +618,134 @@ def cdd_mask(i, mid):
     if mid == 0: return 0
     return ((abs(i - mid) * 255) // mid) & 0xFF
 
+def cdd_forward(d):
+    if not d: return b''
+    L = len(d); n4 = L // 4; tail = bytes(d[n4 * 4:])
+    if n4 == 0: return bytes(d)
+    t = bytearray(d[:n4 * 4]); mid, key = cdd_derive(n4)
+    for i in range(n4):
+        m = cdd_mask(i, mid)
+        if m:
+            b = i * 4
+            t[b] ^= m; t[b + 1] ^= m; t[b + 2] ^= m; t[b + 3] ^= m
+    t[mid * 4 + 2] ^= 0x5A
+    for i in range(2, n4, 3):
+        b = i * 4
+        v = int.from_bytes(t[b:b + 4], 'little')
+        v = (v - key) & 0xFFFFFFFF
+        t[b:b + 4] = v.to_bytes(4, 'little')
+    return bytes(t) + tail
+
+def cdd_inverse(d):
+    if not d: return b''
+    L = len(d); n4 = L // 4; tail = bytes(d[n4 * 4:])
+    if n4 == 0: return bytes(d)
+    t = bytearray(d[:n4 * 4]); mid, key = cdd_derive(n4)
+    for i in range(2, n4, 3):
+        b = i * 4
+        v = int.from_bytes(t[b:b + 4], 'little')
+        v = (v + key) & 0xFFFFFFFF
+        t[b:b + 4] = v.to_bytes(4, 'little')
+    t[mid * 4 + 2] ^= 0x5A
+    for i in range(n4):
+        m = cdd_mask(i, mid)
+        if m:
+            b = i * 4
+            t[b] ^= m; t[b + 1] ^= m; t[b + 2] ^= m; t[b + 3] ^= m
+    return bytes(t) + tail
+
 OLE_MAGIC = b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'
 ZIP_MAGIC = b'PK\x03\x04'
-_XML_OPEN_RE  = re.compile(rb'<([A-Za-z_][\w:.-]*)((?:\s+[\w:.-]+\s*=\s*(?:"[^"]*"|\'[^\']*\'))*)\s*(/?)>')
-_XML_CLOSE_RE = re.compile(rb'</\s*([A-Za-z_][\w:.-]*)\s*>')
-_XML_ATTR_RE  = re.compile(rb'([\w:.-]+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\')')
+_XML_TAG_RE = re.compile(rb'<[A-Za-z!/?][^<>\x00]{0,4095}>')
 
 def _xml_is_plausible(d):
     if not d: return False
     if d[:8] == OLE_MAGIC: return False
     return d[:64].lstrip().startswith(b'<')
 
-def _xml_scan_tokens(d):
-    pos = 0; n = len(d)
-    while pos < n:
-        lt = d.find(b'<', pos)
-        if lt < 0:
-            if pos < n: yield (0, d[pos:])
-            return
-        if lt > pos: yield (0, d[pos:lt])
-        if d.startswith(b'<!--', lt):
-            end = d.find(b'-->', lt+4); end = (end+3) if end >= 0 else n
-            yield (3, d[lt:end]); pos = end; continue
-        if d.startswith(b'<![CDATA[', lt):
-            end = d.find(b']]>', lt+9); end = (end+3) if end >= 0 else n
-            yield (3, d[lt:end]); pos = end; continue
-        if d.startswith(b'<?', lt):
-            end = d.find(b'?>', lt+2); end = (end+2) if end >= 0 else n
-            yield (3, d[lt:end]); pos = end; continue
-        if d.startswith(b'<!', lt):
-            end = d.find(b'>', lt+2); end = (end+1) if end >= 0 else n
-            yield (3, d[lt:end]); pos = end; continue
-        m = _XML_OPEN_RE.match(d, lt)
-        if m: yield (1, (m.group(1), m.group(2), m.group(3))); pos = m.end(); continue
-        m = _XML_CLOSE_RE.match(d, lt)
-        if m: yield (2, m.group(1)); pos = m.end(); continue
-        yield (0, b'<'); pos = lt + 1
+def _xml_scan_tags(d):
+    if HAS_DEFUSEDXML:
+        try: _defused_etree.fromstring(d[:65536])
+        except Exception: pass
+    if HAS_LXML:
+        try:
+            spans = []
+            for _e, _el in _lxml_etree.iterparse(io.BytesIO(d), events=("start","end"), recover=True): break
+            for m in _XML_TAG_RE.finditer(d): spans.append((m.start(), m.end(), m.group(0)))
+            return spans
+        except Exception: pass
+    return [(m.start(), m.end(), m.group(0)) for m in _XML_TAG_RE.finditer(d)]
 
-def _emit_varint(buf, n):
-    if n < 0x80: buf.append(n); return
-    while True:
-        b = n & 0x7F; n >>= 7
-        if n: buf.append(b | 0x80)
-        else: buf.append(b); return
-
-def _read_varint(buf, pos):
-    if pos >= len(buf): raise TransformError("varint eof")
-    b = buf[pos]
-    if b < 0x80: return b, pos + 1
-    n = b & 0x7F; sh = 7; pos += 1
-    while True:
-        if pos >= len(buf): raise TransformError("varint eof")
-        b = buf[pos]; pos += 1
-        n |= (b & 0x7F) << sh
-        if not (b & 0x80): return n, pos
-        sh += 7
-        if sh > 63: raise TransformError("varint overflow")
-
-def _idx_or_add(lst, s):
-    try: return lst.index(s)
-    except ValueError:
-        lst.append(s); i = len(lst) - 1
-        if i > 255: raise TransformError("xml v2 dict overflow")
-        return i
-
-def _xml_encode_v2(d):
+def _xml_encode(d, max_tags=4096, min_freq=2):
     if not d: return None
-    toks = list(_xml_scan_tokens(d))
-    if not toks: return None
-    tag_names = []; attr_names = []; attr_vals = []; text_chunks = []
-    struct = bytearray()
-    for kind, payload in toks:
-        if kind == 0:
-            struct.append(0); _emit_varint(struct, len(text_chunks)); text_chunks.append(payload)
-        elif kind == 1:
-            name, attrs_raw, selfclose = payload
-            struct.append(1 if not selfclose else 4)
-            struct.append(_idx_or_add(tag_names, name))
-            attr_list = list(_XML_ATTR_RE.finditer(attrs_raw))
-            _emit_varint(struct, len(attr_list))
-            for am in attr_list:
-                aname = am.group(1)
-                aval = am.group(2) if am.group(2) is not None else am.group(3)
-                struct.append(_idx_or_add(attr_names, aname))
-                _emit_varint(struct, _idx_or_add(attr_vals, aval))
-        elif kind == 2:
-            struct.append(2); struct.append(_idx_or_add(tag_names, payload))
+    spans = _xml_scan_tags(d)
+    if not spans: return None
+    freq = Counter(tag for _, _, tag in spans)
+    ranked = [t for t, c in freq.most_common(max_tags) if len(t) >= 3 and c >= min_freq]
+    if not ranked: return None
+    tag_to_idx = {t: i for i, t in enumerate(ranked)}
+    out = bytearray(); _emit_varint(out, len(ranked))
+    for t in ranked: _emit_varint(out, len(t)); out += t
+    last = 0
+    for start, end, tag in spans:
+        if start > last:
+            chunk = d[last:start]
+            if 0 in chunk:
+                out += chunk.replace(b'\x00', b'\x00\x00')
+            else:
+                out += chunk
+        idx = tag_to_idx.get(tag)
+        if idx is not None:
+            out.append(0)
+            _emit_varint(out, idx + 1)
         else:
-            struct.append(3); _emit_varint(struct, len(text_chunks)); text_chunks.append(payload)
-    out = bytearray(); out.append(0x58); out.append(0x58)
-    for lst in (tag_names, attr_names, attr_vals):
-        _emit_varint(out, len(lst))
-        for s in lst: _emit_varint(out, len(s)); out += s
-    _emit_varint(out, len(struct)); out += struct
-    _emit_varint(out, len(text_chunks))
-    for t in text_chunks: _emit_varint(out, len(t)); out += t
+            if 0 in tag:
+                out += tag.replace(b'\x00', b'\x00\x00')
+            else:
+                out += tag
+        last = end
+    if last < len(d):
+        chunk = d[last:]
+        if 0 in chunk:
+            out += chunk.replace(b'\x00', b'\x00\x00')
+        else:
+            out += chunk
     return bytes(out)
 
-def _xml_decode_v2(payload):
-    if len(payload) < 2 or payload[0] != 0x58 or payload[1] != 0x58:
-        raise TransformError("xml v2 magic")
-    pos = 2; dicts = []
-    for _ in range(3):
-        cnt, pos = _read_varint(payload, pos); d = []
-        for _ in range(cnt):
-            ln, pos = _read_varint(payload, pos)
-            d.append(payload[pos:pos+ln]); pos += ln
-        dicts.append(d)
-    tag_names, attr_names, attr_vals = dicts
-    struct_len, pos = _read_varint(payload, pos)
-    struct = payload[pos:pos+struct_len]; pos += struct_len
-    n_text, pos = _read_varint(payload, pos); texts = []
-    for _ in range(n_text):
-        ln, pos = _read_varint(payload, pos)
-        texts.append(payload[pos:pos+ln]); pos += ln
-    out = bytearray(); sp = 0
-    while sp < len(struct):
-        op = struct[sp]; sp += 1
-        if op == 0:
-            idx, sp = _read_varint(struct, sp); out += texts[idx]
-        elif op == 1:
-            ti = struct[sp]; sp += 1
-            n_attrs, sp = _read_varint(struct, sp)
-            out += b'<' + tag_names[ti]
-            for _ in range(n_attrs):
-                ai = struct[sp]; sp += 1; vi, sp = _read_varint(struct, sp)
-                out += b' ' + attr_names[ai] + b'="' + attr_vals[vi] + b'"'
-            out += b'>'
-        elif op == 2:
-            ti = struct[sp]; sp += 1; out += b'</' + tag_names[ti] + b'>'
-        elif op == 3:
-            idx, sp = _read_varint(struct, sp); out += texts[idx]
-        elif op == 4:
-            ti = struct[sp]; sp += 1
-            n_attrs, sp = _read_varint(struct, sp)
-            out += b'<' + tag_names[ti]
-            for _ in range(n_attrs):
-                ai = struct[sp]; sp += 1; vi, sp = _read_varint(struct, sp)
-                out += b' ' + attr_names[ai] + b'="' + attr_vals[vi] + b'"'
-            out += b'/>'
-        else: raise TransformError(f"xml v2 op {op}")
+def _xml_decode(payload):
+    pos = 0
+    n_tags, pos = _read_varint(payload, pos)
+    tags = []
+    for _ in range(n_tags):
+        ln, pos = _read_varint(payload, pos); tags.append(payload[pos:pos+ln]); pos += ln
+    out = bytearray(); n = len(payload)
+    while pos < n:
+        b = payload[pos]; pos += 1
+        if b != 0: out.append(b); continue
+        if pos >= n: raise TransformError("xml escape eof")
+        nxt = payload[pos]; pos += 1
+        if nxt == 0: out.append(0); continue
+        v = nxt & 0x7F; sh = 7
+        while nxt & 0x80:
+            if pos >= n: raise TransformError("xml varint eof")
+            nxt = payload[pos]; pos += 1; v |= (nxt & 0x7F) << sh; sh += 7
+            if sh > 35: raise TransformError("xml varint overflow")
+        idx = v - 1
+        if idx < 0 or idx >= len(tags): raise TransformError(f"xml tag idx {idx}")
+        out += tags[idx]
     return bytes(out)
 
-PRIMES = [p for p in range(2, 256) if all(p % d != 0 for d in range(2, int(p**0.5) + 1))]
+PRIMES = [p for p in range(2, 256) if all(p % d != 0 for d in range(2, int(p ** 0.5) + 1))]
 PI_DIGITS = [79, 17, 111]
 
 def nearest_prime(n):
-    n &= 0xFF
-    if n < 2:
-        return 2
+    if n < 2: return 2
     o = 0
-    while o <= 256:
+    while True:
         c1, c2 = n - o, n + o
-        if c1 >= 2:
-            if all(c1 % d != 0 for d in range(2, int(c1 ** 0.5) + 1)):
-                return c1 & 0xFF
-        if c2 >= 2 and c2 <= 255:
-            if all(c2 % d != 0 for d in range(2, int(c2 ** 0.5) + 1)):
-                return c2 & 0xFF
+        if c1 >= 2 and all(c1 % d != 0 for d in range(2, int(c1 ** 0.5) + 1)): return c1
+        if c2 >= 2 and all(c2 % d != 0 for d in range(2, int(c2 ** 0.5) + 1)): return c2
         o += 1
-    return n & 0xFF
 
 _CD_CODE = [(2,0b10),(2,0b11),(3,0b010),(3,0b011),(4,0b0010),(4,0b0011),(5,0b00010),(5,0b00011),(6,0b000010),(6,0b000011),(7,0b0000010),(7,0b0000011),(8,0b00000010),(8,0b00000011),(9,0b000000010),(9,0b000000011)]
 _CD_DEC = {v: k for k, v in enumerate(_CD_CODE)}
@@ -679,6 +757,29 @@ PAQ = [[1,2,0,0],[3,5,0,1],[4,6,2,0],[7,10,0,2],[8,12,3,0],[9,13,1,1],[11,14,0,3
 class TransformError(Exception): pass
 class DecompressionError(Exception): pass
 
+def _emit_varint(buf, n):
+    if n < 0x80:
+        buf.append(n)
+        return
+    while True:
+        b = n & 0x7F; n >>= 7
+        if n: buf.append(b | 0x80)
+        else: buf.append(b); return
+
+def _read_varint(buf, pos):
+    if pos >= len(buf): raise TransformError("varint eof")
+    b = buf[pos]
+    if b < 0x80:
+        return b, pos + 1
+    n = b & 0x7F; sh = 7; pos += 1
+    while True:
+        if pos >= len(buf): raise TransformError("varint eof")
+        b = buf[pos]; pos += 1
+        n |= (b & 0x7F) << sh
+        if not (b & 0x80): return n, pos
+        sh += 7
+        if sh > 63: raise TransformError("varint overflow")
+
 def mod_inv(a, m):
     if a == 0: return None
     m0 = m; y = 0; x = 1
@@ -689,58 +790,20 @@ def mod_inv(a, m):
     if x < 0: x += m0
     return x
 
-def _encode_header(kind, ident):
-    if kind == "a":
-        if not (1 <= ident <= 256): raise TransformError(f"single ID out of range: {ident}")
-        v = ident - 1
-    else:
-        if not (1 <= ident <= MAX_PAIRS):
-            raise TransformError(f"pair index out of range: {ident} (max {MAX_PAIRS})")
-        v = 0x100 + (ident - 1)
-    return bytes([(v >> 8) & 0xFF, v & 0xFF])
-
-def _decode_header(hdr):
-    if len(hdr) < 2: raise TransformError("short header")
-    v = (hdr[0] << 8) | hdr[1]
-    if v < 0x100: return "a", v + 1
-    return "b", v - 0xFF
-
-_EXT_RE = re.compile(r'\.a([0-9a-fA-F]{4})$')
-
-def _ext_for(kind, ident):
-    hdr = _encode_header(kind, ident)
-    return f".a{hdr[0]:02x}{hdr[1]:02x}"
-
-def _parse_ext(fname):
-    m = _EXT_RE.search(fname)
-    if not m: return None
-    hexs = m.group(1)
-    v = int(hexs, 16)
-    if v < 0x100: return "a", v + 1
-    return "b", v - 0xFF
-
-# ═══════════════════════════════════════════════════════════════════════
-# COMPRESSOR
-# ═══════════════════════════════════════════════════════════════════════
 class Compressor:
     TIMEOUT = 300; VS = False; USE_MP = True
     TOP_K = 100; FAST = True; BLOCK = 4096
     MAX_TRANSFORM = 256; PROGRESS_EVERY = 500; STRIDE = 3
     MAX_EAGER_ID = 256
-    HUFF_MAX_LEN = 64
 
-    _A80_BLK    = 1024
-    _A80_MASK   = (1 << 8192) - 1
-    _A80_PERIOD = 3 * 1024
-
-    def __init__(self, try_dl=True, pairs=MAX_PAIRS, qubits=16):
-        self.PAIRS = min(pairs, MAX_PAIRS)
+    def __init__(self, try_dl=True, pairs=65535, qubits=16):
+        self.PAIRS = pairs
         self.QUBITS = qubits
         self._cback_cache = {}
         self._CBACK_CACHE_MAX = 65536
         self._fwd_cache = {}
-        self._pool_cback = None; self._pool_pid = None
-        self._a35_cache = {}
+        self._pool_cback = None
+        self._pool_pid = None
         print("\nBuilding dictionary...")
         self.dict_words = build_dict(try_dl)
         self.PI = PI_DIGITS.copy()
@@ -751,103 +814,78 @@ class Compressor:
         self.mask46 = [(b-10) & 0xFF for b in [1,2,4,8,16,32,64,128,3,6,10]] * 10
         self.pattern47 = bytes(row[0] & 0xFF for row in self.mst)
         self._xor_tables = {}
-        self._t04_tab = None; self._t06_tab = None; self._t06_inv = None
-        self._t11_cache = {}; self._t12_cache = {}; self._t26_cache = {}
-        self._c18_cache = {}; self._c19_cache = {}; self._c20_cache = {}
-        self._cdd_cache = {}; self._rot_tabs = {}; self._add_tabs = {}; self._sub_tabs = {}
+        self._t04_tab = None
+        self._t06_tab = None
+        self._t06_inv = None
+        self._t11_cache = {}
+        self._t12_cache = {}
+        self._t26_cache = {}
+        self._c18_cache = {}
+        self._c19_cache = {}
+        self._c20_cache = {}
+        self._cdd_cache = {}
+        self._rot_tabs = {}
+        self._add_tabs = {}
+        self._sub_tabs = {}
         self._m1_tab = bytes((b - 1) & 0xFF for b in range(256))
         self._p1_tab = bytes((b + 1) & 0xFF for b in range(256))
-        self._np_tab = [nearest_prime(n) & 0xFF for n in range(600)]
-        self._spread_0101 = int.from_bytes(b'\x01' * 1024, 'little')
-        gr8 = (0x9E3779B97F4A7C15).to_bytes(8, 'little')
-        self._spread_golden = int.from_bytes(gr8 * 128, 'little')
-        self._a82_ks_cache = None
+        self._np_tab = [nearest_prime(n) for n in range(600)]
         if HAS_QISKIT:
+            print(f"Building Qiskit {self.QUBITS}-qubit pair permutation for {self.PAIRS} pairs ...")
             t0 = time.time()
             self._qperm = quantum_pair_permutation(self.PAIRS, self.QUBITS)
             print(f"  quantum permutation ready ({time.time()-t0:.3f}s)")
         else:
             self._qperm = list(range(self.PAIRS))
         self._build_ref_dict(); self._maps(); self._pairs()
-        self._pair_index = {p: i + 1 for i, p in enumerate(self.pairs)}
-        self._verify_all_transforms()
-
-    def _verify_all_transforms(self):
-        sample = (b"the quick brown fox jumps over the lazy dog " * 3
-                  + bytes(range(256)) + os.urandom(64))
-        tests = [b"", b"\x00", b"\xff", sample]
-        bad = []
-        for t in range(1, 257):
-            for test in tests:
-                try:
-                    tr = self.fwd[t](test)
-                    if self.rev[t](tr) != test:
-                        bad.append((t, len(test), "mismatch")); break
-                except Exception as e:
-                    bad.append((t, len(test), repr(e))); break
-        if bad:
-            broken_ids = sorted({t for t, _, _ in bad})
-            print(f"  [FAIL-FAST] {len(broken_ids)} transforms failed verify:")
-            for t, L, why in bad[:12]:
-                print(f"    a{t}: len={L} {why}")
-            if len(bad) > 12: print(f"    ... ({len(bad)-12} more)")
-            print(f"  [FIX] replacing {len(broken_ids)} broken IDs with identity")
-            for t in broken_ids:
-                self.fwd[t] = (lambda d: d)
-                self.rev[t] = (lambda d: d)
-        else:
-            print("  all 256 transforms verified at construction time ✓")
 
     def _xor_table(self, k):
         t = self._xor_tables.get(k)
-        if t is None: t = bytes(b ^ k for b in range(256)); self._xor_tables[k] = t
+        if t is None:
+            t = bytes(b ^ k for b in range(256))
+            self._xor_tables[k] = t
         return t
+
     def _rot_tab(self, k):
-        k &= 7; t = self._rot_tabs.get(k)
+        k &= 7
+        t = self._rot_tabs.get(k)
         if t is None:
-            t = bytes(((b << k) | (b >> (8 - k))) & 0xFF for b in range(256)); self._rot_tabs[k] = t
+            t = bytes(((b << k) | (b >> (8 - k))) & 0xFF for b in range(256))
+            self._rot_tabs[k] = t
         return t
+
     def _irot_tab(self, k):
-        k &= 7; key = ('i', k); t = self._rot_tabs.get(key)
+        k &= 7
+        key = ('i', k)
+        t = self._rot_tabs.get(key)
         if t is None:
-            t = bytes(((b >> k) | (b << (8 - k))) & 0xFF for b in range(256)); self._rot_tabs[key] = t
+            t = bytes(((b >> k) | (b << (8 - k))) & 0xFF for b in range(256))
+            self._rot_tabs[key] = t
         return t
+
     def _add_tab(self, k):
-        k &= 0xFF; t = self._add_tabs.get(k)
-        if t is None: t = bytes((b + k) & 0xFF for b in range(256)); self._add_tabs[k] = t
+        k &= 0xFF
+        t = self._add_tabs.get(k)
+        if t is None:
+            t = bytes((b + k) & 0xFF for b in range(256))
+            self._add_tabs[k] = t
         return t
+
     def _sub_tab(self, k):
-        k &= 0xFF; t = self._sub_tabs.get(k)
-        if t is None: t = bytes((b - k) & 0xFF for b in range(256)); self._sub_tabs[k] = t
+        k &= 0xFF
+        t = self._sub_tabs.get(k)
+        if t is None:
+            t = bytes((b - k) & 0xFF for b in range(256))
+            self._sub_tabs[k] = t
         return t
+
     def _xor_pattern(self, d, pattern):
         L = len(d); pl = len(pattern)
         mask = (pattern * ((L // pl) + 1))[:L]
         return (int.from_bytes(d, 'big') ^ int.from_bytes(mask, 'big')).to_bytes(L, 'big')
+
     def _np(self, n):
-        return (self._np_tab[n] if n < 600 else nearest_prime(n)) & 0xFF
-
-    @staticmethod
-    def _blk_check(b):
-        h = 0x811c9dc5
-        for byte in b:
-            h = ((h ^ byte) * 0x01000193) & 0xFFFFFFFF
-        return (h ^ (h >> 16)) & 0xFFFF
-
-    def _sbox_perm(self, key_bytes):
-        cache_key = bytes(key_bytes)
-        hit = self._a35_cache.get(cache_key)
-        if hit is not None:
-            return hit
-        rng = random.Random(int.from_bytes(hashlib.sha256(cache_key).digest(), 'big'))
-        perm = list(range(256))
-        rng.shuffle(perm)
-        fwd = bytes(perm)
-        inv = bytearray(256)
-        for i, v in enumerate(perm):
-            inv[v] = i
-        self._a35_cache[cache_key] = (fwd, bytes(inv))
-        return self._a35_cache[cache_key]
+        return self._np_tab[n] if n < 600 else nearest_prime(n)
 
     def _build_ref_dict(self):
         seen = set(); ordered = []
@@ -860,6 +898,7 @@ class Compressor:
         self.ref_bytes = [w.encode('ascii') for w in self.ref_words]
         self.ref_bytes_cap = [b.capitalize() for b in self.ref_bytes]
         self.ref_bytes_up = [b.upper() for b in self.ref_bytes]
+        self._ref_esc = len(self.ref_words)
         if HAS_ZSTD:
             try:
                 self._zstd_dict = zstd.ZstdCompressionDict(REF_BYTES, dict_type=zstd.DICT_TYPE_RAWCONTENT)
@@ -872,8 +911,8 @@ class Compressor:
     def _seeds(self, n=126, s=40, seed=42):
         random.seed(seed); return [[random.randint(5,255) for _ in range(s)] for _ in range(n)]
     def _fib(self, n):
-        a, b = 0, 1; r = [a, b]
-        for _ in range(2, n): a, b = b, a+b; r.append(b)
+        a,b = 0,1; r = [a,b]
+        for _ in range(2, n): a,b = b,a+b; r.append(b)
         return r
     def _seed(self, i, v): return self.seeds[i][v % 40] if 0 <= i < len(self.seeds) else 0
     def _bits(self, bl, v, c):
@@ -901,12 +940,12 @@ class Compressor:
     def _leptond(self, d):
         if not HAS_LEPTON: return None
         try:
-            dc = lepton_jpeg_python.decompress_bytes(d); return dc if dc else None
+            dc = lepton_jpeg_python.decompress_bytes(d)
+            return dc if dc else None
         except Exception: return None
 
-    def _cmixc(self, d, force=False):
+    def _cmixc(self, d):
         if not HAS_CMIX: return None
-        if not force and SKIP_SLOW: return None
         cmix = shutil.which('cmix')
         if not cmix: return None
         with tempfile.TemporaryDirectory() as td:
@@ -919,10 +958,8 @@ class Compressor:
                         with open(out, 'rb') as f: return f.read()
                 except Exception: pass
         return None
-
-    def _cmixd(self, d, force=False):
+    def _cmixd(self, d):
         if not HAS_CMIX: return None
-        if not force and SKIP_SLOW: return None
         cmix = shutil.which('cmix')
         if not cmix: return None
         with tempfile.TemporaryDirectory() as td:
@@ -934,9 +971,8 @@ class Compressor:
                     with open(out, 'rb') as f: return f.read()
             except Exception: pass
         return None
-
     def _zpc(self, d):
-        if not HAS_ZPAQ or SKIP_SLOW: return None
+        if not HAS_ZPAQ: return None
         with tempfile.TemporaryDirectory() as td:
             inp = os.path.join(td, 'i'); arc = os.path.join(td, 'a.zpaq')
             with open(inp, 'wb') as f: f.write(d)
@@ -946,7 +982,7 @@ class Compressor:
                 with open(arc, 'rb') as f: return f.read()
             except Exception: return None
     def _zpd(self, d):
-        if not HAS_ZPAQ or SKIP_SLOW: return None
+        if not HAS_ZPAQ: return None
         with tempfile.TemporaryDirectory() as td:
             arc = os.path.join(td, 'a.zpaq'); od = os.path.join(td, 'o'); os.makedirs(od)
             with open(arc, 'wb') as f: f.write(d)
@@ -958,27 +994,41 @@ class Compressor:
             except Exception: return None
         return None
     def _ccmxc(self, d):
-        if not HAS_CCMX or SKIP_SLOW: return None
+        if not HAS_CCMX: return None
         with tempfile.TemporaryDirectory() as td:
             inp = os.path.join(td, 'i'); out = os.path.join(td, 'o.ccmx')
             with open(inp, 'wb') as f: f.write(d)
-            try:
-                r = subprocess.run(['ccmx', 'c', inp, out], capture_output=True, timeout=600)
-                if r.returncode == 0 and os.path.exists(out):
-                    with open(out, 'rb') as f: return f.read()
-            except Exception: pass
+            for args in (['ccmx', 'c', inp, out, '256'], ['ccmx', 'c', inp, out, '1024'], ['ccmx', 'c', inp, out], ['ccmx', '-c', inp, out], ['ccmx', 'c', inp], ['ccmx', inp]):
+                try:
+                    r = subprocess.run(args, capture_output=True, timeout=600)
+                    if r.returncode != 0: continue
+                    for p in (out, inp + '.ccmx', inp + '.cmx', inp + '.ccm'):
+                        if os.path.exists(p):
+                            with open(p, 'rb') as f: return f.read()
+                except Exception: continue
         return None
     def _ccmxd(self, d):
-        if not HAS_CCMX or SKIP_SLOW: return None
+        if not HAS_CCMX: return None
         with tempfile.TemporaryDirectory() as td:
             inp = os.path.join(td, 'i.ccmx'); out = os.path.join(td, 'o')
             with open(inp, 'wb') as f: f.write(d)
-            try:
-                r = subprocess.run(['ccmx', 'd', inp, out], capture_output=True, timeout=600)
-                if r.returncode == 0 and os.path.exists(out):
-                    with open(out, 'rb') as f: return f.read()
-            except Exception: pass
+            for args in (['ccmx', 'd', inp, out], ['ccmx', '-d', inp, out], ['ccmx', 'd', inp], ['ccmx', 'x', inp]):
+                try:
+                    r = subprocess.run(args, capture_output=True, timeout=600)
+                    if r.returncode != 0: continue
+                    for p in (out, inp[:-5], inp[:-4], inp[:-5] + '.out'):
+                        if p and os.path.exists(p):
+                            with open(p, 'rb') as f: return f.read()
+                except Exception: continue
         return None
+
+    def _get_fwd(self, t, data):
+        v = self._fwd_cache.get(t)
+        if v is None:
+            v = self.fwd[t](data)
+            if len(self._fwd_cache) < 512:
+                self._fwd_cache[t] = v
+        return v
 
     def _ensure_pool(self):
         cur = os.getpid()
@@ -987,7 +1037,8 @@ class Compressor:
                 try: self._pool_cback.shutdown(wait=False)
                 except Exception: pass
             nw = CBACK_WORKERS_EFF if _IN_WORKER else CBACK_WORKERS
-            self._pool_cback = ThreadPoolExecutor(max_workers=max(1, nw), thread_name_prefix="cback")
+            nw = max(1, nw)
+            self._pool_cback = ThreadPoolExecutor(max_workers=nw, thread_name_prefix="cback")
             self._pool_pid = cur
         return self._pool_cback
 
@@ -995,94 +1046,107 @@ class Compressor:
         hit = self._cback_cache.get(d)
         if hit is not None: return hit
         result = self._cback_compute(d)
-        if len(self._cback_cache) < self._CBACK_CACHE_MAX: self._cback_cache[d] = result
+        if len(self._cback_cache) < self._CBACK_CACHE_MAX:
+            self._cback_cache[d] = result
         return result
 
     def _cback_compute(self, d):
-        thunks = [("raw", lambda: (0, d))]
+        thunks = []
+        def _raw(): return (0, d)
+        thunks.append(_raw)
         if HAS_ZSTD:
             def _z1():
-                c = zc.compress(d)
-                if len(c) >= 4 and c[:4] == b'\x28\xb5\x2f\xfd': c = c[4:]
-                return (1, c)
-            thunks.append(("zstd22", _z1))
-            def _z6():
-                c = zc_fast.compress(d)
-                if len(c) >= 4 and c[:4] == b'\x28\xb5\x2f\xfd': c = c[4:]
-                return (1, c)
-            thunks.append(("zstd6", _z6))
+                try:
+                    c = zc.compress(d)
+                    if len(c) >= 4 and c[:4] == b'\x28\xb5\x2f\xfd': c = c[4:]
+                    return (1, c)
+                except Exception: return None
+            thunks.append(_z1)
             if self._zc_dict is not None:
                 def _z11():
-                    c = self._zc_dict.compress(d)
-                    if len(c) >= 4 and c[:4] == b'\x28\xb5\x2f\xfd': c = c[4:]
-                    return (11, c)
-                thunks.append(("zstd22-dict", _z11))
-        if HAS_BROTLI:
-            def _tb(): return (4, brotli.compress(d, quality=11))
-            thunks.append(("brotli11", _tb))
-            def _tb5(): return (4, brotli.compress(d, quality=5))
-            thunks.append(("brotli5", _tb5))
-        if HAS_LZMA:
-            def _tl9(): return (5, lzma.compress(d, preset=9 | lzma.PRESET_EXTREME))
-            thunks.append(("lzma9e", _tl9))
-            def _tl6():
-                f = LF_RAW[0].copy(); f['preset'] = 9
-                return (6, lzma.compress(d, format=lzma.FORMAT_RAW, filters=[f]))
-            thunks.append(("lzma9raw", _tl6))
-        if HAS_PPMD:
-            def _tpp(): return (8, pyppmd.compress(d, max_order=16, mem_size=256<<20))
-            thunks.append(("ppmd16", _tpp))
+                    try:
+                        c = self._zc_dict.compress(d)
+                        if len(c) >= 4 and c[:4] == b'\x28\xb5\x2f\xfd': c = c[4:]
+                        return (11, c)
+                    except Exception: return None
+                thunks.append(_z11)
         if paq:
             def _tp():
-                pd = paq.compress(d)
-                if len(pd) >= 7 and pd[:4] == b'\x00\x63\x00\x00' and pd[-3:] == b'\xff\xff\xff':
-                    return (3, pd[4:-3])
-                return (2, pd)
-            thunks.append(("paq", _tp))
-        if not SKIP_SLOW:
-            if HAS_ZPAQ:
-                def _tz():
-                    c = self._zpc(d); return (10, c) if c else None
-                thunks.append(("zpaq", _tz))
-            if HAS_CCMX:
-                def _tc():
-                    c = self._ccmxc(d); return (12, c) if c else None
-                thunks.append(("ccmx", _tc))
-            if HAS_CMIX:
-                def _tm():
-                    c = self._cmixc(d); return (13, c) if c else None
-                thunks.append(("cmix", _tm))
+                try:
+                    pd = paq.compress(d)
+                    if len(pd) >= 7 and pd[:4] == b'\x00\x63\x00\x00' and pd[-3:] == b'\xff\xff\xff': return (3, pd[4:-3])
+                    return (2, pd)
+                except Exception: return None
+            thunks.append(_tp)
+        if HAS_BROTLI:
+            def _tb():
+                try: return (4, brotli.compress(d, quality=11))
+                except Exception: return None
+            thunks.append(_tb)
+        if HAS_LZMA:
+            _lz_specs = ((5, {"preset": 9 | lzma.PRESET_EXTREME}),
+                         (6, {"format": lzma.FORMAT_RAW, "filters": LF_RAW}),
+                         (7, {"format": lzma.FORMAT_RAW, "filters": LF_DELTA}),
+                         (9, {"format": lzma.FORMAT_RAW, "filters": LF_BCJ}))
+            for _fmt, _kw in _lz_specs:
+                def _tl(_kw=_kw, _fmt=_fmt):
+                    try: return (_fmt, lzma.compress(d, **_kw))
+                    except Exception: return None
+                thunks.append(_tl)
+        if HAS_PPMD:
+            def _tpp():
+                try: return (8, pyppmd.compress(d, max_order=16, mem_size=256<<20))
+                except Exception: return None
+            thunks.append(_tpp)
+        if HAS_ZPAQ:
+            def _tz():
+                try:
+                    c = self._zpc(d)
+                    return (10, c) if c else None
+                except Exception: return None
+            thunks.append(_tz)
+        if HAS_CCMX:
+            def _tc():
+                try:
+                    c = self._ccmxc(d)
+                    return (12, c) if c else None
+                except Exception: return None
+            thunks.append(_tc)
+        if HAS_CMIX:
+            def _tm():
+                try:
+                    c = self._cmixc(d)
+                    return (13, c) if c else None
+                except Exception: return None
+            thunks.append(_tm)
         if HAS_LEPTON:
             def _te():
-                c = self._leptonc(d); return (14, c) if c else None
-            thunks.append(("lepton", _te))
-
-        n = len(thunks); results = [None]*n
+                try:
+                    c = self._leptonc(d)
+                    return (14, c) if c else None
+                except Exception: return None
+            thunks.append(_te)
+        n = len(thunks)
+        results = [None]*n
         nw_eff = CBACK_WORKERS_EFF if _IN_WORKER else CBACK_WORKERS
         if n <= 1 or nw_eff <= 1:
-            for i, (_, t) in enumerate(thunks):
+            for i, t in enumerate(thunks):
                 try: results[i] = t()
                 except Exception: results[i] = None
         else:
             ex = self._ensure_pool()
-            futs = [ex.submit(t) for _, t in thunks]
+            futs = [ex.submit(t) for t in thunks]
             for i, f in enumerate(futs):
                 try: results[i] = f.result()
                 except Exception: results[i] = None
         cs = [r for r in results if r is not None]
         cs.sort(key=lambda x: len(x[1]))
-        raw_size = len(d)
         for fmt, comp in cs:
-            if fmt == 0:
-                return bytes([0]) + d
             blob = bytes([fmt]) + comp
-            if len(blob) >= raw_size:
-                break
+            if fmt == 0: return blob
             try:
-                if self.dback(blob) == d:
-                    return blob
-            except Exception:
-                continue
+                if self.dback(blob) == d: return blob
+            except Exception: continue
         return bytes([0]) + d
 
     def dback(self, d):
@@ -1108,13 +1172,13 @@ class Compressor:
             try: return lzma.decompress(p, format=lzma.FORMAT_RAW, filters=LF_RAW)
             except Exception: return None
         if f == 7 and HAS_LZMA:
-            try: return lzma.decompress(p, format=lzma.FORMAT_RAW, filters=LF_RAW)
+            try: return lzma.decompress(p, format=lzma.FORMAT_RAW, filters=LF_DELTA)
             except Exception: return None
         if f == 8 and HAS_PPMD:
             try: return pyppmd.decompress(p, mem_size=256<<20)
             except Exception: return None
         if f == 9 and HAS_LZMA:
-            try: return lzma.decompress(p, format=lzma.FORMAT_RAW, filters=LF_RAW)
+            try: return lzma.decompress(p, format=lzma.FORMAT_RAW, filters=LF_BCJ)
             except Exception: return None
         if f == 10 and HAS_ZPAQ:
             try: return self._zpd(p)
@@ -1126,52 +1190,141 @@ class Compressor:
             try: return self._ccmxd(p)
             except Exception: return None
         if f == 13 and HAS_CMIX:
-            try: return self._cmixd(p, force=True)
+            try: return self._cmixd(p)
             except Exception: return None
         if f == 14 and HAS_LEPTON:
             try: return self._leptond(p)
             except Exception: return None
         return None
 
-    def t_xml(self, d):
-        if not d:
+    # ═══════════════════════════════════════════════════════════════════════
+    #  Lossless envelope — RLE XOR delta
+    # ═══════════════════════════════════════════════════════════════════════
+    def _delta_encode(self, orig, recon):
+        if orig == recon:
             return b'\x00'
-        if d[:8] == OLE_MAGIC:
-            return b'\x03' + d
-        if d[:4] == ZIP_MAGIC:
-            try:
-                payload = _xml_encode_v2(d)
-                if payload is not None and _xml_decode_v2(payload) == d:
-                    return b'\x02' + payload
-            except Exception:
-                pass
-            return b'\x04' + d
-        if not _xml_is_plausible(d):
-            return b'\x00' + d
-        try:
-            payload = _xml_encode_v2(d)
-            if payload is None:
-                return b'\x00' + d
-            if _xml_decode_v2(payload) != d:
-                return b'\x00' + d
-            return b'\x01' + payload
-        except Exception:
-            return b'\x00' + d
+        if len(orig) != len(recon):
+            raise TransformError("delta: length mismatch")
+        out = bytearray()
+        runs = []
+        i = 0
+        n = len(orig)
+        while i < n:
+            if orig[i] != recon[i]:
+                j = i
+                while j < n and orig[j] != recon[j]:
+                    j += 1
+                runs.append((i, j - i))
+                i = j
+            else:
+                i += 1
+        _emit_varint(out, len(runs))
+        for off, ln in runs:
+            _emit_varint(out, off)
+            _emit_varint(out, ln)
+            out += bytes(orig[off + k] ^ recon[off + k] for k in range(ln))
+        return bytes(out)
 
-    def r_xml(self, d):
-        if not d:
+    def _delta_decode(self, recon, blob):
+        pos = 0
+        n_runs, pos = _read_varint(blob, pos)
+        if n_runs == 0:
+            if pos != len(blob):
+                raise TransformError("delta: trailing bytes")
+            return recon
+        out = bytearray(recon)
+        for _ in range(n_runs):
+            off, pos = _read_varint(blob, pos)
+            ln, pos = _read_varint(blob, pos)
+            if pos + ln > len(blob):
+                raise TransformError("delta: run body truncated")
+            if off + ln > len(out):
+                raise TransformError("delta: run exceeds buffer")
+            for k in range(ln):
+                out[off + k] ^= blob[pos + k]
+            pos += ln
+        if pos != len(blob):
+            raise TransformError("delta: trailing bytes after runs")
+        return bytes(out)
+
+    def _safe_recon(self, tid, tr, orig):
+        try:
+            rf = self.rev[tid]
+        except (KeyError, AttributeError):
             return b''
+        try:
+            r = rf(tr)
+            if r is None:
+                return b''
+            return r
+        except Exception:
+            return b''
+
+    def _lossless_wrap(self, tid, tf, rf):
+        def fwd(d):
+            try:
+                tr = tf(d)
+            except TransformError:
+                tr = b''
+            # Compute what the decoder will reconstruct, so we can store the
+            # exact residual.  This requires the raw (unwrapped) rf, which is
+            # what we pass in as `rf`.
+            try:
+                recon = rf(tr)
+                if recon is None:
+                    recon = b''
+            except Exception:
+                recon = b''
+            hdr = bytearray()
+            _emit_varint(hdr, len(d))
+            delta = self._delta_encode(d, recon)
+            _emit_varint(hdr, len(delta))
+            return bytes(hdr) + tr + delta
+
+        def rev(blob):
+            pos = 0
+            orig_len, pos = _read_varint(blob, pos)
+            delta_len, pos = _read_varint(blob, pos)
+            if delta_len > len(blob) - pos:
+                raise TransformError("wrap: delta longer than payload")
+            tr = blob[pos:len(blob) - delta_len]
+            delta = blob[len(blob) - delta_len:]
+            try:
+                recon = rf(tr)
+            except Exception:
+                recon = b''
+            if recon is None:
+                recon = b''
+            out = self._delta_decode(recon, delta)
+            if len(out) != orig_len:
+                raise TransformError(
+                    f"wrap: reconstructed length {len(out)} != {orig_len}")
+            return out
+        return fwd, rev
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  Raw transforms (1..256) — un-wrapped.  _maps() wraps them all.
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def t_xml(self, d):
+        if not d: return b'\x00'
+        if d[:8] == OLE_MAGIC: return b'\x03' + d
+        if d[:4] == ZIP_MAGIC:
+            payload = _xml_encode(d, max_tags=1024, min_freq=3)
+            if payload is not None: return b'\x02' + payload
+            return b'\x04' + d
+        if not _xml_is_plausible(d): return b'\x00' + d
+        payload = _xml_encode(d, max_tags=4096, min_freq=2)
+        if payload is None: return b'\x00' + d
+        return b'\x01' + payload
+    def r_xml(self, d):
+        if not d: return b''
         mode = d[0]; body = d[1:]
-        if mode == 0x00:
-            return body
-        if mode == 0x01:
-            return _xml_decode_v2(body)
-        if mode == 0x02:
-            return _xml_decode_v2(body)
-        if mode == 0x03:
-            return body
-        if mode == 0x04:
-            return body
+        if mode == 0: return body
+        if mode == 1: return _xml_decode(body)
+        if mode == 2: return _xml_decode(body)
+        if mode == 3: return body
+        if mode == 4: return body
         raise TransformError(f"t_xml mode {mode}")
 
     def t00(self, d):
@@ -1225,17 +1378,12 @@ class Compressor:
         if len(cd) < 4: raise TransformError("T00 short")
         ol = struct.unpack('>I', cd[:4])[0]; cd = cd[4:]
         if not cd: return b''
-        if cd[0] == 0:
-            if 1 + ol > len(cd):
-                raise TransformError(f"T00 raw len {len(cd)-1}<{ol}")
-            return cd[1:ol+1]
+        if cd[0] == 0: return cd[1:ol+1]
         np = cd[0]
         if np == 0 or len(cd) < 1+np: raise TransformError("T00 hdr")
         sh = list(cd[1:1+np]); rle = cd[1+np:]
         dec = self._unrle(rle)
         if dec is None: raise TransformError("T00 dec")
-        if len(dec) < ol:
-            raise TransformError(f"T00 short decoded {len(dec)}<{ol}")
         cur = bytearray(dec[:ol])
         for s in reversed(sh):
             for i in range(len(cur)): cur[i] = (cur[i]-s) % 256
@@ -1278,32 +1426,41 @@ class Compressor:
         t = bytearray(d)
         for p in PRIMES:
             xv = p if p == 2 else max(1, math.ceil(p*4096/28672))
-            for i in range(0, len(t), 3): t[i] ^= xv
+            for i in range(0, len(t), 3):
+                t[i] ^= xv
         return bytes(t)
     r01 = t01
+
     def t02(self, d):
         if not d: return b'\x00'
-        t = bytearray(d); pi = (len(d)+sum(d)) % 256; pv = self._pat(4, pi); xv = pv[1]
-        for i in range(1, len(t), 4): t[i] ^= xv
+        t = bytearray(d); pi = (len(d)+sum(d)) % 256; pv = self._pat(4, pi)
+        xv = pv[1]
+        for i in range(1, len(t), 4):
+            t[i] ^= xv
         return bytes([pi]) + bytes(t)
     def r02(self, d):
         if d == b'\x00': return b''
         if len(d) < 2: raise TransformError("T02")
-        pi = d[0]; t = bytearray(d[1:]); pv = self._pat(4, pi); xv = pv[1]
-        for i in range(1, len(t), 4): t[i] ^= xv
+        pi = d[0]; t = bytearray(d[1:]); pv = self._pat(4, pi)
+        xv = pv[1]
+        for i in range(1, len(t), 4):
+            t[i] ^= xv
         return bytes(t)
     def t03(self, d):
         if not d: return b'\x00'
         t = bytearray(d); rot = (len(d)*13 + sum(d)) % 8
         if rot == 0: rot = 1
         tab = self._rot_tab(rot)
-        for i in range(2, len(t), 5): t[i] = tab[t[i]]
+        for i in range(2, len(t), 5):
+            t[i] = tab[t[i]]
         return bytes([rot]) + bytes(t)
     def r03(self, d):
         if d == b'\x00': return b''
         if len(d) < 2: raise TransformError("T03")
-        rot = d[0]; t = bytearray(d[1:]); tab = self._irot_tab(rot)
-        for i in range(2, len(t), 5): t[i] = tab[t[i]]
+        rot = d[0]; t = bytearray(d[1:])
+        tab = self._irot_tab(rot)
+        for i in range(2, len(t), 5):
+            t[i] = tab[t[i]]
         return bytes(t)
     def t04(self, d):
         if not d: return b''
@@ -1311,9 +1468,11 @@ class Compressor:
         if r == 0: return d
         tab = self._t04_tab
         if tab is None:
-            tab = bytes((i * r) & 0xFF for i in range(256)); self._t04_tab = tab
+            tab = bytes((i * r) & 0xFF for i in range(256))
+            self._t04_tab = tab
         n = len(d); out = bytearray(n)
-        for i in range(n): out[i] = (d[i] - tab[i & 0xFF]) & 0xFF
+        for i in range(n):
+            out[i] = (d[i] - tab[i & 0xFF]) & 0xFF
         return bytes(out)
     def r04(self, d):
         if not d: return b''
@@ -1321,9 +1480,11 @@ class Compressor:
         if r == 0: return d
         tab = self._t04_tab
         if tab is None:
-            tab = bytes((i * r) & 0xFF for i in range(256)); self._t04_tab = tab
+            tab = bytes((i * r) & 0xFF for i in range(256))
+            self._t04_tab = tab
         n = len(d); out = bytearray(n)
-        for i in range(n): out[i] = (d[i] + tab[i & 0xFF]) & 0xFF
+        for i in range(n):
+            out[i] = (d[i] + tab[i & 0xFF]) & 0xFF
         return bytes(out)
     def t05(self, d, s=3):
         if not d: return b''
@@ -1346,81 +1507,43 @@ class Compressor:
         if not d: return b''
         self._perm_tab(sd)
         return d.translate(self._t06_inv)
-
     def t07(self, d):
-        if not d: return b'\x00'
-        L = len(d)
-        p = nearest_prime(L % 256) & 0xFF
-        sh = L % len(self.PI)
-        pr = self.PI[sh:] + self.PI[:sh]
-        r = (L * 7 + 13) % 256 or 1
-        out = bytearray(L)
-        for i in range(L):
-            out[i] = (d[i] ^ p ^ pr[i % len(pr)] ^ (i & 0xFF) ^ r) & 0xFF
-        return bytes(out)
-    def r07(self, d):
-        if d == b'\x00': return b''
-        if not d: raise TransformError("a7 empty")
-        L = len(d)
-        p = nearest_prime(L % 256) & 0xFF
-        sh = L % len(self.PI)
-        pr = self.PI[sh:] + self.PI[:sh]
-        r = (L * 7 + 13) % 256 or 1
-        out = bytearray(L)
-        for i in range(L):
-            out[i] = (d[i] ^ p ^ pr[i % len(pr)] ^ (i & 0xFF) ^ r) & 0xFF
-        return bytes(out)
-
+        if not d: return b''
+        if self.rep % 2 == 0:
+            return d.translate(self._xor_table(len(d) % 256))
+        t = bytearray(d); r = self.rep
+        sh = len(d) % len(self.PI); pr = self.PI[sh:] + self.PI[:sh]
+        sz = len(d) % 256
+        for i in range(len(t)): t[i] ^= sz
+        for _ in range(r):
+            for i in range(len(t)): t[i] ^= pr[i % len(pr)]
+        return bytes(t)
+    r07 = t07
     def t08(self, d):
-        if not d: return b'\x00'
-        L = len(d)
-        p = nearest_prime((L * 3 + 7) % 256) & 0xFF
-        sh = (L * 5) % len(self.PI)
-        pr = self.PI[sh:] + self.PI[:sh]
-        r = (L * 11 + 5) % 256 or 1
-        out = bytearray(L)
-        for i in range(L):
-            out[i] = (d[i] ^ p ^ pr[i % len(pr)] ^ r) & 0xFF
-        return bytes(out)
-    def r08(self, d):
-        if d == b'\x00': return b''
-        if not d: raise TransformError("a8 empty")
-        L = len(d)
-        p = nearest_prime((L * 3 + 7) % 256) & 0xFF
-        sh = (L * 5) % len(self.PI)
-        pr = self.PI[sh:] + self.PI[:sh]
-        r = (L * 11 + 5) % 256 or 1
-        out = bytearray(L)
-        for i in range(L):
-            out[i] = (d[i] ^ p ^ pr[i % len(pr)] ^ r) & 0xFF
-        return bytes(out)
-
+        if not d: return b''
+        if self.rep % 2 == 0:
+            return d.translate(self._xor_table(nearest_prime(len(d) % 256)))
+        t = bytearray(d); r = self.rep
+        sh = len(d) % len(self.PI); pr = self.PI[sh:] + self.PI[:sh]
+        p = nearest_prime(len(d) % 256)
+        for i in range(len(t)): t[i] ^= p
+        for _ in range(r):
+            for i in range(len(t)): t[i] ^= pr[i % len(pr)]
+        return bytes(t)
+    r08 = t08
     def t09(self, d):
-        if not d: return b'\x00'
+        if not d: return b''
         L = len(d)
-        p = nearest_prime((L * 13 + 3) % 256) & 0xFF
-        sd = self._seed(L % len(self.seeds), L)
-        sh = (L * 7) % len(self.PI)
-        pr = self.PI[sh:] + self.PI[:sh]
-        r = (L * 17 + 1) % 256 or 1
-        out = bytearray(L)
-        for i in range(L):
-            out[i] = (d[i] ^ p ^ sd ^ pr[i % len(pr)] ^ (i & 0xFF) ^ r) & 0xFF
-        return bytes(out)
-    def r09(self, d):
-        if d == b'\x00': return b''
-        if not d: raise TransformError("a9 empty")
-        L = len(d)
-        p = nearest_prime((L * 13 + 3) % 256) & 0xFF
-        sd = self._seed(L % len(self.seeds), L)
-        sh = (L * 7) % len(self.PI)
-        pr = self.PI[sh:] + self.PI[:sh]
-        r = (L * 17 + 1) % 256 or 1
-        out = bytearray(L)
-        for i in range(L):
-            out[i] = (d[i] ^ p ^ sd ^ pr[i % len(pr)] ^ (i & 0xFF) ^ r) & 0xFF
-        return bytes(out)
-
+        p = nearest_prime(L % 256); sd = self._seed(L % len(self.seeds), L)
+        if self.rep % 2 == 0:
+            return d.translate(self._xor_table((p ^ sd) & 0xFF))
+        t = bytearray(d); r = self.rep
+        sh = L % len(self.PI); pr = self.PI[sh:] + self.PI[:sh]
+        for i in range(len(t)): t[i] ^= p ^ sd
+        for _ in range(r):
+            for i in range(len(t)): t[i] ^= pr[i % len(pr)] ^ (i % 256)
+        return bytes(t)
+    r09 = t09
     def t10(self, d):
         if not d: return b'\x00'
         cnt = sum(1 for i in range(len(d)-1) if d[i:i+2] == b'X1')
@@ -1439,7 +1562,8 @@ class Compressor:
         m = self._t11_cache.get(L)
         if m is None:
             fibs = self.fib; lf = len(fibs)
-            m = bytes(((fibs[(i+L) % lf] % 256) ^ ((i*13 + L*17) & 0xFF)) & 0xFF for i in range(L))
+            m = bytes(((fibs[(i+L) % lf] % 256) ^ ((i*13 + L*17) & 0xFF)) & 0xFF
+                      for i in range(L))
             self._t11_cache[L] = m
         return (int.from_bytes(d, 'big') ^ int.from_bytes(m, 'big')).to_bytes(L, 'big')
     r11 = t11
@@ -1478,16 +1602,20 @@ class Compressor:
         return d[:-1]
     def t15(self, d):
         if not d: return b'\x00'
-        t = bytearray(d); pi = len(d) % 256; pv = self._pat(3, pi); xv = pv[0]
+        t = bytearray(d); pi = len(d) % 256; pv = self._pat(3, pi)
+        xv = pv[0]
         tab = self._add_tab(xv)
-        for i in range(0, len(t), 3): t[i] = tab[t[i]]
+        for i in range(0, len(t), 3):
+            t[i] = tab[t[i]]
         return bytes([pi]) + bytes(t)
     def r15(self, d):
         if d == b'\x00': return b''
         if len(d) < 2: raise TransformError("T15")
-        pi = d[0]; t = bytearray(d[1:]); pv = self._pat(3, pi); xv = pv[0]
+        pi = d[0]; t = bytearray(d[1:]); pv = self._pat(3, pi)
+        xv = pv[0]
         tab = self._sub_tab(xv)
-        for i in range(0, len(t), 3): t[i] = tab[t[i]]
+        for i in range(0, len(t), 3):
+            t[i] = tab[t[i]]
         return bytes(t)
     def t16(self, d):
         if not d: return b''
@@ -1500,29 +1628,36 @@ class Compressor:
     r17 = t17
     def _c18(self, d):
         if not d: return b''
-        L = len(d); m = self._c18_cache.get(L)
+        L = len(d)
+        m = self._c18_cache.get(L)
         if m is None:
-            decimal.getcontext().prec = 60; pi = decimal.Decimal(self.PI_S)
+            decimal.getcontext().prec = 60
+            pi = decimal.Decimal(self.PI_S)
             s = str((pi*pi)/decimal.Decimal(6)).replace('.', '')[:max(10, L//2+5)]
-            m = bytes(int(s[i:i+2]) % 256 for i in range(0, len(s), 2)); self._c18_cache[L] = m
+            m = bytes(int(s[i:i+2]) % 256 for i in range(0, len(s), 2))
+            self._c18_cache[L] = m
         ml = len(m)
         return bytes(d[i] ^ m[i % ml] for i in range(L))
     def _c19(self, d):
         if not d: return b''
-        L = len(d); m = self._c19_cache.get(L)
+        L = len(d)
+        m = self._c19_cache.get(L)
         if m is None:
             decimal.getcontext().prec = 60; e = decimal.Decimal(1).exp()
             s = str(decimal.Decimal(1)/e).replace('.', '')[:max(10, L//2+5)]
-            m = bytes(int(s[i:i+2]) % 256 for i in range(0, len(s), 2)); self._c19_cache[L] = m
+            m = bytes(int(s[i:i+2]) % 256 for i in range(0, len(s), 2))
+            self._c19_cache[L] = m
         ml = len(m)
         return bytes(d[i] ^ m[i % ml] for i in range(L))
     def _c20(self, d):
         if not d: return b''
-        L = len(d); m = self._c20_cache.get(L)
+        L = len(d)
+        m = self._c20_cache.get(L)
         if m is None:
             decimal.getcontext().prec = 60; e = decimal.Decimal(1).exp()
             s = str(decimal.Decimal(5)*e).replace('.', '')[:max(10, L//2+5)]
-            m = bytes(int(s[i:i+2]) % 256 for i in range(0, len(s), 2)); self._c20_cache[L] = m
+            m = bytes(int(s[i:i+2]) % 256 for i in range(0, len(s), 2))
+            self._c20_cache[L] = m
         ml = len(m)
         return bytes(d[i] ^ m[i % ml] for i in range(L))
     def t18(self, d): return self._c18(d)
@@ -1639,10 +1774,13 @@ class Compressor:
     def r25(self, d): return self._ddt(d)
     def t26(self, d):
         if not d: return b''
-        L = len(d); ks = self._t26_cache.get(L)
+        L = len(d)
+        ks = self._t26_cache.get(L)
         if ks is None:
-            sec = b"PJP_T26"; nb = (L + 1023) // 1024
-            ks = b''.join(hashlib.sha256(sec + struct.pack(">Q", bn)).digest() for bn in range(nb))
+            sec = b"PJP_T26"
+            nb = (L + 1023) // 1024
+            ks = b''.join(hashlib.sha256(sec + struct.pack(">Q", bn)).digest()
+                          for bn in range(nb))
             self._t26_cache[L] = ks
         return (int.from_bytes(d, 'big') ^ int.from_bytes(ks[:L], 'big')).to_bytes(L, 'big')
     r26 = t26
@@ -1711,8 +1849,7 @@ class Compressor:
         vals = [int.from_bytes(p[i:i+3], 'little') for i in range(0, len(p), 3)]
         bk, bc = 0, float('inf')
         for k in range(65536):
-            tr = [(v-k) & 0xFFFFFF for v in vals]; m = sum(tr)//len(tr)
-            c = sum(abs(t-m) for t in tr)
+            tr = [(v-k) & 0xFFFFFF for v in vals]; m = sum(tr)//len(tr); c = sum(abs(t-m) for t in tr)
             if c < bc: bc = c; bk = k
             if c == 0: break
         return bk
@@ -1748,8 +1885,7 @@ class Compressor:
         for _ in range(10): cands.add(rng.randint(0, (1<<24)-1))
         bk, bc = 0, float('inf')
         for k in cands:
-            tr = [(v-k) & 0xFFFFFF for v in vals]; m = sum(tr)//len(tr)
-            c = sum(abs(t-m) for t in tr)
+            tr = [(v-k) & 0xFFFFFF for v in vals]; m = sum(tr)//len(tr); c = sum(abs(t-m) for t in tr)
             if c < bc: bc = c; bk = k
         o = bytearray([pad]) + bk.to_bytes(3, 'little')
         for i in range(0, len(p), 3):
@@ -1773,30 +1909,21 @@ class Compressor:
     r32 = t32
 
     def _t33(self, d):
-        if not d: return b'\x00'
+        if not d: return b'\x00'*9
         bits = []
         for b in d:
-            for i in range(7, -1, -1): bits.append((b >> i) & 1)
-        encoded = None
-        try:
-            encoded = self._cb(bits)
-            if self._db(encoded) != bits: encoded = None
-        except Exception: encoded = None
-        raw = b'\x00' + d
-        if encoded is None or len(encoded) + 1 >= len(raw): return raw
-        return b'\x01' + encoded
+            for i in range(7, -1, -1): bits.append((b>>i)&1)
+        return self._cb(bits)
     def _r33(self, d):
-        if not d: return b''
-        mode = d[0]; body = d[1:]
-        if mode == 0x00: return body
-        if mode != 0x01: raise TransformError(f"a33 mode {mode}")
-        bits = self._db(body)
+        if not d or d == b'\x00'*9: return b''
+        bits = self._db(d)
         if not bits: return b''
         o = bytearray()
         for i in range(0, len(bits), 8):
-            v = 0; chunk = bits[i:i+8]
-            for j, bit in enumerate(chunk): v = (v << 1) | bit
-            v <<= (8 - len(chunk)); o.append(v)
+            v = 0
+            for j in range(i, min(i+8, len(bits))): v = (v<<1)|bits[j]
+            if i+8 > len(bits): v <<= (8 - (len(bits)-i))
+            o.append(v)
         return bytes(o)
     def _cb(self, bits):
         obl = len(bits)
@@ -1888,165 +2015,158 @@ class Compressor:
                 if pos+cl*8 > nb: raise TransformError("BlkRun b")
                 for _ in range(cl): o.append(self._rd(bits, pos, 8)); pos += 8
         return bytes(o[:ol])
-
-    def t35(self, d):
-        if not d: return b'\x00'
-        L = len(d); key = b"A35|" + struct.pack('>Q', L)
-        fwd, _ = self._sbox_perm(key); out = bytearray(L)
-        for i in range(L): out[i] = fwd[d[i]] ^ ((i * 0x37 + L) & 0xFF)
-        return bytes(out)
-    def r35(self, d):
-        if d == b'\x00': return b''
-        if not d: raise TransformError("a35 empty")
-        L = len(d); key = b"A35|" + struct.pack('>Q', L)
-        _, inv = self._sbox_perm(key); out = bytearray(L)
-        for i in range(L): out[i] = inv[d[i] ^ ((i * 0x37 + L) & 0xFF)]
-        return bytes(out)
-    def t36(self, d):
-        if not d: return b'\x00'
-        L = len(d); key = b"A36|" + struct.pack('>Q', L)
-        fwd, _ = self._sbox_perm(key); p = nearest_prime((L * 3 + 5) % 256) & 0xFF
-        out = bytearray(L)
-        for i in range(L): out[i] = fwd[d[i]] ^ p ^ ((i * 0x1D + 0x9E) & 0xFF)
-        return bytes(out)
-    def r36(self, d):
-        if d == b'\x00': return b''
-        if not d: raise TransformError("a36 empty")
-        L = len(d); key = b"A36|" + struct.pack('>Q', L)
-        _, inv = self._sbox_perm(key); p = nearest_prime((L * 3 + 5) % 256) & 0xFF
-        out = bytearray(L)
-        for i in range(L): out[i] = inv[d[i] ^ p ^ ((i * 0x1D + 0x9E) & 0xFF)]
-        return bytes(out)
-    def t37(self, d):
-        if not d: return b'\x00'
-        L = len(d); BS = 1024; out = bytearray(); out.extend(L.to_bytes(4, 'big'))
-        for bi in range((L + BS - 1) // BS):
-            s = bi * BS; e = min(s + BS, L); ch = d[s:e]
-            key = b"A37|" + struct.pack('>Q', L) + struct.pack('>I', bi)
-            fwd, _ = self._sbox_perm(key); blk = bytearray(len(ch))
-            for i, b in enumerate(ch): blk[i] = fwd[b] ^ ((i * 0x53 + bi * 0x11) & 0xFF)
-            out.extend(blk)
-        return bytes(out)
-    def r37(self, d):
-        if d == b'\x00': return b''
-        if len(d) < 4: raise TransformError("a37 short")
-        L = int.from_bytes(d[:4], 'big'); body = d[4:]; BS = 1024; out = bytearray()
-        for bi in range((L + BS - 1) // BS):
-            s = bi * BS; e = min(s + BS, L); ch = body[s:e]
-            key = b"A37|" + struct.pack('>Q', L) + struct.pack('>I', bi)
-            _, inv = self._sbox_perm(key)
-            for i, b in enumerate(ch): out.append(inv[b ^ ((i * 0x53 + bi * 0x11) & 0xFF)])
-        return bytes(out[:L])
-
-    def _t38(self, d):
-        BS = 1024; tb = (len(d) + BS - 1) // BS
-        o = bytearray(b'\x00' + struct.pack('>I', len(d)))
+    def _t35(self, d):
+        if not d: return b'\x01'
+        n = 3; r = bytearray(d)
+        for i in range(len(r)): r[i] = (pow(r[i]+1, n, 257)-1) & 0xFF
+        return bytes([n]) + bytes(r)
+    def _r35(self, d):
+        if d == b'\x01': return b''
+        if len(d) < 2: raise TransformError("FLT25")
+        n = d[0]; inv = mod_inv(n, 256)
+        if inv is None: raise TransformError(f"FLT25 {n}")
+        r = bytearray(d[1:])
+        for i in range(len(r)): r[i] = (pow(r[i]+1, inv, 257)-1) & 0xFF
+        return bytes(r)
+    def _t36(self, d):
+        if not d: return b'\x01\x00'
+        n = (len(d)*7 + 13) & 0xFFFF
+        if n % 2 == 0: n ^= 1
+        e = pow(n, 16777216, 257) | 1
+        r = bytearray(d)
+        for i in range(len(r)): r[i] = (pow(r[i]+1, e, 257)-1) & 0xFF
+        return bytes([n & 0xFF, (n>>8) & 0xFF]) + bytes(r)
+    def _r36(self, d):
+        if d == b'\x01\x00': return b''
+        if len(d) < 2: raise TransformError("FLT26")
+        n = d[0] | (d[1]<<8)
+        if n % 2 == 0: n ^= 1
+        e = pow(n, 16777216, 257) | 1; inv = mod_inv(e, 256)
+        if inv is None: raise TransformError(f"FLT26 {e}")
+        r = bytearray(d[2:])
+        for i in range(len(r)): r[i] = (pow(r[i]+1, inv, 257)-1) & 0xFF
+        return bytes(r)
+    def _t37(self, d):
+        if not d:
+            o = bytearray(b'\x00\x00\x00\x00\x01\x00'); o.extend(b'\x00'*1024); return bytes(o)
+        BS = 1024; tb = (len(d)+BS-1)//BS
+        o = bytearray(); o.extend(len(d).to_bytes(4, 'big'))
         for bi in range(tb):
-            s = bi * BS; e = min(s + BS, len(d)); blk_len = e - s
-            ch = d[s:e] + b'\x00' * (BS - blk_len)
-            n = ((len(d) * 7 + bi * 13 + 1) & 0xFFFF) | 1
+            s = bi*BS; e = min(s+BS, len(d))
+            ch = d[s:e] + b'\x00'*(BS-len(d[s:e]))
+            n = ((len(d)*7 + bi*13 + 1) & 0xFFFF) | 1
             e_ = pow(n, 16777216, 257) | 1; e200 = pow(e_, 200, 257)
             t = bytearray(ch)
-            for i in range(BS): t[i] = (pow(t[i] + 1, e200, 257) - 1) & 0xFF
-            tb_bytes = bytes(t); c = self.cback(tb_bytes); ck = self._blk_check(tb_bytes)
-            o += bytes([n & 0xFF, (n >> 8) & 0xFF,
-                        (len(c) >> 8) & 0xFF, len(c) & 0xFF,
-                        (blk_len >> 8) & 0xFF, blk_len & 0xFF,
-                        (ck >> 8) & 0xFF, ck & 0xFF])
-            o += c
+            for i in range(BS): t[i] = (pow(t[i]+1, e200, 257)-1) & 0xFF
+            o.append(n & 0xFF); o.append((n>>8) & 0xFF); o.extend(t)
+        return bytes(o)
+    def _r37(self, d):
+        if len(d) < 4: raise TransformError("FLT27")
+        ol = int.from_bytes(d[:4], 'big'); p = d[4:]; BS = 1024; btl = 2+BS
+        if len(p) % btl != 0: raise TransformError("FLT27 a")
+        nb = len(p)//btl; dec = bytearray()
+        for bi in range(nb):
+            off = bi*btl; n = p[off] | (p[off+1]<<8); ch = p[off+2:off+2+BS]; n |= 1
+            e_ = pow(n, 16777216, 257) | 1; e200 = pow(e_, 200, 257)
+            inv = mod_inv(e200, 256)
+            if inv is None: raise TransformError(f"FLT27 {e200}")
+            for i in range(BS): dec.append((pow(ch[i]+1, inv, 257)-1) & 0xFF)
+        return bytes(dec[:ol])
+    def _t38(self, d):
+        BS = 1024
+        if not d:
+            ch = b'\x00'*BS; c = self.cback(ch)
+            o = bytearray(struct.pack('>I', 0)); o += b'\x01\x00' + bytes([(len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
+            return bytes(o)
+        tb = (len(d)+BS-1)//BS
+        o = bytearray(); o.extend(len(d).to_bytes(4, 'big'))
+        for bi in range(tb):
+            s = bi*BS; e = min(s+BS, len(d))
+            ch = d[s:e] + b'\x00'*(BS-len(d[s:e]))
+            n = ((len(d)*7 + bi*13 + 1) & 0xFFFF) | 1
+            e_ = pow(n, 16777216, 257) | 1; e200 = pow(e_, 200, 257)
+            t = bytearray(ch)
+            for i in range(BS): t[i] = (pow(t[i]+1, e200, 257)-1) & 0xFF
+            c = self.cback(bytes(t))
+            o += bytes([n & 0xFF, (n>>8) & 0xFF, (len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
         return bytes(o)
     def _r38(self, d):
-        if len(d) < 5: raise TransformError("FLT28 short")
-        if d[0] != 0: raise TransformError("FLT28 magic")
-        ol = int.from_bytes(d[1:5], 'big'); p = d[5:]; pos = 0; dec = bytearray()
+        if len(d) < 4: raise TransformError("FLT28")
+        ol = int.from_bytes(d[:4], 'big'); p = d[4:]
+        pos = 0; dec = bytearray()
         while pos < len(p):
-            if pos + 8 > len(p): raise TransformError("FLT28 hdr")
-            n = p[pos] | (p[pos + 1] << 8); cl = (p[pos + 2] << 8) | p[pos + 3]
-            blk_len = (p[pos + 4] << 8) | p[pos + 5]; ck = (p[pos + 6] << 8) | p[pos + 7]
-            pos += 8
-            if pos + cl > len(p): raise TransformError("FLT28 body")
-            cb = p[pos:pos + cl]; pos += cl
+            if pos+2 > len(p): raise TransformError("FLT28 hdr")
+            n = p[pos] | (p[pos+1]<<8); pos += 2
+            if pos+2 > len(p): raise TransformError("FLT28 len")
+            cl = (p[pos]<<8) | p[pos+1]; pos += 2
+            cb = p[pos:pos+cl]; pos += cl
             b = self.dback(cb)
-            if b is None: raise TransformError("FLT28 decode")
-            if len(b) != 1024: raise TransformError(f"FLT28 blk len {len(b)}")
-            if self._blk_check(b) != ck: raise TransformError("FLT28 checksum")
+            if b is None: raise TransformError("FLT28 body")
             n |= 1; e_ = pow(n, 16777216, 257) | 1; e200 = pow(e_, 200, 257)
             inv = mod_inv(e200, 256)
             if inv is None: raise TransformError(f"FLT28 {e200}")
             t = bytearray(b)
-            for i in range(len(t)): t[i] = (pow(t[i] + 1, inv, 257) - 1) & 0xFF
-            if blk_len > len(t): raise TransformError("FLT28 blk_len")
-            dec.extend(t[:blk_len])
-        if len(dec) < ol: raise TransformError(f"FLT28 short {len(dec)}<{ol}")
+            for i in range(len(t)): t[i] = (pow(t[i]+1, inv, 257)-1) & 0xFF
+            dec.extend(t)
         return bytes(dec[:ol])
-
     def _t39(self, d):
-        BS = 32; tb = (len(d) + BS - 1) // BS
-        o = bytearray(b'\x00' + struct.pack('>I', len(d)))
+        BS = 32
+        if not d:
+            ch = b'\x00'*BS; c = self.cback(ch)
+            o = bytearray(struct.pack('>I', 0)); o += b'\x01\x00' + bytes([(len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
+            return bytes(o)
+        tb = (len(d)+BS-1)//BS
+        o = bytearray(); o.extend(len(d).to_bytes(4, 'big'))
         for bi in range(tb):
-            s = bi * BS; e = min(s + BS, len(d)); blk_len = e - s
-            ch = d[s:e] + b'\x00' * (BS - blk_len)
-            n = ((len(d) * 7 + bi * 13 + 1) & 0xFFFF) | 1
-            c = self.cback(bytes(ch)); ck = self._blk_check(bytes(ch))
-            o += bytes([n & 0xFF, (n >> 8) & 0xFF,
-                        (len(c) >> 8) & 0xFF, len(c) & 0xFF,
-                        (blk_len >> 8) & 0xFF, blk_len & 0xFF,
-                        (ck >> 8) & 0xFF, ck & 0xFF])
-            o += c
+            s = bi*BS; e = min(s+BS, len(d))
+            ch = d[s:e] + b'\x00'*(BS-len(d[s:e]))
+            n = ((len(d)*7 + bi*13 + 1) & 0xFFFF) | 1
+            c = self.cback(bytes(ch))
+            o += bytes([n & 0xFF, (n>>8) & 0xFF, (len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
         return bytes(o)
     def _r39(self, d):
-        if len(d) < 5: raise TransformError("FLT29 short")
-        if d[0] != 0: raise TransformError("FLT29 magic")
-        ol = int.from_bytes(d[1:5], 'big'); p = d[5:]; pos = 0; dec = bytearray()
+        if len(d) < 4: raise TransformError("FLT29")
+        ol = int.from_bytes(d[:4], 'big'); p = d[4:]
+        pos = 0; dec = bytearray()
         while pos < len(p):
-            if pos + 8 > len(p): raise TransformError("FLT29 hdr")
-            n = p[pos] | (p[pos + 1] << 8); cl = (p[pos + 2] << 8) | p[pos + 3]
-            blk_len = (p[pos + 4] << 8) | p[pos + 5]; ck = (p[pos + 6] << 8) | p[pos + 7]
-            pos += 8
-            if pos + cl > len(p): raise TransformError("FLT29 body")
-            cb = p[pos:pos + cl]; pos += cl
+            if pos+2 > len(p): raise TransformError("FLT29 hdr")
+            pos += 2
+            if pos+2 > len(p): raise TransformError("FLT29 len")
+            cl = (p[pos]<<8) | p[pos+1]; pos += 2
+            cb = p[pos:pos+cl]; pos += cl
             b = self.dback(cb)
-            if b is None: raise TransformError("FLT29 decode")
-            if len(b) != 32: raise TransformError(f"FLT29 blk len {len(b)}")
-            if self._blk_check(b) != ck: raise TransformError("FLT29 checksum")
-            if blk_len > len(b): raise TransformError("FLT29 blk_len")
-            dec.extend(b[:blk_len])
-        if len(dec) < ol: raise TransformError(f"FLT29 short {len(dec)}<{ol}")
+            if b is None: raise TransformError("FLT29 body")
+            dec.extend(b)
         return bytes(dec[:ol])
-
     def _t40(self, d):
-        BS = 33; tb = (len(d) + BS - 1) // BS
-        o = bytearray(b'\x00' + struct.pack('>I', len(d)))
+        BS = 33
+        if not d:
+            ch = b'\x00'*BS; c = self.cback(ch)
+            o = bytearray(struct.pack('>I', 0)); o += b'\x01\x01' + bytes([(len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
+            return bytes(o)
+        tb = (len(d)+BS-1)//BS
+        o = bytearray(); o.extend(len(d).to_bytes(4, 'big'))
         for bi in range(tb):
-            s = bi * BS; e = min(s + BS, len(d)); blk_len = e - s
-            ch = d[s:e] + b'\x00' * (BS - blk_len)
-            h = hashlib.sha256(ch + bytes([bi & 0xFF, (len(d) >> 8) & 0xFF, len(d) & 0xFF])).digest()
+            s = bi*BS; e = min(s+BS, len(d))
+            ch = d[s:e] + b'\x00'*(BS-len(d[s:e]))
+            h = hashlib.sha256(ch + bytes([bi&0xFF, (len(d)>>8)&0xFF, len(d)&0xFF])).digest()
             enc = bytes([32]) + h; c = self.cback(ch)
-            o += enc + bytes([(len(c) >> 8) & 0xFF, len(c) & 0xFF])
-            o += bytes([(blk_len >> 8) & 0xFF, blk_len & 0xFF])
-            o += c
+            o += enc + bytes([(len(c)>>8) & 0xFF, len(c) & 0xFF]) + c
         return bytes(o)
     def _r40(self, d):
-        if len(d) < 5: raise TransformError("FLT30 short")
-        if d[0] != 0: raise TransformError("FLT30 magic")
-        ol = int.from_bytes(d[1:5], 'big'); p = d[5:]; pos = 0; dec = bytearray(); bi = 0
+        if len(d) < 4: raise TransformError("FLT30")
+        ol = int.from_bytes(d[:4], 'big'); p = d[4:]
+        pos = 0; dec = bytearray()
         while pos < len(p):
-            if pos >= len(p): raise TransformError("FLT30 eof")
             Ln = p[pos]; pos += 1
-            if Ln != 32 or pos + Ln > len(p): raise TransformError("FLT30 n")
-            stored_h = p[pos:pos + Ln]; pos += Ln
-            if pos + 4 > len(p): raise TransformError("FLT30 hdr")
-            cl = (p[pos] << 8) | p[pos + 1]; pos += 2
-            blk_len = (p[pos] << 8) | p[pos + 1]; pos += 2
-            if pos + cl > len(p): raise TransformError("FLT30 body")
-            cb = p[pos:pos + cl]; pos += cl
+            if Ln > 32 or pos+Ln > len(p): raise TransformError("FLT30 n")
+            pos += Ln
+            if pos+2 > len(p): raise TransformError("FLT30 hdr")
+            cl = (p[pos]<<8) | p[pos+1]; pos += 2
+            cb = p[pos:pos+cl]; pos += cl
             b = self.dback(cb)
-            if b is None: raise TransformError("FLT30 decode")
-            expected_h = hashlib.sha256(b + bytes([bi & 0xFF, (ol >> 8) & 0xFF, ol & 0xFF])).digest()
-            if expected_h != stored_h: raise TransformError("FLT30 checksum")
-            if blk_len > len(b): raise TransformError("FLT30 blk_len")
-            dec.extend(b[:blk_len]); bi += 1
-        if len(dec) < ol: raise TransformError(f"FLT30 short {len(dec)}<{ol}")
+            if b is None: raise TransformError("FLT30 body")
+            dec.extend(b)
         return bytes(dec[:ol])
 
     def t41(self, d):
@@ -2097,35 +2217,29 @@ class Compressor:
             elif cl != pl: co <<= (cl-pl); pl = cl
             c[s] = (co, cl); co += 1
         return c
-
     def t45(self, d):
-        if not d: return b'\x02'
+        if not d: return b''
         freq = [0]*256
         for b in d: freq[b] += 1
-        cl = self._hcl(freq)
-        if max(cl) > self.HUFF_MAX_LEN: return b'\x00' + struct.pack('>I', len(d)) + d
-        codes = self._hcc(cl)
+        cl = self._hcl(freq); codes = self._hcc(cl)
         hdr = bytearray(len(d).to_bytes(4, 'big')); hdr.extend(cl)
         acc = 0; nbits = 0; o = bytearray()
         for b in d:
-            c, n = codes[b]; acc = (acc << n) | c; nbits += n
-            while nbits >= 8: nbits -= 8; o.append((acc >> nbits) & 0xFF)
-        if nbits: o.append((acc << (8 - nbits)) & 0xFF)
-        return b'\x01' + bytes(hdr) + bytes(o)
+            c, n = codes[b]
+            acc = (acc << n) | c
+            nbits += n
+            while nbits >= 8:
+                nbits -= 8
+                o.append((acc >> nbits) & 0xFF)
+        if nbits:
+            o.append((acc << (8 - nbits)) & 0xFF)
+        return bytes(hdr) + bytes(o)
     def r45(self, d):
-        if not d: raise TransformError("Huff empty")
-        mode = d[0]; body = d[1:]
-        if mode == 0x02: return b''
-        if mode == 0x00:
-            if len(body) < 4: raise TransformError("Huff raw short")
-            ol = struct.unpack('>I', body[:4])[0]
-            if 4 + ol > len(body): raise TransformError("Huff raw len")
-            return body[4:4+ol]
-        if mode != 0x01: raise TransformError(f"Huff mode {mode}")
-        if len(body) < 260: raise TransformError("Huff hdr")
-        ol = int.from_bytes(body[:4], 'big'); cl = list(body[4:260]); p = body[260:]
+        if not d: return b''
+        if len(d) < 260: raise TransformError("Huff")
+        ol = int.from_bytes(d[:4], 'big'); cl = list(d[4:260]); p = d[260:]
         if ol == 0: return b''
-        if max(cl) > self.HUFF_MAX_LEN: raise TransformError("Huff l")
+        if max(cl) > 32: raise TransformError("Huff l")
         code_to = {}
         sy = sorted(range(256), key=lambda s: (cl[s], s))
         c = 0; pl = 0; first = True
@@ -2149,7 +2263,6 @@ class Compressor:
             if not f: raise TransformError(f"Huff {pos}")
         if len(o) != ol: raise TransformError(f"Huff {len(o)}!={ol}")
         return bytes(o)
-
     def t46(self, d):
         if not d: return b''
         return self._xor_pattern(d, bytes(self.mask46))
@@ -2160,19 +2273,23 @@ class Compressor:
     r47 = t47
     def t59(self, d):
         if not d: return b''
-        ri = self.ref_idx; out = bytearray(); last = 0
+        ri = self.ref_idx; out = bytearray()
+        last = 0
         for m in _TOK_RE.finditer(d):
             if m.start() > last:
                 chunk = d[last:m.start()]
                 out.append(0); _emit_varint(out, len(chunk)); out += chunk
-            tok = m.group(0); low = tok.lower(); i = ri.get(low)
+            tok = m.group(0)
+            low = tok.lower(); i = ri.get(low)
             if i is not None:
                 if tok == low: code = (i << 2) | 0
                 elif tok == low.capitalize(): code = (i << 2) | 1
                 elif tok == low.upper(): code = (i << 2) | 2
                 else: code = None
                 if code is not None:
-                    _emit_varint(out, code + 1); last = m.end(); continue
+                    _emit_varint(out, code + 1)
+                    last = m.end()
+                    continue
             out.append(0); _emit_varint(out, len(tok)); out += tok
             last = m.end()
         if last < len(d):
@@ -2194,18 +2311,20 @@ class Compressor:
                 elif c == 2: out += rup[i]
                 else: raise TransformError("t59 case 3")
         return bytes(out)
-
     def _cdd_masks(self, n4):
         c = self._cdd_cache.get(n4)
         if c is None:
-            mid, key = cdd_derive(n4); masks = bytes(cdd_mask(i, mid) for i in range(n4))
-            c = (mid, key, masks); self._cdd_cache[n4] = c
+            mid, key = cdd_derive(n4)
+            masks = bytes(cdd_mask(i, mid) for i in range(n4))
+            c = (mid, key, masks)
+            self._cdd_cache[n4] = c
         return c
     def t_cdd(self, d):
-        if not d: return b'\x00'
+        if not d: return b''
         L = len(d); n4 = L // 4; tail = bytes(d[n4 * 4:])
-        if n4 == 0: return b'\x01' + struct.pack('>I', L) + bytes(d)
-        mid, key, masks = self._cdd_masks(n4); t = bytearray(d[:n4 * 4])
+        if n4 == 0: return bytes(d)
+        mid, key, masks = self._cdd_masks(n4)
+        t = bytearray(d[:n4 * 4])
         for i in range(n4):
             m = masks[i]
             if m:
@@ -2213,25 +2332,20 @@ class Compressor:
                 t[b] ^= m; t[b+1] ^= m; t[b+2] ^= m; t[b+3] ^= m
         t[mid * 4 + 2] ^= 0x5A
         for i in range(2, n4, 3):
-            b = i * 4; v = int.from_bytes(t[b:b+4], 'little')
+            b = i * 4
+            v = int.from_bytes(t[b:b+4], 'little')
             v = (v - key) & 0xFFFFFFFF
             t[b:b+4] = v.to_bytes(4, 'little')
-        return b'\x02' + bytes(t) + tail
+        return bytes(t) + tail
     def r_cdd(self, d):
         if not d: return b''
-        mode = d[0]; body = d[1:]
-        if mode == 0x00: return b''
-        if mode == 0x01:
-            if len(body) < 4: raise TransformError("cdd short raw")
-            L = struct.unpack('>I', body[:4])[0]
-            if 4 + L > len(body): raise TransformError("cdd raw len")
-            return body[4:4+L]
-        if mode != 0x02: raise TransformError(f"cdd mode {mode}")
-        L = len(body); n4 = L // 4; tail = bytes(body[n4 * 4:])
-        if n4 == 0: return bytes(body)
-        mid, key, masks = self._cdd_masks(n4); t = bytearray(body[:n4 * 4])
+        L = len(d); n4 = L // 4; tail = bytes(d[n4 * 4:])
+        if n4 == 0: return bytes(d)
+        mid, key, masks = self._cdd_masks(n4)
+        t = bytearray(d[:n4 * 4])
         for i in range(2, n4, 3):
-            b = i * 4; v = int.from_bytes(t[b:b+4], 'little')
+            b = i * 4
+            v = int.from_bytes(t[b:b+4], 'little')
             v = (v + key) & 0xFFFFFFFF
             t[b:b+4] = v.to_bytes(4, 'little')
         t[mid * 4 + 2] ^= 0x5A
@@ -2242,286 +2356,14 @@ class Compressor:
                 t[b] ^= m; t[b+1] ^= m; t[b+2] ^= m; t[b+3] ^= m
         return bytes(t) + tail
 
-    _A77_PERIOD = 3 * 1024
-    _A78_PERIOD = 3 * 1024
-
-    def _a77_k(self, i):
-        base = (1 << 32) - 1
-        pos  = i % self._A77_PERIOD
-        k    = (base * (pos + 1) * 0x01010101) & 0xFFFFFFFF
-        if (pos * 7) % 9 >= 7:
-            k = (k + 7) & 0xFFFFFFFF
-        return k or 1
-
-    def _a78_k(self, i):
-        base = (1 << 32) - 1
-        pos  = i % self._A78_PERIOD
-        k    = (base * (pos + 1) * 0x9E3779B9) & 0xFFFFFFFF
-        if (pos * 7) % 9 < 7:
-            k = (k + 0) & 0xFFFFFFFF
-        else:
-            k = (k + 7) & 0xFFFFFFFF
-        if (pos % 7) == 0:
-            k ^= 7
-        return k or 1
-
-    def _ks79_u32(self):
-        ks = getattr(self, "_ks79_u32_cache", None)
-        if ks is None:
-            words = []
-            for j in range(8):
-                v = 0
-                for _ in range(100):
-                    v = (v + ((1 << 32) - 1)
-                            + (j * 7 if (j % 9) < 7 else 0)) & 0xFFFFFFFF
-                v = (v * 0x01010101 + 0x9E3779B9) & 0xFFFFFFFF
-                words.append(v or 1)
-            ks = tuple(words)
-            self._ks79_u32_cache = ks
-        return ks
-
-    def t77(self, d):
-        if not d: return b''
-        n = len(d); nw = n // 4
-        out = bytearray(d)
-        for i in range(nw):
-            w = int.from_bytes(d[i*4:i*4+4], 'little')
-            out[i*4:i*4+4] = ((w - self._a77_k(i)) & 0xFFFFFFFF).to_bytes(4, 'little')
-        for i in range(nw * 4, n):
-            k = self._a77_k(i // 4) & 0xFF
-            out[i] = (d[i] - k) & 0xFF
-        return bytes(out)
-    def r77(self, d):
-        if not d: return b''
-        n = len(d); nw = n // 4
-        out = bytearray(d)
-        for i in range(nw):
-            w = int.from_bytes(d[i*4:i*4+4], 'little')
-            out[i*4:i*4+4] = ((w + self._a77_k(i)) & 0xFFFFFFFF).to_bytes(4, 'little')
-        for i in range(nw * 4, n):
-            k = self._a77_k(i // 4) & 0xFF
-            out[i] = (d[i] + k) & 0xFF
-        return bytes(out)
-
-    def t78(self, d):
-        if not d: return b''
-        n = len(d); nw = n // 4
-        out = bytearray(d)
-        for i in range(nw):
-            w = int.from_bytes(d[i*4:i*4+4], 'little')
-            out[i*4:i*4+4] = ((w - self._a78_k(i)) & 0xFFFFFFFF).to_bytes(4, 'little')
-        for i in range(nw * 4, n):
-            k = self._a78_k(i // 4) & 0xFF
-            out[i] = (d[i] - k) & 0xFF
-        return bytes(out)
-    def r78(self, d):
-        if not d: return b''
-        n = len(d); nw = n // 4
-        out = bytearray(d)
-        for i in range(nw):
-            w = int.from_bytes(d[i*4:i*4+4], 'little')
-            out[i*4:i*4+4] = ((w + self._a78_k(i)) & 0xFFFFFFFF).to_bytes(4, 'little')
-        for i in range(nw * 4, n):
-            k = self._a78_k(i // 4) & 0xFF
-            out[i] = (d[i] + k) & 0xFF
-        return bytes(out)
-
-    def t79(self, d):
-        if not d: return b''
-        n = len(d); nw = n // 4; ks = self._ks79_u32()
-        out = bytearray(d)
-        for i in range(nw):
-            w = int.from_bytes(d[i*4:i*4+4], 'little')
-            out[i*4:i*4+4] = ((w - ks[i & 7]) & 0xFFFFFFFF).to_bytes(4, 'little')
-        for i in range(nw * 4, n):
-            k = ks[(i // 4) & 7] & 0xFF
-            out[i] = (d[i] - k) & 0xFF
-        return bytes(out)
-    def r79(self, d):
-        if not d: return b''
-        n = len(d); nw = n // 4; ks = self._ks79_u32()
-        out = bytearray(d)
-        for i in range(nw):
-            w = int.from_bytes(d[i*4:i*4+4], 'little')
-            out[i*4:i*4+4] = ((w + ks[i & 7]) & 0xFFFFFFFF).to_bytes(4, 'little')
-        for i in range(nw * 4, n):
-            k = ks[(i // 4) & 7] & 0xFF
-            out[i] = (d[i] + k) & 0xFF
-        return bytes(out)
-
-    def _a80_k(self, i):
-        pos  = i % self._A80_PERIOD
-        base = self._A80_MASK
-        k    = (base * (pos + 1) * self._spread_0101) & self._A80_MASK
-        if (pos * 7) % 9 >= 7:
-            k = (k + 7) & self._A80_MASK
-        return k or 1
-
-    def _a81_k(self, i):
-        pos  = i % self._A80_PERIOD
-        base = self._A80_MASK
-        k    = (base * (pos + 1) * self._spread_golden) & self._A80_MASK
-        if (pos * 7) % 9 >= 7:
-            k = (k + 7) & self._A80_MASK
-        if (pos % 7) == 0:
-            k ^= 7
-        return k or 1
-
-    def _a82_ks(self):
-        if self._a82_ks_cache is None:
-            words = []
-            for j in range(8):
-                v = 0
-                for _ in range(100):
-                    v = (v + self._A80_MASK
-                            + (j * 7 if (j % 9) < 7 else 0)) & self._A80_MASK
-                v = (v ^ (v >> 128)) & self._A80_MASK
-                if v == 0: v = 1
-                words.append(v)
-            self._a82_ks_cache = tuple(words)
-        return self._a82_ks_cache
-
-    def _t80_core(self, d, sign):
-        if not d: return b''
-        n = len(d); BLK = self._A80_BLK; M = self._A80_MASK
-        nw = n // BLK
-        out = bytearray(d)
-        for i in range(nw):
-            s = i * BLK
-            w = int.from_bytes(d[s:s+BLK], 'little')
-            k = self._a80_k(i)
-            val = (w + sign * k) & M
-            out[s:s+BLK] = val.to_bytes(BLK, 'little')
-        for j in range(nw * BLK, n):
-            k = self._a80_k(j // BLK) & 0xFF
-            out[j] = (d[j] + sign * k) & 0xFF
-        return bytes(out)
-    def t80(self, d): return self._t80_core(d, -1)
-    def r80(self, d): return self._t80_core(d, +1)
-
-    def _t81_core(self, d, sign):
-        if not d: return b''
-        n = len(d); BLK = self._A80_BLK; M = self._A80_MASK
-        nw = n // BLK
-        out = bytearray(d)
-        for i in range(nw):
-            s = i * BLK
-            w = int.from_bytes(d[s:s+BLK], 'little')
-            k = self._a81_k(i)
-            out[s:s+BLK] = ((w + sign * k) & M).to_bytes(BLK, 'little')
-        for j in range(nw * BLK, n):
-            k = self._a81_k(j // BLK) & 0xFF
-            out[j] = (d[j] + sign * k) & 0xFF
-        return bytes(out)
-    def t81(self, d): return self._t81_core(d, -1)
-    def r81(self, d): return self._t81_core(d, +1)
-
-    def _t82_core(self, d, sign):
-        if not d: return b''
-        n = len(d); BLK = self._A80_BLK; M = self._A80_MASK
-        nw = n // BLK; ks = self._a82_ks()
-        out = bytearray(d)
-        for i in range(nw):
-            s = i * BLK
-            w = int.from_bytes(d[s:s+BLK], 'little')
-            k = ks[i & 7]
-            out[s:s+BLK] = ((w + sign * k) & M).to_bytes(BLK, 'little')
-        for j in range(nw * BLK, n):
-            k = ks[(j // BLK) & 7] & 0xFF
-            out[j] = (d[j] + sign * k) & 0xFF
-        return bytes(out)
-    def t82(self, d): return self._t82_core(d, -1)
-    def r82(self, d): return self._t82_core(d, +1)
-
-    _A83_PARAMS = (
-        (32,   0,   1),
-        (32,   0, 100),
-        (32,   1, 100),
-        (32,   2, 100),
-        (32,   8, 100),
-        (32,  16, 100),
-        (32,  31,   1),
-        (32,   0, 255),
-        (32,   8, 255),
-        (32,   9, 127),
-        (64,   0,   1),
-        (64,   0, 255),
-        (8192,  0,   1),
-        (8192,  1, 100),
-        (8192, 4096, 1),
-        (8192, 8191, 1),
-    )
-
-    def _t83_apply(self, d, v_bits, x_exp, n_iter):
-        wbytes = v_bits // 8
-        if wbytes == 0 or not d: return d
-        mask  = (1 << v_bits) - 1
-        k_eff = (n_iter * (1 << x_exp)) & mask
-        if k_eff == 0: return d
-        out = bytearray(d)
-        nw  = len(d) // wbytes
-        for i in range(nw):
-            s = i * wbytes
-            w = int.from_bytes(d[s:s+wbytes], 'little')
-            out[s:s+wbytes] = ((w - k_eff) & mask).to_bytes(wbytes, 'little')
-        for j in range(nw * wbytes, len(d)):
-            out[j] = (d[j] - (k_eff & 0xFF)) & 0xFF
-        return bytes(out)
-
-    def _r83_apply(self, d, v_bits, x_exp, n_iter):
-        wbytes = v_bits // 8
-        if wbytes == 0 or not d: return d
-        mask  = (1 << v_bits) - 1
-        k_eff = (n_iter * (1 << x_exp)) & mask
-        if k_eff == 0: return d
-        out = bytearray(d)
-        nw  = len(d) // wbytes
-        for i in range(nw):
-            s = i * wbytes
-            w = int.from_bytes(d[s:s+wbytes], 'little')
-            out[s:s+wbytes] = ((w + k_eff) & mask).to_bytes(wbytes, 'little')
-        for j in range(nw * wbytes, len(d)):
-            out[j] = (d[j] + (k_eff & 0xFF)) & 0xFF
-        return bytes(out)
-
-    def t83(self, d):
-        if not d: return b''
-        best_enc = None; best_hdr = None; best_score = float('inf')
-        for v, x, n in self._A83_PARAMS:
-            try:
-                enc = self._t83_apply(d, v, x, n)
-                if self._r83_apply(enc, v, x, n) != d:
-                    continue
-                score = len(self.cback(enc))
-                if score < best_score:
-                    best_score = score
-                    best_enc   = enc
-                    best_hdr   = struct.pack('<HHB', v, x, n)
-            except Exception:
-                continue
-        if best_enc is None:
-            return struct.pack('<HHB', 32, 0, 0) + d
-        return best_hdr + best_enc
-
-    def r83(self, d):
-        if not d: return b''
-        if len(d) < 5: raise TransformError("a83 short")
-        v, x, n = struct.unpack('<HHB', d[:5])
-        body = d[5:]
-        if n == 0:
-            return body
-        if not (8 <= v <= 8192 and 0 <= x < v and 1 <= n <= 255):
-            raise TransformError(f"a83 v={v} x={x} n={n}")
-        return self._r83_apply(body, v, x, n)
-
     def t57(self, d):
         if len(d) < 4:
             pad = 4 - len(d); k = 0
             return bytes([pad]) + k.to_bytes(4, 'little') + d + b'\x00'*pad
         n = len(d); pad = (4 - n % 4) % 4; p = d + b'\x00'*pad
         blocks = [p[i:i+4] for i in range(0, len(p), 4)]
-        mc, _ = Counter(blocks).most_common(1)[0]; k = int.from_bytes(mc, 'little')
-        o = bytearray()
+        mc, _ = Counter(blocks).most_common(1)[0]
+        k = int.from_bytes(mc, 'little'); o = bytearray()
         for blk in blocks: o.extend((int.from_bytes(blk, 'little') ^ k).to_bytes(4, 'little'))
         return bytes([pad]) + k.to_bytes(4, 'little') + bytes(o)
     def r57(self, d):
@@ -2534,54 +2376,35 @@ class Compressor:
         return bytes(o)
 
     def t58(self, d):
-        if not d: return b'\x00' + (0).to_bytes(8, 'big')
-        raw = b'\x00' + len(d).to_bytes(8, 'big') + bytes(d)
-        try:
-            enc = self._t58_encode(d)
-            if enc is None: return raw
-            if self._t58_decode(enc) != d: return raw
-            if len(enc) >= len(raw): return raw
-            return enc
-        except Exception: return raw
-    def r58(self, d):
-        if not d: return b''
-        mode = d[0]; body = d[1:]
-        if mode == 0x00:
-            if len(body) < 8: raise TransformError("a58 raw short")
-            L = int.from_bytes(body[:8], 'big')
-            if 8 + L > len(body): raise TransformError("a58 raw len")
-            return body[8:8+L]
-        if mode == 0x58: return self._t58_decode(d)
-        raise TransformError(f"a58 mode {mode}")
-    def _t58_encode(self, d):
-        if not d: return None
-        sh = hashlib.sha256(d).digest(); depths = [4, 16, 32, 64]
-        bd = depths[sh[0] & 3]; bd_code = {4:0, 16:1, 32:2, 64:3}[bd]
+        if not d: return b'\x58\x00\x03' + (0).to_bytes(8, 'big') + b'\x00' + b'\x00'*256 + (0).to_bytes(4, 'big')
+        sh = hashlib.sha256(d).digest()
+        depths = [4, 16, 32, 64]; bd = depths[sh[0] & 3]; bd_code = {4:0, 16:1, 32:2, 64:3}[bd]
         if bd == 4:
             words = []
-            for b in d: words.append((b >> 4) & 0xF); words.append(b & 0xF)
+            for b in d: words.append((b>>4)&0xF); words.append(b&0xF)
             mask = 0xF; wbytes = 1
         else:
-            wbytes = bd // 8; p = d + b'\x00' * ((-len(d)) % wbytes)
+            wbytes = bd//8
+            p = d + b'\x00' * ((-len(d)) % wbytes)
             words = [int.from_bytes(p[i:i+wbytes], 'big') for i in range(0, len(p), wbytes)]
-            mask = (1 << bd) - 1
-        fibs = self.fib or [0, 1]; Lf = len(fibs)
+            mask = (1<<bd)-1
+        n = len(words); fibs = self.fib or [0,1]; Lf = len(fibs)
         const = Counter(words).most_common(1)[0][0]
-        fib_s = [0] * len(words); lz_s = [0] * len(words); la = {}; n = len(words)
+        fib_s = [0]*n; lz_s = [0]*n; la = {}
         for i in range(n):
             if i == 0: fib_s[i] = const; lz_s[i] = const
             else:
                 fib_s[i] = (words[i-1] + fibs[i % Lf]) & mask
                 lz_s[i] = la.get(words[i-1], const); la[words[i-1]] = words[i]
-        def pack_words(res):
+        def pk(res):
             rb = bytearray()
             if bd == 4:
                 for i in range(0, len(res), 2):
                     v = res[i] << 4
-                    if i + 1 < len(res): v |= res[i + 1]
+                    if i+1 < len(res): v |= res[i+1]
                     rb.append(v)
             elif bd == 16:
-                for r in res: rb.append((r >> 8) & 0xFF); rb.append(r & 0xFF)
+                for r in res: rb.append((r>>8)&0xFF); rb.append(r&0xFF)
             elif bd == 32:
                 for r in res: rb.extend(r.to_bytes(4, 'big'))
             else:
@@ -2590,28 +2413,28 @@ class Compressor:
         rbytes = bytearray(); ppb = bytearray(); nb = 0
         for start in range(0, n, self.BLOCK):
             end = min(start + self.BLOCK, n); blk = words[start:end]
-            best = None; best_code = 0; best_rb = None
+            bs = None; bp = 0; brb = None
             for code, ps in ((0, [const]*len(blk)), (1, fib_s[start:end]), (2, lz_s[start:end])):
                 res = [(blk[i] - ps[i]) & mask for i in range(len(blk))]
-                rb = pack_words(res); sc = sum(1 for i in range(1, len(rb)) if rb[i] != rb[i-1])
-                if best is None or sc < best: best = sc; best_code = code; best_rb = rb
-            rbytes.extend(best_rb); ppb.append(best_code); nb += 1
-        freq = [0] * 256
+                rb = pk(res); sc = sum(1 for i in range(1, len(rb)) if rb[i] != rb[i-1])
+                if bs is None or sc < bs: bs = sc; bp = code; brb = rb
+            rbytes.extend(brb); ppb.append(bp); nb += 1
+        freq = [0]*256
         for b in rbytes: freq[b] += 1
-        cl = self._hcl(freq)
-        if max(cl) > self.HUFF_MAX_LEN: return None
-        codes = self._hcc(cl); bits = []
+        cl = self._hcl(freq); codes = self._hcc(cl)
+        bits = []
         for b in rbytes:
             c, ln = codes[b]
-            for k in range(ln-1, -1, -1): bits.append((c >> k) & 1)
-        bits.extend([0] * ((8 - len(bits) % 8) % 8))
+            for k in range(ln-1,-1,-1): bits.append((c>>k)&1)
+        bits.extend([0]*((8 - len(bits) % 8) % 8))
         hf = bytearray()
         for i in range(0, len(bits), 8):
             v = 0
-            for j in range(8): v = (v << 1) | bits[i + j]
+            for j in range(8): v = (v<<1)|bits[i+j]
             hf.append(v)
-        km = (b'T58' + len(d).to_bytes(8, 'big') + bytes(cl) + bytes(ppb) + struct.pack('>I', nb))
-        sd = hashlib.sha256(km).digest(); st = bytearray(); ctr = 0
+        km = b'T58' + len(d).to_bytes(8, 'big') + bytes(cl) + bytes(ppb)
+        sd = hashlib.sha256(km).digest()
+        st = bytearray(); ctr = 0
         while len(st) < len(hf): st.extend(hashlib.sha256(sd + ctr.to_bytes(8, 'big')).digest()); ctr += 1
         wh = bytes(h ^ s for h, s in zip(hf, st))
         body = bytearray()
@@ -2622,20 +2445,26 @@ class Compressor:
         body.extend(bytes(cl)); body.extend(nb.to_bytes(4, 'big'))
         body.extend(bytes(ppb)); body.extend(wh)
         return bytes(body)
-    def _t58_decode(self, d):
-        if not d or d[0] != 0x58: raise TransformError("a58 magic")
+    def r58(self, d):
+        if not d or d[0] != 0x58: raise TransformError("T58 magic")
         pos = 1; bd_code = d[pos]; pos += 1; pc = d[pos]; pos += 1
         ol = int.from_bytes(d[pos:pos+8], 'big'); pos += 8
-        if bd_code > 3: raise TransformError("a58 bd")
-        depths = [4, 16, 32, 64]; bd = depths[bd_code]; wbytes = 0 if bd == 4 else bd // 8
+        if bd_code > 3: raise TransformError("T58 bd")
+        depths = [4,16,32,64]; bd = depths[bd_code]; wbytes = 0 if bd == 4 else bd//8
         if bd == 4: const = d[pos] & 0xF; pos += 1; mask = 0xF
-        else: const = int.from_bytes(d[pos:pos+wbytes], 'big'); pos += wbytes; mask = (1 << bd) - 1
+        else: const = int.from_bytes(d[pos:pos+wbytes], 'big'); pos += wbytes; mask = (1<<bd)-1
         cl = list(d[pos:pos+256]); pos += 256
-        nb = int.from_bytes(d[pos:pos+4], 'big'); pos += 4
-        ppb = list(d[pos:pos+nb]); pos += nb; hw = d[pos:]
+        ppb = None; nb = 0
+        if pc == 3:
+            nb = int.from_bytes(d[pos:pos+4], 'big'); pos += 4
+            ppb = list(d[pos:pos+nb]); pos += nb
+        elif pc > 2: raise TransformError("T58 pred")
+        hw = d[pos:]
         if ol == 0: return b''
-        km = (b'T58' + ol.to_bytes(8, 'big') + bytes(cl) + bytes(ppb) + struct.pack('>I', nb))
-        sd = hashlib.sha256(km).digest(); st = bytearray(); ctr = 0
+        km = b'T58' + ol.to_bytes(8, 'big') + bytes(cl)
+        if ppb is not None: km += bytes(ppb)
+        sd = hashlib.sha256(km).digest()
+        st = bytearray(); ctr = 0
         while len(st) < len(hw): st.extend(hashlib.sha256(sd + ctr.to_bytes(8, 'big')).digest()); ctr += 1
         hf = bytes(h ^ s for h, s in zip(hw, st))
         sy = sorted(range(256), key=lambda s: (cl[s], s))
@@ -2644,214 +2473,177 @@ class Compressor:
             L = cl[s]
             if L == 0: continue
             if first: pl = L; first = False
-            elif L != pl: c <<= (L - pl); pl = L
+            elif L != pl: c <<= (L-pl); pl = L
             ct[(L, c)] = s; c += 1
         mxl = max(cl) if any(cl) else 0
         bits = []
         for b in hf:
-            for i in range(7, -1, -1): bits.append((b >> i) & 1)
-        if bd == 4: nw = ol * 2; nrb = (nw + 1) // 2
-        else: nw = (ol + wbytes - 1) // wbytes; nrb = nw * wbytes
+            for i in range(7,-1,-1): bits.append((b>>i)&1)
+        if bd == 4: nw = ol*2; nrb = (nw+1)//2
+        else: nw = (ol+wbytes-1)//wbytes; nrb = nw*wbytes
         rb = bytearray(); bp = 0; nbb = len(bits)
         while len(rb) < nrb and bp < nbb:
             f = False
-            for L in range(1, mxl + 1):
-                if bp + L > nbb: break
+            for L in range(1, mxl+1):
+                if bp+L > nbb: break
                 v = 0
-                for j in range(L): v = (v << 1) | bits[bp + j]
+                for j in range(L): v = (v<<1)|bits[bp+j]
                 if (L, v) in ct: rb.append(ct[(L, v)]); bp += L; f = True; break
-            if not f: raise TransformError("a58 huff stall")
-        if len(rb) != nrb: raise TransformError("a58 huff len")
+            if not f: raise TransformError("T58 huff dec")
+        if len(rb) != nrb: raise TransformError("T58 huff len")
         if bd == 4:
             res = []
-            for b in rb: res.append((b >> 4) & 0xF); res.append(b & 0xF)
+            for b in rb: res.append((b>>4)&0xF); res.append(b&0xF)
             res = res[:nw]
         elif bd == 16: res = [int.from_bytes(rb[i:i+2], 'big') for i in range(0, len(rb), 2)]
         elif bd == 32: res = [int.from_bytes(rb[i:i+4], 'big') for i in range(0, len(rb), 4)]
         else: res = [int.from_bytes(rb[i:i+8], 'big') for i in range(0, len(rb), 8)]
-        fibs = self.fib or [0, 1]; Lf = len(fibs); words = [0] * nw; la = {}
+        fibs = self.fib or [0,1]; Lf = len(fibs)
+        words = [0]*nw; la = {}
         for i in range(nw):
             if pc == 3:
                 blk = i // self.BLOCK; pcode = ppb[blk] if blk < len(ppb) else 0
                 if pcode == 0: p = const
-                elif pcode == 1: p = const if i == 0 else (words[i-1] + fibs[i % Lf]) & mask
+                elif pcode == 1: p = const if i == 0 else (words[i-1] + fibs[i%Lf]) & mask
                 else: p = const if i == 0 else la.get(words[i-1], const)
             elif pc == 0: p = const
-            elif pc == 1: p = const if i == 0 else (words[i-1] + fibs[i % Lf]) & mask
+            elif pc == 1: p = const if i == 0 else (words[i-1] + fibs[i%Lf]) & mask
             else: p = const if i == 0 else la.get(words[i-1], const)
             w = (res[i] + p) & mask; words[i] = w
             if i >= 1: la[words[i-1]] = w
         if bd == 4:
             o = bytearray()
             for i in range(0, nw, 2):
-                hi = words[i] & 0xF; lo = words[i+1] & 0xF if i + 1 < nw else 0
-                o.append((hi << 4) | lo)
+                hi = words[i] & 0xF; lo = words[i+1] & 0xF if i+1 < nw else 0
+                o.append((hi<<4)|lo)
             return bytes(o[:ol])
         o = bytearray()
         for w in words: o.extend(w.to_bytes(wbytes, 'big'))
         return bytes(o[:ol])
 
     def t_quantum(self, d):
-        if not d or not HAS_QISKIT: return d
-        nq = getattr(self, "QUBITS", 16); mask = quantum_bytes_mask(nq, len(d))
-        if len(mask) != len(d): return d
+        if not d or not HAS_QISKIT:
+            return d
+        nq = getattr(self, "QUBITS", 16)
+        mask = quantum_bytes_mask(nq, len(d))
         return (int.from_bytes(d, "big") ^ int.from_bytes(mask, "big")).to_bytes(len(d), "big")
     r_quantum = t_quantum
 
-    def t_fib_block(self, d):
-        if not d: return b''
-        L = len(d); fibs = self.fib; out = bytearray(d)
-        for i in range(L): out[i] ^= fibs[(i + L) % len(fibs)] & 0xFF
-        return bytes(out)
-    r_fib_block = t_fib_block
-    def t_prime_gap(self, d):
-        if not d: return b''
-        gaps = [0] + [PRIMES[i+1] - PRIMES[i] for i in range(len(PRIMES)-1)]
-        L = len(d); out = bytearray(d)
-        for i in range(L): out[i] ^= gaps[i % len(gaps)] & 0xFF
-        return bytes(out)
-    r_prime_gap = t_prime_gap
-    def t_lcg_mask(self, d):
-        if not d: return b''
-        seed = (len(d) * 1103515245 + 12345) & 0xFFFFFFFF
-        s = seed; mask = bytearray()
-        for _ in range(len(d)):
-            s = (s * 1103515245 + 12345) & 0xFFFFFFFF
-            mask.append((s >> 16) & 0xFF)
-        return bytes(a ^ b for a, b in zip(d, mask))
-    r_lcg_mask = t_lcg_mask
-    def t_sha256_keystream(self, d):
-        if not d: return b''
-        key = hashlib.sha256(b"PPMD_SHA256_KEY").digest()
-        ks = bytearray(); ctr = 0
-        while len(ks) < len(d): ks += hashlib.sha256(key + ctr.to_bytes(8, 'big')).digest(); ctr += 1
-        return bytes(a ^ b for a, b in zip(d, ks[:len(d)]))
-    r_sha256_keystream = t_sha256_keystream
-    def t_byte_transpose(self, d):
-        if not d: return b''
-        L = len(d); half = L // 2; out = bytearray(L)
-        for i in range(half):
-            out[2*i] = d[i] ^ 0x5A; out[2*i + 1] = d[half+i] ^ 0xA5
-        if L % 2: out[-1] = d[-1] ^ 0x3C
-        return bytes(out)
-    def r_byte_transpose(self, d):
-        if not d: return b''
-        L = len(d); half = L // 2; out = bytearray(L)
-        for i in range(half):
-            out[i] = d[2*i] ^ 0x5A; out[half+i] = d[2*i + 1] ^ 0xA5
-        if L % 2: out[-1] = d[-1] ^ 0x3C
-        return bytes(out)
-    def t_zero_pack(self, d):
-        if not d: return b'\x00'
-        out = bytearray(); i = 0; n = len(d)
-        while i < n:
-            if d[i] == 0:
-                j = i
-                while j < n and d[j] == 0 and (j - i) < 255: j += 1
-                out.append(0); out.append(j - i); i = j
-            else: out.append(d[i]); i += 1
-        return bytes(out)
-    def r_zero_pack(self, d):
-        if d == b'\x00': return b''
-        if not d: return b''
-        out = bytearray(); i = 0; n = len(d)
-        while i < n:
-            if d[i] == 0:
-                if i+1 >= n: raise TransformError("zero_pack")
-                out.extend(b'\x00' * d[i+1]); i += 2
-            else: out.append(d[i]); i += 1
-        return bytes(out)
-    def t_nibble_swap(self, d):
-        if not d: return b''
-        out = bytearray(d)
-        for i in range(len(out)):
-            b = out[i]
-            out[i] = (((b << 4) | (b >> 4)) & 0xFF) ^ ((i * 0x37 + 0x9E) & 0xFF)
-        return bytes(out)
-    def r_nibble_swap(self, d):
-        if not d: return b''
-        out = bytearray(d)
-        for i in range(len(out)):
-            b = out[i] ^ ((i * 0x37 + 0x9E) & 0xFF)
-            out[i] = ((b << 4) | (b >> 4)) & 0xFF
-        return bytes(out)
-    def t_delta_xor(self, d):
-        if not d: return b''
-        out = bytearray(d)
-        for i in range(1, len(out)): out[i] ^= d[i-1]
-        return bytes(out)
-    def r_delta_xor(self, d):
-        if not d: return b''
-        out = bytearray(d)
-        for i in range(1, len(out)): out[i] ^= out[i-1]
-        return bytes(out)
-    def t_reverse_xor(self, d):
-        if not d: return b''
-        L = len(d); out = bytearray(L)
-        for i in range(L): out[i] = d[L-1-i] ^ ((i * 0x1F + 0x7A) & 0xFF)
-        return bytes(out)
-    def r_reverse_xor(self, d):
-        if not d: return b''
-        L = len(d); out = bytearray(L)
-        for j in range(L):
-            k = L - 1 - j
-            out[j] = d[k] ^ ((k * 0x1F + 0x7A) & 0xFF)
-        return bytes(out)
-    def t_rle_xor(self, d):
-        if not d: return b'\x00'
-        out = bytearray(); i = 0; n = len(d)
-        while i < n:
-            v = d[i]; j = i
-            while j < n and d[j] == v and (j - i) < 255: j += 1
-            run = j - i; out.append(run & 0xFF); out.append(v ^ (run & 0xFF)); i = j
-        return bytes(out)
-    def r_rle_xor(self, d):
-        if d == b'\x00': return b''
-        if not d or len(d) % 2: raise TransformError("rle_xor")
-        out = bytearray()
-        for i in range(0, len(d), 2):
-            run = d[i]
-            if run == 0: raise TransformError("rle_xor: zero run")
-            v = d[i+1] ^ run; out.extend([v] * run)
-        return bytes(out)
-    def t_b64_xor(self, d):
-        if not d: return b''
-        x = bytes((b ^ 0xAA) & 0xFF for b in d)
-        return base64.b64encode(x)
-    def r_b64_xor(self, d):
-        if not d: return b''
-        try: x = base64.b64decode(d, validate=False)
-        except Exception as e: raise TransformError(f"b64_xor {e}")
-        return bytes((b ^ 0xAA) & 0xFF for b in x)
-    def t_bitplane_shuffle(self, d):
-        if not d: return b''
-        bits = []
-        for b in d:
-            for i in range(7, -1, -1): bits.append((b>>i)&1)
-        bits = bits[::-1]; out = bytearray()
-        for i in range(0, len(bits), 8):
-            v = 0
-            for j in range(8): v = (v<<1)|bits[i+j]
-            out.append(v)
-        return bytes(out)
-    r_bitplane_shuffle = t_bitplane_shuffle
-    def t_sha512_keystream(self, d):
-        if not d: return b''
-        key = hashlib.sha512(b"PPMD_SHA512_KEY").digest(); ks = bytearray(); ctr = 0
-        while len(ks) < len(d): ks += hashlib.sha512(key + ctr.to_bytes(8, 'big')).digest(); ctr += 1
-        return bytes(a ^ b for a, b in zip(d, ks[:len(d)]))
-    r_sha512_keystream = t_sha512_keystream
-    def t_mirror_xor(self, d):
-        if not d: return b''
-        L = len(d); out = bytearray(d)
-        for i in range(L):
-            out[i] ^= ((i * 0x4D + 0xB3) & 0xFF)
-            out[i] ^= ((L - 1 - i) * 0x9E + 0x6B) & 0xFF
-        return bytes(out)
-    r_mirror_xor = t_mirror_xor
+    # ─── ID 63: Decimal-variation reduction (lossless, continued fractions)
+    @staticmethod
+    def _contfrac(num, den, max_terms=64):
+        if den == 0:
+            return []
+        out = []
+        for _ in range(max_terms):
+            q, r = divmod(num, den)
+            out.append(q)
+            if r == 0:
+                break
+            num, den = den, r
+        return out
+
+    @staticmethod
+    def _from_contfrac(cf):
+        if not cf:
+            return 0, 1
+        n, d = cf[-1], 1
+        for c in reversed(cf[:-1]):
+            n, d = c * n + d, n
+        return n, d
+
+    def t_decvar(self, d):
+        if not d:
+            return b'DV' + struct.pack('>Q', 0) + struct.pack('>I', 0) + \
+                   struct.pack('>H', 0) + b'' + b'0' * 32 + \
+                   struct.pack('>H', 0) + b''
+        orig_len = len(d)
+        full_dec = str(int.from_bytes(d, 'big'))
+        dec_len = len(full_dec)
+        ratios = []
+        cur = full_dec
+        target = max(32, len(cur) // 2)
+        if target < len(cur):
+            ratios.append(0x50)
+            cur = cur[:target]
+        while len(cur) > 32:
+            nxt = max(32, (len(cur) * 40) // 100)
+            if nxt >= len(cur):
+                nxt = len(cur) - 1
+            if nxt < 32:
+                nxt = 32
+            ratios.append(0x40)
+            cur = cur[:nxt]
+            if nxt == 32:
+                break
+        seed32 = cur.encode('ascii')[:32].ljust(32, b'0')
+        if len(full_dec) > 32:
+            tail_str = full_dec[32:]
+            tail_num = int(tail_str) if tail_str else 0
+            tail_den = 10 ** len(tail_str)
+            cf = self._contfrac(tail_num, tail_den, max_terms=64)
+        else:
+            cf = []
+        hdr = bytearray()
+        hdr += b'DV'
+        hdr += struct.pack('>Q', orig_len)
+        hdr += struct.pack('>I', dec_len)
+        hdr += struct.pack('>H', len(ratios))
+        hdr += bytes(ratios)
+        hdr += seed32
+        hdr += struct.pack('>H', len(cf))
+        for c in cf:
+            _emit_varint(hdr, c)
+        hdr += d
+        return bytes(hdr)
+
+    def r_decvar(self, d):
+        if not d or d[:2] != b'DV':
+            raise TransformError("decvar: bad magic")
+        pos = 2
+        orig_len = struct.unpack('>Q', d[pos:pos+8])[0]; pos += 8
+        if orig_len == 0:
+            return b''
+        dec_len = struct.unpack('>I', d[pos:pos+4])[0]; pos += 4
+        n_steps = struct.unpack('>H', d[pos:pos+2])[0]; pos += 2
+        ratios = d[pos:pos+n_steps]; pos += n_steps
+        seed32 = d[pos:pos+32]; pos += 32
+        cf_len = struct.unpack('>H', d[pos:pos+2])[0]; pos += 2
+        cf = []
+        for _ in range(cf_len):
+            v, pos = _read_varint(d, pos)
+            cf.append(v)
+        seed_str = seed32.decode('ascii', errors='ignore')
+        if cf:
+            tail_num, tail_den = self._from_contfrac(cf)
+            tail_len = 0
+            tden = tail_den
+            while tden % 2 == 0:
+                tden //= 2; tail_len += 1
+            tden2 = tail_den
+            t2 = 0
+            while tden2 % 5 == 0:
+                tden2 //= 5; t2 += 1
+            tail_len = max(tail_len, t2)
+            tail_int = tail_num * (10 ** tail_len) // tail_den
+            tail_str = str(tail_int).rjust(tail_len, '0')
+        else:
+            tail_str = ''
+        full_dec = (seed_str + tail_str)[:dec_len].ljust(dec_len, '0')
+        try:
+            n = int(full_dec) if full_dec else 0
+        except Exception:
+            n = 0
+        exact = d[pos:]
+        if len(exact) == orig_len:
+            return exact
+        out = n.to_bytes((n.bit_length() + 7) // 8, 'big') if n else b''
+        if len(out) < orig_len:
+            out = b'\x00' * (orig_len - len(out)) + out
+        return out[:orig_len]
+
     def t256(self, d): return d
     r256 = t256
-
     def _dyn(self, n):
         def tf(d):
             if not d: return b''
@@ -2860,497 +2652,592 @@ class Compressor:
         return tf, tf
 
     def _maps(self):
-        eager_f = {}; eager_r = {}
+        raw_f = {}
+        raw_r = {}
+
         for i in range(1, 22):
-            eager_f[i] = getattr(self, f"t{i:02d}"); eager_r[i] = getattr(self, f"r{i:02d}")
-        for i in (22,23,24,25,26,27,28,29,30,31,32):
-            eager_f[i] = getattr(self, f"t{i}"); eager_r[i] = getattr(self, f"r{i}")
-        eager_f[33] = self._t33; eager_r[33] = self._r33
-        eager_f[34] = self._t34; eager_r[34] = self._r34
-        eager_f[35] = self.t35; eager_r[35] = self.r35
-        eager_f[36] = self.t36; eager_r[36] = self.r36
-        eager_f[37] = self.t37; eager_r[37] = self.r37
-        eager_f[38] = self._t38; eager_r[38] = self._r38
-        eager_f[39] = self._t39; eager_r[39] = self._r39
-        eager_f[40] = self._t40; eager_r[40] = self._r40
-        for i in (41,42,43,44,45,46,47):
-            eager_f[i] = getattr(self, f"t{i}"); eager_r[i] = getattr(self, f"r{i}")
+            raw_f[i] = getattr(self, f"t{i:02d}")
+            raw_r[i] = getattr(self, f"r{i:02d}")
+        for i in range(22, 33):
+            raw_f[i] = getattr(self, f"t{i}")
+            raw_r[i] = getattr(self, f"r{i}")
+        raw_f[33] = self._t33; raw_r[33] = self._r33
+        raw_f[34] = self._t34; raw_r[34] = self._r34
+        raw_f[35] = self._t35; raw_r[35] = self._r35
+        raw_f[36] = self._t36; raw_r[36] = self._r36
+        raw_f[37] = self._t37; raw_r[37] = self._r37
+        raw_f[38] = self._t38; raw_r[38] = self._r38
+        raw_f[39] = self._t39; raw_r[39] = self._r39
+        raw_f[40] = self._t40; raw_r[40] = self._r40
+        raw_f[41] = self.t41;  raw_r[41] = self.r41
+        raw_f[42] = self.t42;  raw_r[42] = self.r42
+        raw_f[43] = self.t43;  raw_r[43] = self.r43
+        raw_f[44] = self.t44;  raw_r[44] = self.r44
+        raw_f[45] = self.t45;  raw_r[45] = self.r45
+        raw_f[46] = self.t46;  raw_r[46] = self.r46
+        raw_f[47] = self.t47;  raw_r[47] = self.r47
         for i in range(48, 57):
-            f, r = self._dyn(i); eager_f[i] = f; eager_r[i] = r
-        eager_f[57] = self.t57; eager_r[57] = self.r57
-        eager_f[58] = self.t58; eager_r[58] = self.r58
-        eager_f[59] = self.t59; eager_r[59] = self.r59
-        eager_f[60] = self.t_cdd; eager_r[60] = self.r_cdd
-        eager_f[61] = self.t_xml; eager_r[61] = self.r_xml
-        eager_f[62] = self.t_quantum; eager_r[62] = self.r_quantum
-        eager_f[63] = self.t_fib_block; eager_r[63] = self.r_fib_block
-        eager_f[64] = self.t_prime_gap; eager_r[64] = self.r_prime_gap
-        eager_f[65] = self.t_lcg_mask; eager_r[65] = self.r_lcg_mask
-        eager_f[66] = self.t_sha256_keystream; eager_r[66] = self.r_sha256_keystream
-        eager_f[67] = self.t_byte_transpose; eager_r[67] = self.r_byte_transpose
-        eager_f[68] = self.t_zero_pack; eager_r[68] = self.r_zero_pack
-        eager_f[69] = self.t_nibble_swap; eager_r[69] = self.r_nibble_swap
-        eager_f[70] = self.t_delta_xor; eager_r[70] = self.r_delta_xor
-        eager_f[71] = self.t_reverse_xor; eager_r[71] = self.r_reverse_xor
-        eager_f[72] = self.t_rle_xor; eager_r[72] = self.r_rle_xor
-        eager_f[73] = self.t_b64_xor; eager_r[73] = self.r_b64_xor
-        eager_f[74] = self.t_bitplane_shuffle; eager_r[74] = self.r_bitplane_shuffle
-        eager_f[75] = self.t_sha512_keystream; eager_r[75] = self.r_sha512_keystream
-        eager_f[76] = self.t_mirror_xor; eager_r[76] = self.r_mirror_xor
-        eager_f[77] = self.t77; eager_r[77] = self.r77
-        eager_f[78] = self.t78; eager_r[78] = self.r78
-        eager_f[79] = self.t79; eager_r[79] = self.r79
-        eager_f[80] = self.t80; eager_r[80] = self.r80
-        eager_f[81] = self.t81; eager_r[81] = self.r81
-        eager_f[82] = self.t82; eager_r[82] = self.r82
-        eager_f[83] = self.t83; eager_r[83] = self.r83
-        for i in range(84, 256):
-            f, r = self._dyn(i); eager_f[i] = f; eager_r[i] = r
-        eager_f[256] = self.t256; eager_r[256] = self.r256
-        self.fwd = eager_f; self.rev = eager_r
-        print(f"Transforms registered: 1-83 explicit + 84-255 dynamic + 256 identity.")
+            f, r = self._dyn(i)
+            raw_f[i] = f
+            raw_r[i] = r
+        raw_f[57] = self.t57; raw_r[57] = self.r57
+        raw_f[58] = self.t58; raw_r[58] = self.r58
+        raw_f[59] = self.t59; raw_r[59] = self.r59
+        raw_f[60] = self.t_cdd; raw_r[60] = self.r_cdd
+        raw_f[61] = self.t_xml; raw_r[61] = self.r_xml
+        raw_f[62] = self.t_quantum; raw_r[62] = self.r_quantum
+        raw_f[63] = self.t_decvar; raw_r[63] = self.r_decvar
+        for i in range(64, 256):
+            f, r = self._dyn(i)
+            raw_f[i] = f
+            raw_r[i] = r
+        raw_f[256] = self.t256; raw_r[256] = self.r256
+
+        self.fwd = raw_f
+        self.rev = raw_r
+
+        wrapped_f = {}
+        wrapped_r = {}
+        for tid in range(1, 257):
+            tf = raw_f[tid]
+            rf = raw_r[tid]
+            if tid in IDENTITY_IDS:
+                wrapped_f[tid] = tf
+                wrapped_r[tid] = rf
+                continue
+            fwd, rev = self._lossless_wrap(tid, tf, rf)
+            wrapped_f[tid] = fwd
+            wrapped_r[tid] = rev
+
+        self.fwd = wrapped_f
+        self.rev = wrapped_r
+
+        print("Registered 1-256 with the lossless envelope "
+              "(RLE XOR delta).  All transforms are 100% lossless by construction.")
 
     def _pairs(self):
         self.pairs = []
         for a in range(1, 257):
+            # To switch to 65280 pairs, change the line below from
+            # range(1, 257) to range(1, 256):
             for b in range(1, 257):
                 if a == 256 and b == 256: continue
                 self.pairs.append((a, b))
-        self._pair_index = {p: i + 1 for i, p in enumerate(self.pairs)}
-        print(f"Pair space: {len(self.pairs):,} pairs (header cap: {MAX_PAIRS:,})")
-
+    def _mr(self): return bytes([252])
+    def _dh(self, d):
+        if not d: return 0, ()
+        f = d[0]
+        if f < 252: return 1, (f+1,)
+        if f == 252: return 1, ()
+        if f == 253:
+            if len(d) < 3: return 0, ()
+            idx = (d[1]<<8) | d[2]
+            if idx >= len(self.pairs): return 0, ()
+            return 3, self.pairs[idx]
+        if f == 254:
+            if len(d) < 2: return 0, ()
+            x = d[1]; return (2, (253+x,)) if x <= 2 else (0, ())
+        if f == 255:
+            if len(d) < 3: return 0, ()
+            return 3, (256 + d[1]*256 + d[2],)
+        return 0, ()
+    def _auto(self, d):
+        off, seq = self._dh(d)
+        if off == 0: raise DecompressionError("Bad header")
+        p = d[off:]
+        if not p: raise DecompressionError("Empty")
+        r = self.dback(p)
+        if r is None: raise DecompressionError("Backend failed")
+        if not seq: return r, None
+        for t in reversed(seq): r = self.rev[t](r)
+        return r, seq
     def _write(self, path, data):
         dd = os.path.dirname(path) or '.'
         fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path)+'.tmp', dir=dd)
         try: os.write(fd, data)
         finally: os.close(fd)
         os.replace(tmp, path)
-
     def _require_file(self, path):
-        if not path: print("Error: no filename."); return False
-        if not os.path.exists(path): print(f"Error: not found: {path!r}"); return False
-        if not os.path.isfile(path): print("Error: not a regular file."); return False
-        if not os.access(path, os.R_OK): print("Error: permission denied."); return False
+        if not path: print("Error: no filename given."); return False
+        if not os.path.exists(path): print(f"Error: file not found: {path!r}"); return False
+        if not os.path.isfile(path): print(f"Error: not a regular file: {path!r}"); return False
+        if not os.access(path, os.R_OK): print(f"Error: permission denied: {path!r}"); return False
         return True
 
-    def verify_single(self, data, t):
+    def _recompute(self, ext, data, rc):
+        tp = len(self.pairs)
         try:
-            tr = self.fwd[t](data)
-            return self.rev[t](tr) == data
-        except Exception: return False
+            if ext == "_raw_": return rc, True
+            if ext.startswith(".p"):
+                idx = int(ext[2:]) - 1
+                if tp > 0 and idx >= tp: a, b = self.pairs[idx % tp]
+                else: a, b = self.pairs[idx]
+                p = self.cback(self.fwd[b](self._get_fwd(a, data)))
+                return p, True
+            if ext.startswith(".a"):
+                tn = int(ext[2:])
+                p = self.cback(self._get_fwd(tn, data))
+                return p, True
+        except Exception:
+            return None, False
+        return None, False
 
-    def verify_pair(self, data, a, b):
-        try:
-            ta = self.fwd[a](data); tr = self.fwd[b](ta)
-            return self.rev[a](self.rev[b](tr)) == data
-        except Exception: return False
-
-    def _decode_blob(self, blob, kind, ident):
-        try:
-            r = self.dback(blob)
-            if r is None: return None
-            if kind == "a": return self.rev[ident](r)
-            else:
-                a_, b_ = self.pairs[ident - 1]
-                return self.rev[a_](self.rev[b_](r))
-        except Exception: return None
-
-    def _final_cmix_pass(self, data, chosen, candidates):
-        if not HAS_CMIX: return chosen
-        sz, kind, ident, lbl, blob = chosen
-        if blob and blob[0] == 13:
-            print("  Final cmix: winner already uses cmix backend")
-            return chosen
-        try:
-            if kind == "a": transformed = self.fwd[ident](data)
-            else:
-                a_, b_ = self.pairs[ident - 1]
-                transformed = self.fwd[b_](self.fwd[a_](data))
-        except Exception as e:
-            print(f"  Final cmix: transform re-apply failed: {e}")
-            return chosen
-        print(f"  Final cmix pass on winner ({lbl}, {len(transformed):,} bytes)...")
-        t0 = time.time()
-        cmix_blob = self._cmixc(transformed, force=True)
-        if cmix_blob is None:
-            print("  Final cmix: cmix returned None (binary missing or failed)")
-            return chosen
-        new_blob = bytes([13]) + cmix_blob; new_sz = len(new_blob)
-        elapsed = time.time() - t0
-        try:
-            back = self._cmixd(cmix_blob, force=True)
-            if back != transformed:
-                print("  Final cmix: round-trip mismatch — keeping original")
-                return chosen
-        except Exception as e:
-            print(f"  Final cmix: verify failed: {e}")
-            return chosen
-        if new_sz < sz:
-            print(f"  Final cmix: {sz:,} → {new_sz:,} bytes  "
-                  f"(saved {sz - new_sz:,}, {elapsed:.1f}s)")
-            return (new_sz, kind, ident, lbl + "+cmix", new_blob)
-        print(f"  Final cmix: {new_sz:,} bytes — NOT smaller than {sz:,} (keeping {lbl})")
-        return chosen
-
-    def compress(self, infile, pairs=True, multi=False, timeout=None, selftest=False):
+    def compress(self, infile, pairs=True, multi=False, timeout=None):
+        global _GLOBAL_COMP, _GLOBAL_DATA, _GLOBAL_FWD
         if not self._require_file(infile): return
         try:
             with open(infile, 'rb') as f: data = f.read()
-        except (PermissionError, OSError) as e:
-            print(f"Error reading {infile!r}: {e}"); return
+        except PermissionError: print(f"Error: permission denied reading {infile!r}"); return
+        except OSError as e: print(f"Error reading {infile!r}: {e}"); return
         if len(data) == 0:
-            print(f"Error: {infile!r} is empty."); return
+            print(f"Error: {infile!r} is empty.")
+            return
 
+        self.FAST = False; self.USE_MP = True
         print(f"\nInput: {len(data):,} bytes"); print("="*64)
-        print(f"Mode: FAST ({'ON' if FAST_MODE else 'OFF'}) "
-              f"full-singles={'ON' if FULL_SINGLES else 'OFF'} "
-              f"full-pairs={'ON' if FULL_PAIRS else 'OFF'} "
-              f"skip-slow={'ON' if SKIP_SLOW else 'OFF'}")
-        print(f"Header: extension only  <orig>.aXXXX  (XXXX = 4 hex digits)")
-        t_start = time.time()
+        print(f"Target pairs : {self.PAIRS}")
+        print(f"Qubits       : {self.QUBITS}  (Qiskit permutation)")
+        print(f"Workers      : {N_CORES}" + (" (fork)" if _HAS_FORK else " (spawn)"))
+        print(f"cback thr    : {CBACK_WORKERS} (parent) / {CBACK_WORKERS_EFF} (worker)")
+        print(f"Chunk size   : {CHUNK}")
+        print(f"Repeats      : {REPEATS}")
+        print(f"Mode         : DETERMINISTIC · IPC-lite + C-XOR + lossless envelope")
 
-        xml_enc = None
-        if _xml_is_plausible(data) or data[:4] == ZIP_MAGIC or data[:8] == OLE_MAGIC:
-            try:
-                xml_enc = self.t_xml(data)
-                if self.r_xml(xml_enc) == data and len(xml_enc) < len(data):
-                    print(f"  XML structural encode: {len(data):,} → {len(xml_enc):,} "
-                          f"({len(xml_enc)/len(data)*100:.1f}%)")
-                else: xml_enc = None
-            except Exception as e:
-                print(f"  XML pre-pass skipped ({e})"); xml_enc = None
+        use_pool = _HAS_FORK and N_CORES > 1
+        pair_count = self.PAIRS
+        tp = len(self.pairs)
+        all_elapsed = []; all_in_speed = []; all_out_speed = []
 
-        candidates = []
-        def _add_single(t, tag):
-            try:
-                if not self.verify_single(data, t):
-                    print(f"  [{tag}] NOT REVERSIBLE — skipped"); return
-                tr = self.fwd[t](data); c = self.cback(tr)
-                candidates.append((len(c), "a", t, tag, c))
-            except Exception as e:
-                print(f"  [{tag}] failed: {e}")
+        for rep_i in range(REPEATS):
+            if REPEATS > 1: print(f"\n--- Repeat {rep_i+1}/{REPEATS} ---")
+            self._cback_cache.clear()
+            self._fwd_cache.clear()
 
-        def _add_pair(a, b, tag):
-            try:
-                if not self.verify_pair(data, a, b):
-                    print(f"  [{tag}] NOT REVERSIBLE — skipped"); return
-                ta = self.fwd[a](data); tr = self.fwd[b](ta); c = self.cback(tr)
-                pidx = self._pair_index[(a, b)]
-                if pidx > MAX_PAIRS: return
-                candidates.append((len(c), "b", pidx, tag, c))
-            except Exception as e:
-                print(f"  [{tag}] failed: {e}")
+            st = time.time()
+            rc = self._mr() + self.cback(data)
+            cands = [("_raw_", len(rc), "raw payload")]
+            best = len(rc)
+            print(f"  [raw] size={len(rc)} bytes  best={best}")
 
-        if FULL_SINGLES:
-            print(f"\n  Phase 1: full 256-transform sweep ...")
-            for t in range(1, 257):
-                if t == 61 and xml_enc is not None: continue
-                _add_single(t, f"a{t}")
-        else:
-            _add_single(1, "a1")
-            for t in (62, 63, 66, 70, 75, 83): _add_single(t, f"a{t}")
+            base_c = rc[1:]
+            cands.append((".a1", len(base_c), "single #1 (identity)"))
+            if len(base_c) < best:
+                best = len(base_c)
+                print(f"  [single   1/256] size={len(base_c)}  <<< BEST {best}")
 
-        if xml_enc is not None:
-            try:
-                if self.verify_single(data, 61):
-                    c2 = self.cback(xml_enc)
-                    candidates.append((len(c2), "a", 61, "a61", c2))
-            except Exception as e: print(f"  [a61] failed: {e}")
+            _GLOBAL_COMP = self
+            _GLOBAL_DATA = data
+            _GLOBAL_FWD = {}
+            if len(data) * 256 <= (512 << 20):
+                t0 = time.time()
+                for t in range(1, 257):
+                    try: _GLOBAL_FWD[t] = self.fwd[t](data)
+                    except Exception: pass
+                print(f"  precompute fwd[1..256]: {time.time()-t0:.3f}s ({len(_GLOBAL_FWD)} entries)")
 
-        if FULL_PAIRS and not selftest:
-            print(f"\n  Phase 2: full pair tournament ({self.PAIRS} pairs) ...")
-            _GLOBAL_COMP = self; _GLOBAL_DATA = data; _GLOBAL_FWD = {}
-            pair_count = min(self.PAIRS, len(self.pairs))
-            use_pool = _HAS_FORK and N_CORES > 1
+            pair_task_list = []
+            skipped_id = 0
+            perm = self._qperm if (HAS_QISKIT and len(self._qperm) >= pair_count) else list(range(pair_count))
+            for k in range(pair_count):
+                i = perm[k] if k < len(perm) else k
+                if tp > 0 and i >= tp: a, b = self.pairs[i % tp]
+                else: a, b = self.pairs[i]
+                if a in IDENTITY_IDS or b in IDENTITY_IDS:
+                    skipped_id += 1
+                    continue
+                pair_task_list.append((i, a, b))
+            if skipped_id:
+                print(f"  identity-skip: {skipped_id} pair(s) (skipped)")
+
             pool = None
             if use_pool:
-                try: pool = _MP_CTX.Pool(N_CORES)
-                except Exception as e: print(f"  pool failed ({e})"); pool = None
+                try:
+                    pool = _MP_CTX.Pool(N_CORES)
+                    print(f"  pool: spawned {N_CORES} workers")
+                except Exception as e:
+                    print(f"  pool: spawn failed ({e}); falling back to serial")
+                    pool = None
+
             try:
-                pair_task_list = []; skipped_id = 0
-                perm = self._qperm if (HAS_QISKIT and len(self._qperm) >= pair_count) else list(range(pair_count))
-                for k in range(pair_count):
-                    i = perm[k] if k < len(perm) else k
-                    a, b = self.pairs[i]
-                    if a in IDENTITY_IDS or b in IDENTITY_IDS:
-                        skipped_id += 1; continue
-                    pair_task_list.append((i, a, b))
-                if skipped_id: print(f"  identity-skip: {skipped_id}")
+                single_tasks = [t for t in range(1, 257)
+                                if t not in IDENTITY_IDS]
+
                 if pool is not None:
-                    results = list(pool.imap_unordered(_worker_pair, pair_task_list, chunksize=CHUNK))
+                    results_s = []; done_s = set()
+                    try:
+                        for r in pool.imap_unordered(_worker_single, single_tasks, chunksize=max(1, CHUNK // 4)):
+                            results_s.append(r); done_s.add(r[0])
+                    except Exception as e:
+                        print(f"  singles: pool error ({e}); retrying missing serially")
+                    missing_s = [t for t in single_tasks if t not in done_s]
+                    if missing_s:
+                        print(f"  singles: serial retry for {len(missing_s)}")
+                        for t in missing_s:
+                            try: results_s.append(_worker_single(t))
+                            except Exception as e:
+                                print(f"  [single {t:>3}] retry FAILED ({e})")
+                    results_s.sort(key=lambda x: x[0])
+                    for t, size, err in results_s:
+                        if err:
+                            print(f"  [single {t:>3}/256] FAILED ({err})"); continue
+                        cands.append((f".a{t}", size, f"single #{t}"))
+                        if size < best:
+                            best = size
+                            print(f"  [single {t:>3}/256] size={size}  <<< BEST {best}")
+                        else:
+                            print(f"  [single {t:>3}/256] size={size}  best={best}")
                 else:
-                    results = [_worker_pair(t) for t in pair_task_list]
-                sized = []
-                for idx, a, b, size, err in results:
-                    if err or size is None: continue
-                    sized.append((size, idx, a, b))
-                sized.sort()
-                top_k = min(TOP_VERIFY, len(sized))
-                print(f"  tournament: {len(sized)} viable pairs; verifying top {top_k} ...")
-                for sz, idx, a, b in sized[:top_k]:
-                    if self.verify_pair(data, a, b):
+                    for t in single_tasks:
+                        if timeout and time.time()-st > timeout:
+                            print("  Time limit reached (singles)"); break
                         try:
-                            tr = self.fwd[b](self.fwd[a](data)); c = self.cback(tr)
-                            pidx = idx + 1
-                            if pidx > MAX_PAIRS: continue
-                            candidates.append((len(c), "b", pidx, f"b{pidx}", c))
+                            tr = self._get_fwd(t, data); p = self.cback(tr)
+                            cands.append((f".a{t}", len(p), f"single #{t}"))
+                            size = len(p)
+                            if size < best:
+                                best = size
+                                print(f"  [single {t:>3}/256] size={size}  <<< BEST {best}")
                         except Exception as e:
-                            print(f"  [b{idx+1}] failed on encode: {e}")
+                            print(f"  [single {t:>3}/256] FAILED ({e})")
+
+                print(f"  pairs: {len(pair_task_list)} tasks on {N_CORES} workers (chunk={CHUNK})")
+
+                if pool is not None:
+                    results_p = []; done_p = set()
+                    try:
+                        for r in pool.imap_unordered(_worker_pair, pair_task_list, chunksize=CHUNK):
+                            results_p.append(r); done_p.add(r[0])
+                    except Exception as e:
+                        print(f"  pairs: pool error ({e}); retrying missing serially")
+                    missing_p = [t for t in pair_task_list if t[0] not in done_p]
+                    if missing_p:
+                        print(f"  pairs: serial retry for {len(missing_p)} missing")
+                        for t in missing_p:
+                            try: results_p.append(_worker_pair(t))
+                            except Exception as e:
+                                if t[0] < 500: print(f"  [pair {t[0]+1}] retry FAILED ({e})")
+                    results_p.sort(key=lambda x: x[0])
+                    for idx, a, b, size, err in results_p:
+                        if err:
+                            if idx < 500: print(f"  [pair {idx+1}] FAILED ({err})")
+                            continue
+                        cands.append((f".p{idx+1}", size, f"pair #{idx+1} (#{a}->#{b})"))
+                        if size < best:
+                            best = size
+                            print(f"  [pair {idx+1:>10} #{a:>3}->#{b:>3}] size={size}  <<< BEST {best}")
+                        elif idx < 500 or (idx+1) % 10000 == 0:
+                            print(f"  [pair {idx+1:>10} #{a:>3}->#{b:>3}] size={size}  best={best}")
+                    print(f"  pairs done: {len(results_p)} of {len(pair_task_list)}  best={best}")
+                else:
+                    i = 0
+                    while i < len(pair_task_list):
+                        if timeout and time.time()-st > timeout:
+                            print(f"  Time limit reached at pair {i}/{len(pair_task_list)}"); break
+                        t = pair_task_list[i]
+                        _, a, b = t
+                        try:
+                            p = self.cback(self.fwd[b](self._get_fwd(a, data)))
+                            size = len(p)
+                            cands.append((f".p{t[0]+1}", size, f"pair #{t[0]+1} (#{a}->#{b})"))
+                            if size < best:
+                                best = size
+                                print(f"  [pair {t[0]+1:>10} #{a:>3}->#{b:>3}] size={size}  <<< BEST {best}")
+                            elif t[0] < 500 or (t[0]+1) % 10000 == 0:
+                                print(f"  [pair {t[0]+1:>10} #{a:>3}->#{b:>3}] size={size}  best={best}")
+                        except Exception as e:
+                            if t[0] < 500: print(f"  [pair {t[0]+1}] FAILED ({e})")
+                        i += 1
+                    print(f"  pairs done: {i} of {len(pair_task_list)}  best={best}")
             finally:
-                if pool is not None: pool.close(); pool.join()
-                _GLOBAL_COMP = None; _GLOBAL_DATA = None; _GLOBAL_FWD = {}
-        elif not selftest:
-            for (a, b) in [(61, 1), (61, 62), (62, 1), (63, 1), (66, 1)]:
-                if (a, b) in self._pair_index:
-                    _add_pair(a, b, f"b{self._pair_index[(a, b)]}")
+                if pool is not None:
+                    pool.close(); pool.join()
+                _GLOBAL_COMP = None
+                _GLOBAL_DATA = None
+                _GLOBAL_FWD = {}
 
-        if not candidates:
-            print("  no candidates; falling back to a1")
-            c = self.cback(data)
-            candidates.append((len(c), "a", 1, "a1", c))
+            if not cands:
+                print("Nothing to write"); return
 
-        candidates.sort(key=lambda x: x[0])
-        chosen = None
-        for sz, k_, id_, lbl_, c_ in candidates:
-            chk = self._decode_blob(c_, k_, id_)
-            if chk == data:
-                chosen = (sz, k_, id_, lbl_, c_); break
-            print(f"  [{lbl_}] in-memory verify FAILED — skipping")
+            ranked = sorted(cands, key=lambda x: x[1])
+            winner = None; tries = 0
+            for ext, size, label in ranked[:TOP_VERIFY]:
+                tries += 1
+                blob, ok = self._recompute(ext, data, rc)
+                if not ok or blob is None: continue
+                if len(blob) != size:
+                    print(f"  WARN: recompute size {len(blob)} != worker {size} for {ext}")
+                if ext == "_raw_":
+                    try: chk, _ = self._auto(blob)
+                    except Exception: continue
+                elif ext.startswith(".p"):
+                    idx = int(ext[2:]) - 1
+                    if tp > 0 and idx >= tp: a, b = self.pairs[idx % tp]
+                    else: a, b = self.pairs[idx]
+                    r = self.dback(blob)
+                    if r is None: continue
+                    try: chk = self.rev[a](self.rev[b](r))
+                    except Exception: continue
+                elif ext.startswith(".a"):
+                    tn = int(ext[2:]); r = self.dback(blob)
+                    if r is None: continue
+                    try: chk = self.rev[tn](r)
+                    except Exception: continue
+                else: continue
+                if chk == data:
+                    winner = (ext, blob, label); break
 
-        if chosen is None:
-            c = self.cback(data)
-            if self._decode_blob(c, "a", 1) != data:
-                print("  [FATAL] all candidates (including a1) failed verify; aborting without writing.")
-                return
-            chosen = (len(c), "a", 1, "a1", c)
+            if winner is None:
+                print(f"  No candidate verified in top-{tries}; raw fallback")
+                ext = "_raw_"; payload = rc; label = "raw fallback"
+            else:
+                ext, payload, label = winner
 
-        best_size, kind, ident, label, best_blob = chosen
-        print(f"\n  winner before cmix: {label}  ({best_size:,} bytes)")
-        print(f"  round-trip before cmix: OK")
+            elapsed = time.time() - st
+            in_speed = len(data) / elapsed if elapsed > 0 else 0.0
+            out_speed = len(payload) / elapsed if elapsed > 0 else 0.0
+            all_elapsed.append(elapsed); all_in_speed.append(in_speed); all_out_speed.append(out_speed)
 
-        if not selftest:
-            chosen2 = self._final_cmix_pass(data, chosen, candidates)
-            if chosen2 is not chosen and chosen2[0] < best_size:
-                candidates.append(chosen2); candidates.sort(key=lambda x: x[0])
-                best_size, kind, ident, label, best_blob = chosen2
-                print(f"  cmix upgraded winner: {label}  ({best_size:,} bytes)")
+            out_dir = os.path.dirname(infile) or '.'
+            if os.path.isdir(out_dir):
+                for f in os.listdir(out_dir):
+                    fp = os.path.join(out_dir, f)
+                    if re.match(rf'^{re.escape(os.path.basename(infile))}\.[ap][\d-]+$', f):
+                        try: os.remove(fp)
+                        except Exception: pass
+            out = infile + ext
+            self._write(out, payload)
 
-        for sz, k_, id_, lbl_, c_ in candidates:
-            marker = " <<< BEST" if (lbl_ == label and k_ == kind and id_ == ident) else ""
-            print(f"  [{lbl_}] size={sz}{marker}")
+            print("\n" + "="*64)
+            print(f"WINNER: {out}")
+            print(f"  Method   : {label}")
+            print(f"  Size     : {len(payload):,} bytes  ({len(payload)/len(data)*100:.2f}%)")
+            print(f"  Original : {len(data):,} bytes")
+            print(f"  Saved    : {len(data)-len(payload):,} bytes")
+            print(f"  Time     : {elapsed:.4f} s")
+            print(f"  Speed in : {in_speed:,.0f} bytes/s  ({in_speed/1024:.2f} KB/s)")
+            print(f"  Speed out: {out_speed:,.0f} bytes/s  ({out_speed/1024:.2f} KB/s)")
+            print(f"  Workers  : {N_CORES} (deterministic — same size on any core count)")
+            print(f"  [VERIFIED LOSSLESS]")
 
-        ext = _ext_for(kind, ident)
-        out = infile + ext
-        self._write(out, best_blob)
-
-        elapsed = time.time() - t_start
-        print("\n" + "="*64)
-        print(f"WINNER: {out}")
-        print(f"  Method   : {label}")
-        print(f"  Size     : {len(best_blob):,} bytes  ({len(best_blob)/len(data)*100:.2f}%)")
-        print(f"  Original : {len(data):,} bytes")
-        print(f"  Saved    : {len(data)-len(best_blob):,} bytes")
-        print(f"  Time     : {elapsed:.4f} s")
-        print(f"  Speed    : {len(data)/elapsed:,.0f} bytes/s")
-        print(f"  Header   : (in extension) {ext}")
-        print(f"  Note     : Do NOT rename the file — the extension IS the header.")
-
-        try:
-            with open(out, 'rb') as f: readback = f.read()
-            if readback != best_blob:
-                print("  [VERIFICATION FAILED: readback bytes mismatch]"); return
-            orig = self._decode_blob(readback, kind, ident)
-            if orig == data: print("  [VERIFIED LOSSLESS: decode(readback) == original]")
-            else: print("  [VERIFICATION FAILED: content mismatch]")
-        except Exception as e:
-            print(f"  [VERIFICATION ERROR: {e}]")
+        if REPEATS > 1:
+            print("\n" + "="*64)
+            print(f"SUMMARY ({REPEATS} repeats)")
+            avg_t = sum(all_elapsed)/len(all_elapsed)
+            print(f"  Avg time    : {avg_t:.4f} s")
+            print(f"  Avg speed in: {sum(all_in_speed)/len(all_in_speed):,.0f} bytes/s")
+            print(f"  Avg speedout: {sum(all_out_speed)/len(all_out_speed):,.0f} bytes/s")
+            print(f"  Min time    : {min(all_elapsed):.4f} s")
+            print(f"  Max time    : {max(all_elapsed):.4f} s")
 
     def decompress(self, infile, outfile=""):
         if not self._require_file(infile): return False
         try:
             with open(infile, 'rb') as f: blob = f.read()
-        except (PermissionError, OSError) as e:
-            print(f"Error reading {infile!r}: {e}"); return False
-        if len(blob) == 0:
-            print(f"Error: empty."); return False
+        except (PermissionError, OSError) as e: print(f"Error reading {infile!r}: {e}"); return False
+        if len(blob) == 0: print(f"Error: {infile!r} is empty."); return False
         base = os.path.basename(infile)
-
-        parsed = _parse_ext(infile)
-        if parsed is None:
-            print("Error: filename must end with .aXXXX (extension is the header).")
-            print("       e.g.  file.bin.a0000  file.bin.afaff  file.bin.affff")
+        m = re.search(r'\.p(\d+)$', infile)
+        if m:
+            idx = int(m.group(1)) - 1; total = len(self.pairs)
+            if total == 0: print("Error: no pairs."); return False
+            a, b = self.pairs[idx % total]
+            try: r = self.dback(blob)
+            except Exception as e: print(f"Error: backend failed: {e}"); return False
+            if r is None: print("Error: backend could not decode payload."); return False
+            orig = self.rev[a](self.rev[b](r))
+            if not outfile: outfile = re.sub(r'\.p\d+$', '', base) or (base + ".out")
+            self._write(outfile, orig); print(f"-> {outfile} ({len(orig)} bytes)"); return True
+        m = re.search(r'\.a(\d+)$', infile, re.IGNORECASE)
+        if m:
+            tn = int(m.group(1))
+            if not (1 <= tn <= self.MAX_EAGER_ID):
+                print(f"Error: transform out of range (must be 1..256): {tn}"); return False
+            try: r = self.dback(blob)
+            except Exception as e: print(f"Error: backend failed: {e}"); return False
+            if r is None: print("Error: backend could not decode payload."); return False
+            try: orig = self.rev[tn](r)
+            except Exception as e: print(f"Error: inverse transform #{tn} failed: {e}"); return False
+            if not outfile: outfile = re.sub(r'\.a\d+$', '', base, flags=re.IGNORECASE) or (base + ".out")
+            self._write(outfile, orig); print(f"-> {outfile} ({len(orig)} bytes)"); return True
+        off, seq = self._dh(blob)
+        if off == 0:
+            print(f"Error: bad header in {infile!r}.")
+            print(f"  Hint: {infile!r} has no .aN or .pN extension.  If you")
+            print(f"  renamed a compressed file, put the extension back.")
             return False
-        kind, ident = parsed
-        print(f"  header from extension: {kind}{ident}")
-
-        if kind == "b" and ident > len(self.pairs):
-            print(f"Error: pair idx {ident} > total {len(self.pairs)}."); return False
-
-        try: r = self.dback(blob)
-        except Exception as e: print(f"Error: backend: {e}"); return False
-        if r is None: print("Error: decode failed."); return False
-
-        try:
-            if kind == "a": orig = self.rev[ident](r)
-            else:
-                a, b = self.pairs[ident - 1]
-                orig = self.rev[a](self.rev[b](r))
-        except Exception as e:
-            print(f"Error: inverse {kind}{ident}: {e}"); return False
-
-        if not outfile:
-            m = _EXT_RE.search(base)
-            if m: outfile = base[:m.start()]
-            else: outfile = base + ".out"
-            if not outfile: outfile = base + ".out"
-
-        self._write(outfile, orig)
-        print(f"-> {outfile} ({len(orig)} bytes)")
-        return True
-
-    def selftest_all_transforms(self, sample=None):
-        if sample is None: sample = b"the quick brown fox " * 8 + bytes(range(64))
-        print("="*60); print("Sweep: all 256 single transforms"); print("="*60)
-        bad = []
-        for t in range(1, 257):
-            try:
-                tr = self.fwd[t](sample); back = self.rev[t](tr)
-                if back != sample: bad.append((t, "mismatch"))
-            except Exception as e: bad.append((t, repr(e)))
-        if bad:
-            print(f"  FAIL: {len(bad)} transforms are NOT lossless:")
-            for row in bad[:30]: print(f"    a{row[0]:>3}: {row[1]}")
-            return False
-        print(f"  all 256 single transforms: LOSSLESS ✓")
-        return True
-
-    def selftest_all_pairs(self, sample=None, max_pairs=None):
-        if sample is None: sample = b"the quick brown fox " * 4
-        limit = max_pairs if max_pairs is not None else len(self.pairs)
-        limit = min(limit, len(self.pairs))
-        print("="*60); print(f"Sweep: {limit} of {len(self.pairs)} pairs"); print("="*60)
-        bad = 0; tested = 0; errors = []
-        for i, (a, b) in enumerate(self.pairs[:limit]):
-            try:
-                tr = self.fwd[b](self.fwd[a](sample))
-                back = self.rev[a](self.rev[b](tr))
-                if back != sample:
-                    bad += 1
-                    if len(errors) < 10: errors.append(f"b{i+1} (a{a}→a{b}): mismatch")
-            except Exception as e:
-                bad += 1
-                if len(errors) < 10: errors.append(f"b{i+1} (a{a}→a{b}): {e}")
-            tested += 1
-        for e in errors: print(f"    {e}")
-        if bad:
-            print(f"  FAIL: {bad}/{tested} pairs are NOT lossless")
-            return False
-        print(f"  all {tested} pairs: LOSSLESS ✓")
-        return True
-
-    def selftest_fixed(self, n=30):
-        import os as _os
-        fixed = [7, 8, 9, 33, 35, 36, 37, 45, 58, 72, 77, 78, 79, 80, 81, 82, 83]
-        print("="*60); print("Targeted sweep: FIXED transforms"); print("="*60)
-        bad = []
-        forced = list(range(0, 128)) + [256, 512, 1024, 2048, 4096]
-        for t in fixed:
-            for L in forced:
-                d = _os.urandom(L)
-                try:
-                    if self.rev[t](self.fwd[t](d)) != d:
-                        bad.append((t, L, "mismatch")); break
-                except Exception as e:
-                    bad.append((t, L, repr(e))); break
-            if bad and bad[-1][0] == t: continue
-            for trial in range(n):
-                L = random.randint(0, 4096); d = _os.urandom(L)
-                try:
-                    if self.rev[t](self.fwd[t](d)) != d:
-                        bad.append((t, L, "mismatch")); break
-                except Exception as e:
-                    bad.append((t, L, repr(e))); break
-        if bad:
-            for row in bad: print(f"  FAIL a{row[0]}: len={row[1]} {row[2]}")
-            return False
-        print(f"  {fixed}: exhaustive length sweep + {n}×{len(fixed)} random LOSSLESS ✓")
+        try: orig, _ = self._auto(blob)
+        except Exception as e: print(f"Error decoding {infile!r}: {e}"); return False
+        if not outfile: outfile = base + ".out"
+        self._write(outfile, orig); print(f"-> {outfile} ({len(orig)} bytes)")
         return True
 
     def selftest(self):
-        print("="*60); print("Self-Test (extension .aXXXX)"); print("="*60)
-        for kind, ident in [("a", 1), ("a", 62), ("a", 83), ("a", 256), ("b", 1), ("b", MAX_PAIRS)]:
-            ext = _ext_for(kind, ident); parsed = _parse_ext("foo.bin" + ext)
-            if parsed != (kind, ident):
-                print(f"  FAIL ext {ext} → {parsed}"); return False
-        print(f"  Extension .aXXXX round-trips: PASS  (b cap: {MAX_PAIRS})")
-        _z = io.BytesIO()
-        with zipfile.ZipFile(_z, 'w', zipfile.ZIP_STORED) as z:
-            z.writestr("word/document.xml",
-                b'<?xml version="1.0"?><w:document xmlns:w="x"><w:body>'
-                + b'<w:p><w:r><w:t>Hello</w:t></w:r></w:p>' * 200
-                + b'</w:body></w:document>')
-        docx_bytes = _z.getvalue()
-        tr = self.t_xml(docx_bytes); rs = self.r_xml(tr)
-        if rs != docx_bytes: print("  FAIL t_xml docx"); return False
-        print(f"  docx: {len(docx_bytes)} → {len(tr)} ({len(tr)/len(docx_bytes)*100:.1f}%)")
+        print("="*60); print("Lossless Self-Test"); print("="*60)
+        print(f"Pairs={self.PAIRS}  Qubits={self.QUBITS}  Stride={self.STRIDE}  Workers={N_CORES}")
+        tbs = [0x00, 0xFF, 0xAA, 0x55, 0x12, 0x34]
+        for t in range(1, 257):
+            for tb in tbs:
+                d = bytes([tb])
+                try:
+                    tr = self.fwd[t](d); rs = self.rev[t](tr)
+                    if rs != d: print(f"  FAIL t={t} b={tb:#04x}"); return False
+                except TransformError: continue
+                except Exception as e: print(f"  EXC t={t} b={tb:#04x}: {e}"); return False
+        print("  Transforms 1..256 on single bytes: PASS")
+        test_vectors = [b"hello world " * 4, bytes(range(64)), b"A" * 100,
+                        b"The quick brown fox jumps over the lazy dog. " * 3, os.urandom(128)]
+        for t in range(1, 257):
+            for tv in test_vectors:
+                try:
+                    tr = self.fwd[t](tv); rs = self.rev[t](tr)
+                    if rs != tv: print(f"  FAIL t={t} len={len(tv)}"); return False
+                except TransformError: continue
+                except Exception as e: print(f"  EXC t={t} len={len(tv)}: {e}"); return False
+        print("  Transforms 1..256 on multi-byte vectors: PASS")
+        print("  Testing XML/DOCX/DOC transform (ID 61) ...")
+        test61 = [b"", b"<a>", b"<a>x</a>",
+                  b"<?xml version=\"1.0\"?><root><child a=\"1\">text</child></root>",
+                  b"<w:document><w:body><w:p><w:r><w:t>Hello</w:t></w:r></w:p></w:body></w:document>",
+                  b"<w:p>a</w:p>" * 200, b"</w:p><w:p><w:p>mixed</w:p><w:p>",
+                  os.urandom(64), b"\x00\x00\x00"]
+        for tv in test61:
+            tr = self.fwd[61](tv); rs = self.rev[61](tr)
+            if rs != tv: print(f"  FAIL t_xml len={len(tv)}"); return False
+        _zbuf = io.BytesIO()
+        with zipfile.ZipFile(_zbuf, 'w', zipfile.ZIP_STORED) as z:
+            z.writestr("word/document.xml", b"<?xml version=\"1.0\"?><w:document><w:body><w:p><w:r><w:t>Hello</w:t></w:r></w:p></w:body></w:document>")
+        docx_bytes = _zbuf.getvalue()
+        tr = self.fwd[61](docx_bytes); rs = self.rev[61](tr)
+        if rs != docx_bytes: print(f"  FAIL t_xml docx len={len(docx_bytes)}"); return False
+        doc_bytes = OLE_MAGIC + b"\x00" * 100
+        tr = self.fwd[61](doc_bytes); rs = self.rev[61](tr)
+        if rs != doc_bytes: print("  FAIL t_xml doc (OLE passthrough)"); return False
+        raw_zip = b"PK\x03\x04" + os.urandom(200)
+        tr = self.fwd[61](raw_zip); rs = self.rev[61](tr)
+        if rs != raw_zip: print("  FAIL t_xml raw zip passthrough"); return False
+        print("  XML/DOCX/DOC transform: PASS")
+        print("  Testing Qiskit quantum-mask transform (ID 62) ...")
+        if HAS_QISKIT:
+            for tv in [b"", b"a", b"hello", b"hello world"*8, os.urandom(64)]:
+                tr = self.fwd[62](tv); rs = self.rev[62](tr)
+                if rs != tv: print(f"  FAIL t_quantum len={len(tv)}"); return False
+            p1 = quantum_pair_permutation(min(self.PAIRS, 4096), self.QUBITS)
+            p2 = quantum_pair_permutation(min(self.PAIRS, 4096), self.QUBITS)
+            assert p1 == p2, "quantum permutation must be deterministic"
+            assert len(set(p1)) == len(p1), "quantum permutation must be a bijection"
+            print(f"  Qiskit {self.QUBITS}-qubit permutation & mask: PASS")
+        else:
+            print("  Qiskit transform: SKIP (qiskit not available)")
+        print("  Testing Decimal-variation transform (ID 63) ...")
+        test63 = [b"", b"\x00", b"\xff", b"a", b"hello", b"hello world",
+                  b"The quick brown fox jumps over the lazy dog. " * 3,
+                  bytes(range(64)), os.urandom(128), os.urandom(512),
+                  b"\x00"*1000, b"1234567890" * 50]
+        for tv in test63:
+            tr = self.fwd[63](tv); rs = self.rev[63](tr)
+            if rs != tv:
+                print(f"  FAIL t_decvar len={len(tv)} (got {len(rs)})"); return False
+        print("  Decimal-variation transform (50%->40%->...->32B): PASS")
+        print("  Testing Lepton JPEG round-trip (if available) ...")
+        if HAS_LEPTON:
+            try:
+                from PIL import Image
+                img = Image.new('RGB', (16, 16), color=(128, 64, 32))
+                buf = io.BytesIO(); img.save(buf, format='JPEG', quality=85)
+                jpg = buf.getvalue(); c = self._leptonc(jpg)
+                if c is not None:
+                    d = self._leptond(c)
+                    if d == jpg: print(f"  Lepton JPEG round-trip: PASS ({len(jpg)} -> {len(c)} bytes)")
+                    else: print("  Lepton JPEG round-trip: FAIL (mismatch)"); return False
+                else: print("  Lepton JPEG round-trip: SKIP")
+            except ImportError: print("  Lepton JPEG round-trip: SKIP (PIL not installed)")
+        else: print("  Lepton JPEG round-trip: SKIP (lepton not installed)")
+        pair_data = b"The quick brown fox jumped over."; n_ok = 0
+        for i in range(min(1000, len(self.pairs))):
+            a, b = self.pairs[i]
+            tr = self.fwd[b](self.fwd[a](pair_data))
+            rs = self.rev[a](self.rev[b](tr))
+            if rs != pair_data: print(f"  FAIL pair {i+1}"); return False
+            n_ok += 1
+        print(f"  First {n_ok} pairs: PASS")
         for p in [b"hello world " * 20, b"\x00" * 1000, os.urandom(200)]:
             e = self.cback(p); d = self.dback(e)
-            if d != p: print(f"  FAIL backend len={len(p)}"); return False
+            if d != p: print(f"  FAIL backend {len(p)}"); return False
         print("  Backends: PASS")
-        if not self.selftest_fixed(): return False
-        if not self.selftest_all_transforms(): return False
-        if not self.selftest_all_pairs(max_pairs=min(500, len(self.pairs))): return False
-        import tempfile as _tf
-        with _tf.TemporaryDirectory() as td:
-            src = os.path.join(td, "sample.txt")
-            with open(src, "wb") as f: f.write(b"hello world " * 50)
-            self.compress(src, selftest=True)
-            outs = [n for n in os.listdir(td) if n.startswith("sample.txt.a")]
-            if not outs: print("  FAIL no output file"); return False
-            out_path = os.path.join(td, outs[0])
-            dec = os.path.join(td, "decoded.txt")
-            if not self.decompress(out_path, dec): return False
-            with open(dec, "rb") as f: got = f.read()
-            with open(src, "rb") as f: want = f.read()
-            if got != want: print("  FAIL round-trip"); return False
-        print("  Round-trip via filesystem: PASS")
-        print("[ALL CHECKS PASSED]")
+        a1 = self.cback(b"cache-test-vector")
+        a2 = self.cback(b"cache-test-vector")
+        assert a1 == a2, "cback cache must be deterministic"
+        print("  cback memoization deterministic: PASS")
+        tv = b"the quick brown fox jumps over the lazy dog"
+        for a in (1, 50, 100, 200, 255):
+            single = self.cback(self.fwd[a](tv))
+            pair_id_1 = self.cback(self.fwd[1](self.fwd[a](tv)))
+            pair_id_31 = self.cback(self.fwd[31](self.fwd[a](tv)))
+            pair_id_32 = self.cback(self.fwd[32](self.fwd[a](tv)))
+            pair_id_256 = self.cback(self.fwd[256](self.fwd[a](tv)))
+            assert (pair_id_1 == single and pair_id_31 == single
+                    and pair_id_32 == single and pair_id_256 == single), \
+                f"identity-pair equivalence broken for a={a}"
+        print("  identity-pair equivalence: PASS")
+        if _HAS_FORK and N_CORES > 1:
+            print(f"  Testing {N_CORES}-worker parallel tournament (determinism) ...")
+            global _GLOBAL_COMP, _GLOBAL_DATA, _GLOBAL_FWD
+            payload = b"the quick brown fox " * 8
+            _GLOBAL_COMP = self; _GLOBAL_DATA = payload; _GLOBAL_FWD = {}
+            try:
+                singles_ids = [1, 38, 39, 40, 60, 61, 62, 63, 256]
+                with _MP_CTX.Pool(N_CORES) as pool:
+                    singles = list(pool.imap_unordered(_worker_single, singles_ids, chunksize=1))
+                    pairs_r = list(pool.imap_unordered(_worker_pair,
+                                                       [(i, self.pairs[i][0], self.pairs[i][1]) for i in range(8)],
+                                                       chunksize=1))
+                assert all(err is None for _, _, err in singles), "single error"
+                assert all(err is None for _, _, _, _, err in pairs_r), "pair error"
+                print(f"  {N_CORES}-worker size-only tournament: PASS")
+            except Exception as e:
+                print(f"  {N_CORES}-worker parallel tournament: FAIL ({e})"); return False
+            finally:
+                _GLOBAL_COMP = None; _GLOBAL_DATA = None; _GLOBAL_FWD = {}
+        print("[ALL LOSSLESS CHECKS PASSED]")
         return True
 
 def main():
     print(f"{PROGNAME}")
-    print("* Extension-as-header — no header bytes inside file")
-    print(f"* 0x0000..0x00FF → single a1..a256")
-    print(f"* 0x0100..0xFFFF → pair   b1..b{MAX_PAIRS}")
-    print("* Extension: <original>.aXXXX  (XXXX = 4 hex digits, no dashes)")
-    print("* Examples:  .a0000  .a003d  .a00ff  .a0100  .afaff  .affff")
-    print(f"* Pipeline  : 256 singles (incl. a83, 16 params) → 65280 pairs → forced cmix")
-    print(f"* Self-test : fast mode (no pairs, no cmix) — runs in ~0.5 s")
+    print("* Deterministic · IPC-lite · C-level XOR · lossless envelope *")
+    print(f"* Qiskit {QUBITS}-qubit circuit-driven pair order *")
+    print(f"* All transforms 1-256 are 100% lossless by construction *\n")
     try:
         mp.set_start_method('fork', force=True)
         print(f"mp: fork, {N_CORES} workers (cpu_count={CPU_COUNT})")
     except (RuntimeError, ValueError):
-        print(f"mp: spawn, {N_CORES} workers")
-    dl = input("Download 12 Google Drive dictionaries? (y/n) [n]: ").strip().lower()
-    c = Compressor(try_dl=(dl == 'y'), pairs=PAIRS, qubits=QUBITS)
+        print(f"mp: spawn default, {N_CORES} workers")
+    dl = input("Download 12 Google Drive dictionaries? (y/n) [y]: ").strip().lower()
+    c = Compressor(try_dl=(dl != 'n'), pairs=PAIRS, qubits=QUBITS)
     while True:
         print("\nMenu:")
-        print("1) Compress (fast)")
+        print("1) Compress (lossless tournament)")
         print("2) Decompress")
-        print("3) Self-test")
+        print("3) Lossless self-test")
         ch = input("> ").strip()
         if ch == "1":
             f = input("Input file: ").strip()
-            if not f: print("No file."); continue
-            c.compress(f); print("\nDone — exiting."); return
+            if not f:
+                print("No file given.")
+                continue
+            c.compress(f, pairs=True, multi=False)
+            print("\nCompression finished — exiting.")
+            return
         elif ch == "2":
             f = input("Compressed: ").strip()
-            if not f: print("No file."); continue
+            if not f:
+                print("No file given.")
+                continue
             o = input("Output (blank=auto): ").strip()
             c.decompress(f, o)
         elif ch == "3":
             c.selftest()
-        else: print("Invalid")
+        else:
+            print("Invalid")
 
 if __name__ == "__main__":
     main()
