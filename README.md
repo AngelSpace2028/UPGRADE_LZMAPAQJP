@@ -34,4 +34,4 @@ Have written by Jurijus Pacalovas in September 25 in 2026 year
 
 PJP-9
 
-The best of the best JP 
+The best of the best JPQ3
