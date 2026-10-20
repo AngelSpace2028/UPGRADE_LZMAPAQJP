@@ -12,12 +12,6 @@
 #   [C19] a83: parametrized minus. 5-byte header (v:u16, x:u16, n:u8).
 #   [C20] a83 expanded to 16 parameter sets (incl. u64 words).
 #   [C21] selftest() uses fast path: skips pair tournament + forced cmix.
-#   [C22] a38/a39/a40: added 8-byte SHA-256[:8] trailer for 100% lossless
-#         integrity check.  New magic bytes 0x38/0x39/0x3a.  Old archives
-#         (magic 0x00) still decode — backward compatible.
-#   [C23] FIXED: sentinel collision on empty strings. Changed empty return
-#         value from b'\x00' to b'' across all transforms. This fixes the
-#         "len=1 mismatch" failure in self-tests (e.g., a35 outputting b'\x00').
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -1141,7 +1135,7 @@ class Compressor:
 
     def t_xml(self, d):
         if not d:
-            return b''
+            return b'\x00'
         if d[:8] == OLE_MAGIC:
             return b'\x03' + d
         if d[:4] == ZIP_MAGIC:
@@ -1288,25 +1282,25 @@ class Compressor:
         return bytes(t)
     r01 = t01
     def t02(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         t = bytearray(d); pi = (len(d)+sum(d)) % 256; pv = self._pat(4, pi); xv = pv[1]
         for i in range(1, len(t), 4): t[i] ^= xv
         return bytes([pi]) + bytes(t)
     def r02(self, d):
-        if not d: return b''
+        if d == b'\x00': return b''
         if len(d) < 2: raise TransformError("T02")
         pi = d[0]; t = bytearray(d[1:]); pv = self._pat(4, pi); xv = pv[1]
         for i in range(1, len(t), 4): t[i] ^= xv
         return bytes(t)
     def t03(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         t = bytearray(d); rot = (len(d)*13 + sum(d)) % 8
         if rot == 0: rot = 1
         tab = self._rot_tab(rot)
         for i in range(2, len(t), 5): t[i] = tab[t[i]]
         return bytes([rot]) + bytes(t)
     def r03(self, d):
-        if not d: return b''
+        if d == b'\x00': return b''
         if len(d) < 2: raise TransformError("T03")
         rot = d[0]; t = bytearray(d[1:]); tab = self._irot_tab(rot)
         for i in range(2, len(t), 5): t[i] = tab[t[i]]
@@ -1354,7 +1348,7 @@ class Compressor:
         return d.translate(self._t06_inv)
 
     def t07(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         L = len(d)
         p = nearest_prime(L % 256) & 0xFF
         sh = L % len(self.PI)
@@ -1365,7 +1359,8 @@ class Compressor:
             out[i] = (d[i] ^ p ^ pr[i % len(pr)] ^ (i & 0xFF) ^ r) & 0xFF
         return bytes(out)
     def r07(self, d):
-        if not d: return b''
+        if d == b'\x00': return b''
+        if not d: raise TransformError("a7 empty")
         L = len(d)
         p = nearest_prime(L % 256) & 0xFF
         sh = L % len(self.PI)
@@ -1377,7 +1372,7 @@ class Compressor:
         return bytes(out)
 
     def t08(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         L = len(d)
         p = nearest_prime((L * 3 + 7) % 256) & 0xFF
         sh = (L * 5) % len(self.PI)
@@ -1388,7 +1383,8 @@ class Compressor:
             out[i] = (d[i] ^ p ^ pr[i % len(pr)] ^ r) & 0xFF
         return bytes(out)
     def r08(self, d):
-        if not d: return b''
+        if d == b'\x00': return b''
+        if not d: raise TransformError("a8 empty")
         L = len(d)
         p = nearest_prime((L * 3 + 7) % 256) & 0xFF
         sh = (L * 5) % len(self.PI)
@@ -1400,7 +1396,7 @@ class Compressor:
         return bytes(out)
 
     def t09(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         L = len(d)
         p = nearest_prime((L * 13 + 3) % 256) & 0xFF
         sd = self._seed(L % len(self.seeds), L)
@@ -1412,7 +1408,8 @@ class Compressor:
             out[i] = (d[i] ^ p ^ sd ^ pr[i % len(pr)] ^ (i & 0xFF) ^ r) & 0xFF
         return bytes(out)
     def r09(self, d):
-        if not d: return b''
+        if d == b'\x00': return b''
+        if not d: raise TransformError("a9 empty")
         L = len(d)
         p = nearest_prime((L * 13 + 3) % 256) & 0xFF
         sd = self._seed(L % len(self.seeds), L)
@@ -1425,14 +1422,14 @@ class Compressor:
         return bytes(out)
 
     def t10(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         cnt = sum(1 for i in range(len(d)-1) if d[i:i+2] == b'X1')
         n = (((cnt*2)+1)//3)*3 % 256
         t = bytearray(d)
         for i in range(len(t)): t[i] ^= n
         return bytes([n]) + bytes(t)
     def r10(self, d):
-        if not d: return b''
+        if not d: raise TransformError("T10")
         n = d[0]; t = bytearray(d[1:])
         for i in range(len(t)): t[i] ^= n
         return bytes(t)
@@ -1457,14 +1454,14 @@ class Compressor:
         return (int.from_bytes(d, 'big') ^ int.from_bytes(m, 'big')).to_bytes(L, 'big')
     r12 = t12
     def t13(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         r = self._reps(d); cv = len(d) % 256
         for _ in range(r): cv = self._np(cv)
         t = bytearray(d); xv = cv
         for i in range(len(t)): t[i] ^= xv
         return bytes([(r-1) % 256]) + bytes(t)
     def r13(self, d):
-        if not d: return b''
+        if d == b'\x00': return b''
         if len(d) < 2: raise TransformError("T13")
         r = (d[0]+1) % 256
         if r == 0: r = 256
@@ -1474,19 +1471,19 @@ class Compressor:
         for i in range(len(t)): t[i] ^= xv
         return bytes(t)
     def t14(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         return d + bytes([sum(d) % 256])
     def r14(self, d):
-        if not d: return b''
+        if not d: raise TransformError("T14")
         return d[:-1]
     def t15(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         t = bytearray(d); pi = len(d) % 256; pv = self._pat(3, pi); xv = pv[0]
         tab = self._add_tab(xv)
         for i in range(0, len(t), 3): t[i] = tab[t[i]]
         return bytes([pi]) + bytes(t)
     def r15(self, d):
-        if not d: return b''
+        if d == b'\x00': return b''
         if len(d) < 2: raise TransformError("T15")
         pi = d[0]; t = bytearray(d[1:]); pv = self._pat(3, pi); xv = pv[0]
         tab = self._sub_tab(xv)
@@ -1545,7 +1542,7 @@ class Compressor:
         try: return base64.b64decode(d, validate=False)
         except Exception as e: raise TransformError(f"b64: {e}")
     def t23(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         try: text = d.decode('utf-8')
         except UnicodeDecodeError: return b'\x00' + d
         toks = re.split(r'([A-Za-z0-9_]+)', text); wl = []; wi = {}; ts = []
@@ -1690,7 +1687,7 @@ class Compressor:
             chars.append(_6TOCH[v])
         return ''.join(chars).encode('utf-8')
     def t28(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         pad = (3 - len(d) % 3) % 3; p = d + b'\x00'*pad
         o = bytearray([pad])
         for i in range(0, len(p), 3):
@@ -1698,7 +1695,8 @@ class Compressor:
             o.extend(((v-k) % (1<<24)).to_bytes(3, 'little'))
         return bytes(o)
     def r28(self, d):
-        if not d: return b''
+        if d == b'\x00': return b''
+        if not d: raise TransformError("T28")
         pad = d[0]; p = d[1:]
         if len(p) % 3 != 0: raise TransformError("T28 l")
         o = bytearray()
@@ -1719,7 +1717,7 @@ class Compressor:
             if c == 0: break
         return bk
     def t29(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         k = self._best16(d)
         pad = (3 - len(d) % 3) % 3; p = d + b'\x00'*pad
         o = bytearray([pad]) + k.to_bytes(2, 'little')
@@ -1728,7 +1726,7 @@ class Compressor:
             o.extend(((v-k) % (1<<24)).to_bytes(3, 'little'))
         return bytes(o)
     def r29(self, d):
-        if not d: return b''
+        if d == b'\x00': return b''
         if len(d) < 3: raise TransformError("T29")
         pad = d[0]; k = int.from_bytes(d[1:3], 'little'); p = d[3:]
         if len(p) % 3 != 0: raise TransformError("T29 l")
@@ -1739,7 +1737,7 @@ class Compressor:
         if pad: o = o[:-pad]
         return bytes(o)
     def t30(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         pad = (3 - len(d) % 3) % 3; p = d + b'\x00'*pad
         vals = [int.from_bytes(p[i:i+3], 'little') for i in range(0, len(p), 3)]
         mean = sum(vals)//len(vals); sv = sorted(vals); med = sv[len(sv)//2]
@@ -1759,7 +1757,7 @@ class Compressor:
             o.extend(((v-bk) % (1<<24)).to_bytes(3, 'little'))
         return bytes(o)
     def r30(self, d):
-        if not d: return b''
+        if d == b'\x00': return b''
         if len(d) < 4: raise TransformError("T30")
         pad = d[0]; k = int.from_bytes(d[1:4], 'little'); p = d[4:]
         if len(p) % 3 != 0: raise TransformError("T30 l")
@@ -1775,7 +1773,7 @@ class Compressor:
     r32 = t32
 
     def _t33(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         bits = []
         for b in d:
             for i in range(7, -1, -1): bits.append((b >> i) & 1)
@@ -1892,33 +1890,35 @@ class Compressor:
         return bytes(o[:ol])
 
     def t35(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         L = len(d); key = b"A35|" + struct.pack('>Q', L)
         fwd, _ = self._sbox_perm(key); out = bytearray(L)
         for i in range(L): out[i] = fwd[d[i]] ^ ((i * 0x37 + L) & 0xFF)
         return bytes(out)
     def r35(self, d):
-        if not d: return b''
+        if d == b'\x00': return b''
+        if not d: raise TransformError("a35 empty")
         L = len(d); key = b"A35|" + struct.pack('>Q', L)
         _, inv = self._sbox_perm(key); out = bytearray(L)
         for i in range(L): out[i] = inv[d[i] ^ ((i * 0x37 + L) & 0xFF)]
         return bytes(out)
     def t36(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         L = len(d); key = b"A36|" + struct.pack('>Q', L)
         fwd, _ = self._sbox_perm(key); p = nearest_prime((L * 3 + 5) % 256) & 0xFF
         out = bytearray(L)
         for i in range(L): out[i] = fwd[d[i]] ^ p ^ ((i * 0x1D + 0x9E) & 0xFF)
         return bytes(out)
     def r36(self, d):
-        if not d: return b''
+        if d == b'\x00': return b''
+        if not d: raise TransformError("a36 empty")
         L = len(d); key = b"A36|" + struct.pack('>Q', L)
         _, inv = self._sbox_perm(key); p = nearest_prime((L * 3 + 5) % 256) & 0xFF
         out = bytearray(L)
         for i in range(L): out[i] = inv[d[i] ^ p ^ ((i * 0x1D + 0x9E) & 0xFF)]
         return bytes(out)
     def t37(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         L = len(d); BS = 1024; out = bytearray(); out.extend(L.to_bytes(4, 'big'))
         for bi in range((L + BS - 1) // BS):
             s = bi * BS; e = min(s + BS, L); ch = d[s:e]
@@ -1928,7 +1928,7 @@ class Compressor:
             out.extend(blk)
         return bytes(out)
     def r37(self, d):
-        if not d: return b''
+        if d == b'\x00': return b''
         if len(d) < 4: raise TransformError("a37 short")
         L = int.from_bytes(d[:4], 'big'); body = d[4:]; BS = 1024; out = bytearray()
         for bi in range((L + BS - 1) // BS):
@@ -1940,7 +1940,7 @@ class Compressor:
 
     def _t38(self, d):
         BS = 1024; tb = (len(d) + BS - 1) // BS
-        o = bytearray(b'\x38' + struct.pack('>I', len(d)))
+        o = bytearray(b'\x00' + struct.pack('>I', len(d)))
         for bi in range(tb):
             s = bi * BS; e = min(s + BS, len(d)); blk_len = e - s
             ch = d[s:e] + b'\x00' * (BS - blk_len)
@@ -1954,20 +1954,11 @@ class Compressor:
                         (blk_len >> 8) & 0xFF, blk_len & 0xFF,
                         (ck >> 8) & 0xFF, ck & 0xFF])
             o += c
-        o += hashlib.sha256(d).digest()[:8]
         return bytes(o)
     def _r38(self, d):
         if len(d) < 5: raise TransformError("FLT28 short")
-        magic = d[0]
-        if magic == 0x00:
-            has_trailer = False; body = d
-        elif magic == 0x38:
-            if len(d) < 13: raise TransformError("FLT28 short trailer")
-            has_trailer = True
-            stored = d[-8:]; body = d[:-8]
-        else:
-            raise TransformError("FLT28 magic")
-        ol = int.from_bytes(body[1:5], 'big'); p = body[5:]; pos = 0; dec = bytearray()
+        if d[0] != 0: raise TransformError("FLT28 magic")
+        ol = int.from_bytes(d[1:5], 'big'); p = d[5:]; pos = 0; dec = bytearray()
         while pos < len(p):
             if pos + 8 > len(p): raise TransformError("FLT28 hdr")
             n = p[pos] | (p[pos + 1] << 8); cl = (p[pos + 2] << 8) | p[pos + 3]
@@ -1987,14 +1978,11 @@ class Compressor:
             if blk_len > len(t): raise TransformError("FLT28 blk_len")
             dec.extend(t[:blk_len])
         if len(dec) < ol: raise TransformError(f"FLT28 short {len(dec)}<{ol}")
-        result = bytes(dec[:ol])
-        if has_trailer and hashlib.sha256(result).digest()[:8] != stored:
-            raise TransformError("FLT28 trailer mismatch")
-        return result
+        return bytes(dec[:ol])
 
     def _t39(self, d):
         BS = 32; tb = (len(d) + BS - 1) // BS
-        o = bytearray(b'\x39' + struct.pack('>I', len(d)))
+        o = bytearray(b'\x00' + struct.pack('>I', len(d)))
         for bi in range(tb):
             s = bi * BS; e = min(s + BS, len(d)); blk_len = e - s
             ch = d[s:e] + b'\x00' * (BS - blk_len)
@@ -2005,20 +1993,11 @@ class Compressor:
                         (blk_len >> 8) & 0xFF, blk_len & 0xFF,
                         (ck >> 8) & 0xFF, ck & 0xFF])
             o += c
-        o += hashlib.sha256(d).digest()[:8]
         return bytes(o)
     def _r39(self, d):
         if len(d) < 5: raise TransformError("FLT29 short")
-        magic = d[0]
-        if magic == 0x00:
-            has_trailer = False; body = d
-        elif magic == 0x39:
-            if len(d) < 13: raise TransformError("FLT29 short trailer")
-            has_trailer = True
-            stored = d[-8:]; body = d[:-8]
-        else:
-            raise TransformError("FLT29 magic")
-        ol = int.from_bytes(body[1:5], 'big'); p = body[5:]; pos = 0; dec = bytearray()
+        if d[0] != 0: raise TransformError("FLT29 magic")
+        ol = int.from_bytes(d[1:5], 'big'); p = d[5:]; pos = 0; dec = bytearray()
         while pos < len(p):
             if pos + 8 > len(p): raise TransformError("FLT29 hdr")
             n = p[pos] | (p[pos + 1] << 8); cl = (p[pos + 2] << 8) | p[pos + 3]
@@ -2033,14 +2012,11 @@ class Compressor:
             if blk_len > len(b): raise TransformError("FLT29 blk_len")
             dec.extend(b[:blk_len])
         if len(dec) < ol: raise TransformError(f"FLT29 short {len(dec)}<{ol}")
-        result = bytes(dec[:ol])
-        if has_trailer and hashlib.sha256(result).digest()[:8] != stored:
-            raise TransformError("FLT29 trailer mismatch")
-        return result
+        return bytes(dec[:ol])
 
     def _t40(self, d):
         BS = 33; tb = (len(d) + BS - 1) // BS
-        o = bytearray(b'\x3a' + struct.pack('>I', len(d)))
+        o = bytearray(b'\x00' + struct.pack('>I', len(d)))
         for bi in range(tb):
             s = bi * BS; e = min(s + BS, len(d)); blk_len = e - s
             ch = d[s:e] + b'\x00' * (BS - blk_len)
@@ -2049,20 +2025,11 @@ class Compressor:
             o += enc + bytes([(len(c) >> 8) & 0xFF, len(c) & 0xFF])
             o += bytes([(blk_len >> 8) & 0xFF, blk_len & 0xFF])
             o += c
-        o += hashlib.sha256(d).digest()[:8]
         return bytes(o)
     def _r40(self, d):
         if len(d) < 5: raise TransformError("FLT30 short")
-        magic = d[0]
-        if magic == 0x00:
-            has_trailer = False; body = d
-        elif magic == 0x3a:
-            if len(d) < 13: raise TransformError("FLT30 short trailer")
-            has_trailer = True
-            stored = d[-8:]; body = d[:-8]
-        else:
-            raise TransformError("FLT30 magic")
-        ol = int.from_bytes(body[1:5], 'big'); p = body[5:]; pos = 0; dec = bytearray(); bi = 0
+        if d[0] != 0: raise TransformError("FLT30 magic")
+        ol = int.from_bytes(d[1:5], 'big'); p = d[5:]; pos = 0; dec = bytearray(); bi = 0
         while pos < len(p):
             if pos >= len(p): raise TransformError("FLT30 eof")
             Ln = p[pos]; pos += 1
@@ -2080,10 +2047,7 @@ class Compressor:
             if blk_len > len(b): raise TransformError("FLT30 blk_len")
             dec.extend(b[:blk_len]); bi += 1
         if len(dec) < ol: raise TransformError(f"FLT30 short {len(dec)}<{ol}")
-        result = bytes(dec[:ol])
-        if has_trailer and hashlib.sha256(result).digest()[:8] != stored:
-            raise TransformError("FLT30 trailer mismatch")
-        return result
+        return bytes(dec[:ol])
 
     def t41(self, d):
         if not d: return b''
@@ -2238,7 +2202,7 @@ class Compressor:
             c = (mid, key, masks); self._cdd_cache[n4] = c
         return c
     def t_cdd(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         L = len(d); n4 = L // 4; tail = bytes(d[n4 * 4:])
         if n4 == 0: return b'\x01' + struct.pack('>I', L) + bytes(d)
         mid, key, masks = self._cdd_masks(n4); t = bytearray(d[:n4 * 4])
@@ -2778,7 +2742,7 @@ class Compressor:
         if L % 2: out[-1] = d[-1] ^ 0x3C
         return bytes(out)
     def t_zero_pack(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         out = bytearray(); i = 0; n = len(d)
         while i < n:
             if d[i] == 0:
@@ -2788,6 +2752,7 @@ class Compressor:
             else: out.append(d[i]); i += 1
         return bytes(out)
     def r_zero_pack(self, d):
+        if d == b'\x00': return b''
         if not d: return b''
         out = bytearray(); i = 0; n = len(d)
         while i < n:
@@ -2833,7 +2798,7 @@ class Compressor:
             out[j] = d[k] ^ ((k * 0x1F + 0x7A) & 0xFF)
         return bytes(out)
     def t_rle_xor(self, d):
-        if not d: return b''
+        if not d: return b'\x00'
         out = bytearray(); i = 0; n = len(d)
         while i < n:
             v = d[i]; j = i
@@ -2841,8 +2806,8 @@ class Compressor:
             run = j - i; out.append(run & 0xFF); out.append(v ^ (run & 0xFF)); i = j
         return bytes(out)
     def r_rle_xor(self, d):
-        if not d: return b''
-        if len(d) % 2: raise TransformError("rle_xor")
+        if d == b'\x00': return b''
+        if not d or len(d) % 2: raise TransformError("rle_xor")
         out = bytearray()
         for i in range(0, len(d), 2):
             run = d[i]
@@ -2943,7 +2908,7 @@ class Compressor:
             f, r = self._dyn(i); eager_f[i] = f; eager_r[i] = r
         eager_f[256] = self.t256; eager_r[256] = self.r256
         self.fwd = eager_f; self.rev = eager_r
-        print(f"Transforms registered: 1-83 explicit + 84-255 dynamic space + 256 identity.")
+        print(f"Transforms registered: 1-83 explicit + 84-255 dynamic + 256 identity.")
 
     def _pairs(self):
         self.pairs = []
@@ -2952,7 +2917,7 @@ class Compressor:
                 if a == 256 and b == 256: continue
                 self.pairs.append((a, b))
         self._pair_index = {p: i + 1 for i, p in enumerate(self.pairs)}
-        print(f"Pairs: {len(self.pairs):,} pairs (header cap: {MAX_PAIRS:,})")
+        print(f"Pair space: {len(self.pairs):,} pairs (header cap: {MAX_PAIRS:,})")
 
     def _write(self, path, data):
         dd = os.path.dirname(path) or '.'
@@ -3188,7 +3153,7 @@ class Compressor:
         print(f"  Time     : {elapsed:.4f} s")
         print(f"  Speed    : {len(data)/elapsed:,.0f} bytes/s")
         print(f"  Header   : (in extension) {ext}")
-        print(f"  Note     : Do NOT rename the file — the extension IS the sample header.")
+        print(f"  Note     : Do NOT rename the file — the extension IS the header.")
 
         try:
             with open(out, 'rb') as f: readback = f.read()
