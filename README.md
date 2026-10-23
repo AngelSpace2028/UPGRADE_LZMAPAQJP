@@ -30,7 +30,7 @@ Checked:
 I use markers for my paq: use 1-2 bytes; also use 1 byte: uses 00 63 00 00 or 28 B5 2F FD
 
 Here is Portfolio UPGRADE_LZMAPAQJP
-Have written by Jurijus Pacalovas in September 25 in 2026 year
+Have written by Jurijus Pacalovas in 2026 year in Oct 23
 
 PJP-9
 
