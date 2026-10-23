@@ -3,7 +3,7 @@ UPGRADE_LZMAPAQJP It’s Theory Information mostly for Quantum Compression, Comp
 PAQJPVG_8.5-4 Replit App by Jurijus Pacalovas 8.5L-4 PAQ level 9 and zstandard level 22 app
 
 
-PJP-10 The best PAQ level default and zstandard level 22 Done all 2026 year in May 6 by Jurijus Pacalovas
+JPQ3 The best 22 Done all 2026 year in Oct 23 by Jurijus Pacalovas
 
 
 
