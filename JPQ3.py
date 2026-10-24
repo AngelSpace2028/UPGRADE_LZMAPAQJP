@@ -12,6 +12,13 @@
 #   [C19] a83: parametrized minus. 5-byte header (v:u16, x:u16, n:u8).
 #   [C20] a83 expanded to 16 parameter sets (incl. u64 words).
 #   [C21] selftest() uses fast path: skips pair tournament + forced cmix.
+#   [C22] _EXT_RE accepts trailing junk after .aXXXX
+#         (.tmp<mkstemp>, "x...", anything non-hex).  This makes
+#         decompress() handle:
+#             Example6.7.extract.txt.a0000
+#             Example6.7.extract.txt.a0000.tmpqp1gcncg
+#             Example6.7.extract.txt.a0000x...
+#         all → Example6.7.extract.txt
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -705,7 +712,16 @@ def _decode_header(hdr):
     if v < 0x100: return "a", v + 1
     return "b", v - 0xFF
 
-_EXT_RE = re.compile(r'\.a([0-9a-fA-F]{4})$')
+# ══════════════════════════════════════════════════════════════════════
+# [C22] — CHANGED LINE.  Old regex:
+#     _EXT_RE = re.compile(r'\.a([0-9a-fA-F]{4})$')
+# New regex accepts trailing non-hex junk:
+#     .a0000                          → match .a0000
+#     .a0000.tmpqp1gcncg              → match .a0000
+#     .a0000x...                      → match .a0000
+#     .a0000abc                       → NO match (a,b,c are hex → ambiguous)
+# ══════════════════════════════════════════════════════════════════════
+_EXT_RE = re.compile(r'\.a([0-9a-fA-F]{4})(?![0-9a-fA-F])')
 
 def _ext_for(kind, ident):
     hdr = _encode_header(kind, ident)
@@ -719,9 +735,9 @@ def _parse_ext(fname):
     if v < 0x100: return "a", v + 1
     return "b", v - 0xFF
 
-# ═══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # COMPRESSOR
-# ═══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 class Compressor:
     TIMEOUT = 300; VS = False; USE_MP = True
     TOP_K = 100; FAST = True; BLOCK = 4096
@@ -3179,6 +3195,7 @@ class Compressor:
         if parsed is None:
             print("Error: filename must end with .aXXXX (extension is the header).")
             print("       e.g.  file.bin.a0000  file.bin.afaff  file.bin.affff")
+            print("       Trailing .tmp<...> or junk after .aXXXX is now tolerated.")
             return False
         kind, ident = parsed
         print(f"  header from extension: {kind}{ident}")
@@ -3283,6 +3300,20 @@ class Compressor:
             if parsed != (kind, ident):
                 print(f"  FAIL ext {ext} → {parsed}"); return False
         print(f"  Extension .aXXXX round-trips: PASS  (b cap: {MAX_PAIRS})")
+
+        # [C22] test trailing-junk filenames
+        for name, want in [
+            ("Example6.7.extract.txt.a0000",                   ("a", 1)),
+            ("Example6.7.extract.txt.a0000.tmpqp1gcncg",       ("a", 1)),
+            ("Example6.7.extract.txt.a0000x",                  ("a", 1)),
+            ("Example6.7.extract.txt.a0000x...",               ("a", 1)),
+            ("foo.bin.a0100",                                  ("b", 1)),
+        ]:
+            got = _parse_ext(name)
+            if got != want:
+                print(f"  FAIL trailing-junk {name!r} → {got}"); return False
+        print("  Trailing-junk (.tmp…/x…) parsing: PASS")
+
         _z = io.BytesIO()
         with zipfile.ZipFile(_z, 'w', zipfile.ZIP_STORED) as z:
             z.writestr("word/document.xml",
@@ -3324,6 +3355,9 @@ def main():
     print(f"* 0x0100..0xFFFF → pair   b1..b{MAX_PAIRS}")
     print("* Extension: <original>.aXXXX  (XXXX = 4 hex digits, no dashes)")
     print("* Examples:  .a0000  .a003d  .a00ff  .a0100  .afaff  .affff")
+    print("* Trailing junk after .aXXXX is tolerated:")
+    print("    Example6.7.extract.txt.a0000.tmpqp1gcncg")
+    print("    Example6.7.extract.txt.a0000x...")
     print(f"* Pipeline  : 256 singles (incl. a83, 16 params) → 65280 pairs → forced cmix")
     print(f"* Self-test : fast mode (no pairs, no cmix) — runs in ~0.5 s")
     try:
