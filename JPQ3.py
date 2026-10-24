@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 written by Jurijus Pacalovas
+#!/usr/bin/env python3 written by Jurijus Pacalovas __
 # -*- coding: utf-8 -*-
 # PPMD_1.6 — Lossless Tournament + XML structural v2 + Qiskit mask
 # + wide-base minus transforms (a77-a82) + parametrized minus (a83)
