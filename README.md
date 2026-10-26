@@ -34,4 +34,4 @@ Have written by Jurijus Pacalovas in 2026 year in Oct 23
 
 PJP-9
 
-The best of the best JPQ4 win example: .txt 5-16 times, .jpg 29% .mp3 23% .docx 24%
+The best of the best JPQ4 win better then .zip, 7zip, ear and some paq archives, example: .txt 5-16 times, .jpg 29% .mp3 23% .docx 24%
