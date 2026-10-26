@@ -1,5 +1,5 @@
 #!/usr/bin/env python3 written by Jurijus Pacalovas
-# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*- _
 # PPMD_1.6 — Lossless Tournament + XML structural v3 ("XY"/"XZ"/"XW") + Qiskit mask
 # + wide-base minus transforms (a77-a83) + 22-family diverse filler (a84-a255)
 # EXTENSION-AS-HEADER — saves the 2 bytes inside the file
