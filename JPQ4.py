@@ -3372,6 +3372,89 @@ class Compressor:
         if not d: return b''
         return self._xor_pattern(d, self.pattern47)
     r47 = t47
+
+    # ─── a48–a56 (previously missing) ───────────────────────────────
+    def t48(self, d):
+        """a48: XOR with repeating golden-ratio 8-byte pattern."""
+        if not d: return b''
+        pat = (0x9E3779B97F4A7C15).to_bytes(8, 'big')
+        return self._xor_pattern(d, pat)
+    r48 = t48
+
+    def t49(self, d):
+        """a49: XOR with LCG keystream seeded from length."""
+        if not d: return b''
+        s = ((len(d) * 0x9E3779B1) ^ 0xDEADBEEF) & 0xFFFFFFFF
+        out = bytearray(len(d))
+        for i in range(len(d)):
+            s = (s * 1664525 + 1013904223) & 0xFFFFFFFF
+            out[i] = d[i] ^ ((s >> 16) & 0xFF)
+        return bytes(out)
+    r49 = t49
+
+    def t50(self, d):
+        """a50: XOR with Fibonacci byte stream."""
+        if not d: return b''
+        out = bytearray(d); fb = self.fib; L = len(d)
+        for i in range(L): out[i] ^= fb[i % len(fb)] & 0xFF
+        return bytes(out)
+    r50 = t50
+
+    def t51(self, d):
+        """a51: byte reverse."""
+        if not d: return b''
+        return bytes(d[::-1])
+    r51 = t51
+
+    def t52(self, d):
+        """a52: XOR with position-dependent mask (i*0x37+0x5A)."""
+        if not d: return b''
+        return bytes(d[i] ^ ((i * 0x37 + 0x5A) & 0xFF) for i in range(len(d)))
+    r52 = t52
+
+    def t53(self, d):
+        """a53: XOR with rotated pi-digit stream."""
+        if not d: return b''
+        L = len(d); sh = L % len(self.PI)
+        pr = self.PI[sh:] + self.PI[:sh]
+        out = bytearray(L)
+        for i in range(L): out[i] = d[i] ^ pr[i % len(pr)]
+        return bytes(out)
+    r53 = t53
+
+    def t54(self, d):
+        """a54: ADD position-dependent mask (i*0x1B+0x2F)."""
+        if not d: return b''
+        out = bytearray(len(d))
+        for i in range(len(d)):
+            out[i] = (d[i] + ((i * 0x1B + 0x2F) & 0xFF)) & 0xFF
+        return bytes(out)
+    def r54(self, d):
+        if not d: return b''
+        out = bytearray(len(d))
+        for i in range(len(d)):
+            out[i] = (d[i] - ((i * 0x1B + 0x2F) & 0xFF)) & 0xFF
+        return bytes(out)
+
+    def t55(self, d):
+        """a55: XOR with prime-number stream."""
+        if not d: return b''
+        out = bytearray(d); L = len(d); P = PRIMES
+        for i in range(L): out[i] ^= P[i % len(P)]
+        return bytes(out)
+    r55 = t55
+
+    def t56(self, d):
+        """a56: reverse each 8-byte group (last group may be shorter)."""
+        if not d: return b''
+        n = len(d); o = bytearray(d); w = 8
+        for i in range(0, n, w):
+            chunk = d[i:i + w]
+            o[i:i + len(chunk)] = chunk[::-1]
+        return bytes(o)
+    r56 = t56
+    # ─────────────────────────────────────────────────────────────────
+
     def t59(self, d):
         if not d: return b''
         ri = self.ref_idx; out = bytearray(); last = 0
@@ -4022,7 +4105,7 @@ class Compressor:
         eager_f[38] = self._t38; eager_r[38] = self._r38
         eager_f[39] = self._t39; eager_r[39] = self._r39
         eager_f[40] = self._t40; eager_r[40] = self._r40
-        for i in (41,42,43,44,45,46,47):
+        for i in range(41, 57):        # 41..47 + 48..56 all registered now
             eager_f[i] = getattr(self, f"t{i}"); eager_r[i] = getattr(self, f"r{i}")
         eager_f[57] = self.t57; eager_r[57] = self.r57
         eager_f[58] = self.t58; eager_r[58] = self.r58
