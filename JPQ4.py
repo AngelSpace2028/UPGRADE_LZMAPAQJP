@@ -1,36 +1,8 @@
 #!/usr/bin/env python3 written by Jurijus Pacalovas
-# -*- coding: utf-8 -*- _
-# PPMD_1.6 — Lossless Tournament + XML structural v3 ("XY"/"XZ"/"XW") + Qiskit mask
+# -*- coding: utf-8 -*-
+# PPMD_1.6 — Lossless Tournament + XML structural v3 (XY/XZ/XW/XC/XD/XE) + Qiskit mask
 # + wide-base minus transforms (a77-a83) + 22-family diverse filler (a84-a255)
 # EXTENSION-AS-HEADER — saves the 2 bytes inside the file
-#
-# [C16] a77/a78/a79: 32-bit word minus
-# [C17] QUBIT_LIMIT=1024
-# [C18] a80/a81/a82: 8192-bit word minus
-# [C19] a83: parametrised minus, 5-byte header
-# [C20] a83: 16 parameter sets
-# [C21] selftest() fast path
-# [C22] _EXT_RE accepts trailing junk after .aXXXX
-# [C23] DOCX seeds — XML structural v3
-#        "XY" 0x59 magic = seeded varint
-#        "XZ" 0x5A magic = seeded bit-packed
-#        "XW" 0x5B magic = seeded varint + word-tokenized text chunks  [C27]
-# [C24] a84-a255: 22 distinct algorithm families
-# [C25] a61 = container-aware DOCX/ZIP transform (see t_docx):
-#        preserves per-entry method/date/extra/CRC/layout verbatim,
-#        XML-structurally re-encodes .xml/.rels (modes 1/2),
-#        word-token re-encode of text chunks (also modes 1/2),
-#        Lepton-coded JPEG (mode 4, byte-identical only),  [C28]
-#        and relies on _final_cmix_pass for the outer chain.
-# [C26] Block-Huffman prefix codes width 2,3,8,16,…,2^24
-#        (mode 2 wraps XML structural payloads; DOCX mode 2 wraps
-#        per-entry XML).
-# [C27] Word-token text encoding inside XML structural payload:
-#        uses self.ref_idx (~260k words). Skipped automatically if
-#        ref_idx is empty. Consumes decode via _GLOBAL_REF_* globals.
-# [C28] Lepton JPEG for .jpg/.jpeg/.jpe DOCX entries. Only when
-#        _find_deflate_params can reproduce the original deflate so
-#        that reconstruction stays byte-identical to the input DOCX.
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -644,6 +616,126 @@ _DOCX_TAGS  = list(dict.fromkeys(_DOCX_TAGS))
 _DOCX_ATTRS = list(dict.fromkeys(_DOCX_ATTRS))
 _DOCX_VALS  = list(dict.fromkeys(_DOCX_VALS))
 
+_DOCX_COMPOUND_SEEDS_RAW = [
+    (b'w:jc',        [(b'w:val', b'center')]),
+    (b'w:jc',        [(b'w:val', b'both')]),
+    (b'w:jc',        [(b'w:val', b'left')]),
+    (b'w:jc',        [(b'w:val', b'right')]),
+    (b'w:jc',        [(b'w:val', b'distribute')]),
+    (b'w:jc',        [(b'w:val', b'start')]),
+    (b'w:sz',        [(b'w:val', b'24')]),
+    (b'w:sz',        [(b'w:val', b'22')]),
+    (b'w:sz',        [(b'w:val', b'20')]),
+    (b'w:sz',        [(b'w:val', b'28')]),
+    (b'w:sz',        [(b'w:val', b'32')]),
+    (b'w:sz',        [(b'w:val', b'36')]),
+    (b'w:szCs',      [(b'w:val', b'24')]),
+    (b'w:szCs',      [(b'w:val', b'22')]),
+    (b'w:szCs',      [(b'w:val', b'28')]),
+    (b'w:b',         [(b'w:val', b'1')]),
+    (b'w:b',         [(b'w:val', b'0')]),
+    (b'w:b',         []),
+    (b'w:bCs',       []),
+    (b'w:i',         []),
+    (b'w:iCs',       []),
+    (b'w:u',         [(b'w:val', b'single')]),
+    (b'w:color',     [(b'w:val', b'000000')]),
+    (b'w:color',     [(b'w:val', b'1F1F1F')]),
+    (b'w:color',     [(b'w:val', b'2E74B5')]),
+    (b'w:color',     [(b'w:val', b'auto')]),
+    (b'w:color',     [(b'w:val', b'auto'), (b'w:themeColor', b'text1')]),
+    (b'w:pStyle',    [(b'w:val', b'Normal')]),
+    (b'w:pStyle',    [(b'w:val', b'Heading 1')]),
+    (b'w:pStyle',    [(b'w:val', b'Heading 2')]),
+    (b'w:pStyle',    [(b'w:val', b'Heading 3')]),
+    (b'w:pStyle',    [(b'w:val', b'Title')]),
+    (b'w:pStyle',    [(b'w:val', b'Subtitle')]),
+    (b'w:rStyle',    [(b'w:val', b'Hyperlink')]),
+    (b'w:rFonts',    [(b'w:ascii', b'Calibri'), (b'w:hAnsi', b'Calibri')]),
+    (b'w:rFonts',    [(b'w:ascii', b'Arial'), (b'w:hAnsi', b'Arial')]),
+    (b'w:rFonts',    [(b'w:ascii', b'Times New Roman'),
+                      (b'w:hAnsi', b'Times New Roman')]),
+    (b'w:rFonts',    [(b'w:asciiTheme', b'minorHAnsi'),
+                      (b'w:hAnsiTheme', b'minorHAnsi')]),
+    (b'w:lang',      [(b'w:val', b'en-US')]),
+    (b'w:lang',      [(b'w:val', b'en-GB')]),
+    (b'w:vertAlign', [(b'w:val', b'superscript')]),
+    (b'w:vertAlign', [(b'w:val', b'subscript')]),
+    (b'w:pgSz',      [(b'w:w', b'12240'), (b'w:h', b'15840')]),
+    (b'w:pgSz',      [(b'w:w', b'11906'), (b'w:h', b'16838')]),
+    (b'w:pgMar',     [(b'w:top', b'1440'), (b'w:right', b'1440'),
+                      (b'w:bottom', b'1440'), (b'w:left', b'1440'),
+                      (b'w:header', b'720'), (b'w:footer', b'720'),
+                      (b'w:gutter', b'0')]),
+    (b'w:spacing',   [(b'w:after', b'0'), (b'w:line', b'240'),
+                      (b'w:lineRule', b'auto')]),
+    (b'w:spacing',   [(b'w:before', b'0'), (b'w:after', b'0')]),
+    (b'w:ind',       [(b'w:firstLine', b'720')]),
+    (b'w:ind',       [(b'w:left', b'720')]),
+    (b'w:rPr',       []),
+    (b'w:pPr',       []),
+    (b'w:p',         []),
+    (b'w:r',         []),
+    (b'w:t',         [(b'xml:space', b'preserve')]),
+    (b'w:t',         []),
+    (b'w:body',      []),
+    (b'w:document',  []),
+    (b'w:sectPr',    []),
+    (b'w:tbl',       []),
+    (b'w:tr',        []),
+    (b'w:tc',        []),
+    (b'w:hyperlink', [(b'r:id', b'rId1')]),
+    (b'w:bookmarkStart', [(b'w:id', b'0'), (b'w:name', b'_GoBack')]),
+    (b'w:proofErr', [(b'w:type', b'spellStart')]),
+    (b'w:proofErr', [(b'w:type', b'spellEnd')]),
+    (b'w:proofErr', [(b'w:type', b'gramStart')]),
+    (b'w:proofErr', [(b'w:type', b'gramEnd')]),
+    (b'w:rsid',     []),
+    (b'w:lang',     [(b'w:eastAsia', b'en-US')]),
+    (b'w:tab',      []),
+    (b'w:br',       []),
+    (b'w:lastRenderedPageBreak', []),
+    (b'w:keepNext', []),
+    (b'w:keepLines', []),
+    (b'w:widowControl', [(b'w:val', b'0')]),
+    (b'w:pageBreakBefore', []),
+    (b'w:outlineLvl', [(b'w:val', b'0')]),
+    (b'w:outlineLvl', [(b'w:val', b'1')]),
+    (b'w:outlineLvl', [(b'w:val', b'2')]),
+    (b'w:shd',      [(b'w:val', b'clear'), (b'w:color', b'auto'),
+                     (b'w:fill', b'FFFFFF')]),
+    (b'w:tblW',     [(b'w:w', b'0'), (b'w:type', b'auto')]),
+    (b'w:tblLayout', [(b'w:type', b'autofit')]),
+    (b'w:tblStyle', [(b'w:val', b'TableGrid')]),
+    (b'w:tcW',      [(b'w:w', b'0'), (b'w:type', b'auto')]),
+    (b'w:highlight', [(b'w:val', b'none')]),
+    (b'w:caps',     []),
+    (b'w:smallCaps', []),
+    (b'w:strike',   []),
+    (b'w:dstrike',  []),
+    (b'w:vanish',   []),
+    (b'w:noProof',  []),
+]
+
+def _build_compound_seed():
+    tag_idx  = {t: i for i, t in enumerate(_DOCX_TAGS)}
+    attr_idx = {a: i for i, a in enumerate(_DOCX_ATTRS)}
+    val_idx  = {v: i for i, v in enumerate(_DOCX_VALS)}
+    out = []
+    for tag_b, attrs_b in _DOCX_COMPOUND_SEEDS_RAW:
+        ti = tag_idx.get(tag_b)
+        if ti is None: continue
+        pairs = []; ok = True
+        for a_b, v_b in attrs_b:
+            ai = attr_idx.get(a_b); vi = val_idx.get(v_b)
+            if ai is None or vi is None: ok = False; break
+            pairs.append((ai, vi))
+        if ok: out.append((ti, tuple(pairs)))   # FIX #1: tuple, not list
+    return out
+
+_DOCX_COMPOUNDS_SEED = _build_compound_seed()
+print(f"Compound seed: {len(_DOCX_COMPOUNDS_SEED)} pre-defined OOXML combos")
+
 OLE_MAGIC = b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'
 ZIP_MAGIC = b'PK\x03\x04'
 _ZIP_CENTRAL_SIG   = b'PK\x01\x02'
@@ -707,6 +799,45 @@ def _read_varint(buf, pos):
         if not (b & 0x80): return n, pos
         sh += 7
         if sh > 63: raise TransformError("varint overflow")
+
+def _word_encode_text(text, ref_idx):
+    out = bytearray()
+    last = 0
+    for m in _TOK_RE.finditer(text):
+        if m.start() > last:
+            out.append(0); _emit_varint(out, m.start() - last)
+            out += text[last:m.start()]
+        tok_orig = m.group(0); tok_low = tok_orig.lower()
+        i = ref_idx.get(tok_low)
+        if i is not None and i < (1 << 30):
+            if   tok_orig == tok_low:                code = (i << 2) | 0
+            elif tok_orig == tok_low.capitalize():   code = (i << 2) | 1
+            elif tok_orig == tok_low.upper():        code = (i << 2) | 2
+            else:                                    code = None
+            if code is not None:
+                _emit_varint(out, code + 1)
+                last = m.end()
+                continue
+        out.append(0); _emit_varint(out, len(tok_orig)); out += tok_orig
+        last = m.end()
+    if last < len(text):
+        out.append(0); _emit_varint(out, len(text) - last); out += text[last:]
+    return bytes(out)
+
+def _word_decode_text(blob, rb, rcap, rup):
+    out = bytearray(); p = 0; nb = len(blob)
+    while p < nb:
+        code, p = _read_varint(blob, p)
+        if code == 0:
+            ln, p = _read_varint(blob, p); out += blob[p:p+ln]; p += ln
+        else:
+            x = code - 1; i = x >> 2; c = x & 3
+            if i >= len(rb): raise TransformError(f"words idx {i}>={len(rb)}")
+            if   c == 0: out += rb[i]
+            elif c == 1: out += rcap[i]
+            elif c == 2: out += rup[i]
+            else:        raise TransformError(f"words case {c}")
+    return bytes(out)
 
 def _rdb(bits, pos, n):
     v = 0
@@ -894,8 +1025,6 @@ def _xml_encode_v2(d):
     return bytes(out)
 
 def _xml_encode_v2_words(d, ref_idx):
-    """Word-tokenized text chunks ('XW' / 0x5B magic). Byte-identical round-trip
-    is guaranteed provided the decoder sees the same global ref dict."""
     if not d or not ref_idx: return None
     toks = list(_xml_scan_tokens(d))
     if not toks: return None
@@ -922,31 +1051,7 @@ def _xml_encode_v2_words(d, ref_idx):
             struct.append(2); _emit_varint(struct, _idx_or_add(tag_names, payload))
         else:
             struct.append(3); _emit_varint(struct, len(text_chunks)); text_chunks.append(payload)
-
-    def _word_encode(text):
-        out = bytearray()
-        last = 0
-        for m in _TOK_RE.finditer(text):
-            if m.start() > last:
-                out.append(0); _emit_varint(out, m.start() - last); out += text[last:m.start()]
-            tok_orig = m.group(0); tok_low = tok_orig.lower()
-            i = ref_idx.get(tok_low)
-            if i is not None and i < (1 << 30):
-                if tok_orig == tok_low:                code = (i << 2) | 0
-                elif tok_orig == tok_low.capitalize(): code = (i << 2) | 1
-                elif tok_orig == tok_low.upper():      code = (i << 2) | 2
-                else:                                  code = None
-                if code is not None:
-                    _emit_varint(out, code + 1)
-                    last = m.end()
-                    continue
-            out.append(0); _emit_varint(out, len(tok_orig)); out += tok_orig
-            last = m.end()
-        if last < len(text):
-            out.append(0); _emit_varint(out, len(text) - last); out += text[last:]
-        return bytes(out)
-
-    encoded_texts = [_word_encode(t) for t in text_chunks]
+    encoded_texts = [_word_encode_text(t, ref_idx) for t in text_chunks]
     out = bytearray([0x58, 0x5B])
     for lst, seed in zip((tag_names, attr_names, attr_vals),
                          (_DOCX_TAGS, _DOCX_ATTRS, _DOCX_VALS)):
@@ -956,6 +1061,201 @@ def _xml_encode_v2_words(d, ref_idx):
     _emit_varint(out, len(struct)); out += struct
     _emit_varint(out, len(encoded_texts))
     for t in encoded_texts: _emit_varint(out, len(t)); out += t
+    return bytes(out)
+
+def _xml_encode_v3_compound(d, ref_idx):
+    if not d or not ref_idx:
+        return None
+    toks = list(_xml_scan_tokens(d))
+    if not toks:
+        return None
+
+    tag_names  = list(_DOCX_TAGS)
+    attr_names = list(_DOCX_ATTRS)
+    attr_vals  = list(_DOCX_VALS)
+    compounds  = list(_DOCX_COMPOUNDS_SEED)
+    compound_idx = {c: i for i, c in enumerate(compounds)}
+
+    def _add_compound(ti, attr_pairs):
+        key = (ti, tuple(attr_pairs))
+        i = compound_idx.get(key)
+        if i is None:
+            i = len(compounds); compounds.append(key); compound_idx[key] = i
+        return i
+
+    text_chunks = []
+    struct = bytearray()
+    for kind, payload in toks:
+        if kind == 0:
+            struct.append(0)
+            _emit_varint(struct, len(text_chunks)); text_chunks.append(payload)
+        elif kind == 1:
+            name, attrs_raw, selfclose = payload
+            ti = _idx_or_add(tag_names, name)
+            ams = list(_XML_ATTR_RE.finditer(attrs_raw))
+            attr_pairs = []
+            for am in ams:
+                aname = am.group(1)
+                aval  = am.group(2) if am.group(2) is not None else am.group(3)
+                ai = _idx_or_add(attr_names, aname)
+                vi = _idx_or_add(attr_vals,  aval)
+                attr_pairs.append((ai, vi))
+            if attr_pairs:
+                ci = _add_compound(ti, attr_pairs)
+                struct.append(2 if selfclose else 1)
+                _emit_varint(struct, ci)
+            else:
+                struct.append(4 if selfclose else 5)
+                _emit_varint(struct, ti)
+        elif kind == 2:
+            struct.append(3)
+            _emit_varint(struct, _idx_or_add(tag_names, payload))
+        else:
+            struct.append(0)
+            _emit_varint(struct, len(text_chunks)); text_chunks.append(payload)
+
+    encoded_texts = [_word_encode_text(t, ref_idx) for t in text_chunks]
+    out = bytearray([0x58, 0x5C])
+    for lst, seed in zip((tag_names, attr_names, attr_vals),
+                         (_DOCX_TAGS, _DOCX_ATTRS, _DOCX_VALS)):
+        new_items = lst[len(seed):]
+        _emit_varint(out, len(new_items))
+        for s in new_items:
+            _emit_varint(out, len(s)); out += s
+    new_compounds = compounds[len(_DOCX_COMPOUNDS_SEED):]
+    _emit_varint(out, len(new_compounds))
+    for (ti, pairs) in new_compounds:
+        _emit_varint(out, ti)
+        _emit_varint(out, len(pairs))
+        for ai, vi in pairs:
+            _emit_varint(out, ai); _emit_varint(out, vi)
+    _emit_varint(out, len(struct)); out += struct
+    _emit_varint(out, len(encoded_texts))
+    for t in encoded_texts:
+        _emit_varint(out, len(t)); out += t
+    return bytes(out)
+
+def _xml_encode_v4_localdict(d):
+    if not d:
+        return None
+    toks = list(_xml_scan_tokens(d))
+    if not toks:
+        return None
+    freq = Counter()
+    for kind, payload in toks:
+        if kind not in (0, 3):
+            continue
+        last = 0
+        for m in _TOK_RE.finditer(payload):
+            if m.start() > last:
+                freq[payload[last:m.start()]] += 1
+            freq[m.group(0).lower()] += 1
+            last = m.end()
+        if last < len(payload):
+            freq[payload[last:]] += 1
+    candidates = []
+    for chunk, count in freq.items():
+        cost = len(chunk) + 1
+        escape_per = 1 + 1 + len(chunk)
+        encoded_per = 2
+        benefit = (escape_per - encoded_per) * count - cost
+        if benefit > 0:
+            candidates.append((benefit, chunk))
+    candidates.sort(reverse=True)
+    local_words = [c for _, c in candidates[:4096]]
+    local_idx = {c: i for i, c in enumerate(local_words)}
+
+    tag_names  = list(_DOCX_TAGS)
+    attr_names = list(_DOCX_ATTRS)
+    attr_vals  = list(_DOCX_VALS)
+    compounds  = list(_DOCX_COMPOUNDS_SEED)
+    compound_idx = {c: i for i, c in enumerate(compounds)}
+
+    def _add_compound(ti, attr_pairs):
+        key = (ti, tuple(attr_pairs))
+        i = compound_idx.get(key)
+        if i is None:
+            i = len(compounds); compounds.append(key); compound_idx[key] = i
+        return i
+
+    def encode_text(text):
+        out = bytearray(); last = 0
+        def emit_chunk(chunk):
+            i = local_idx.get(chunk)
+            if i is not None:
+                _emit_varint(out, ((i << 2) | 3) + 1)
+            else:
+                out.append(0); _emit_varint(out, len(chunk)); out.extend(chunk)   # FIX #2
+        for m in _TOK_RE.finditer(text):
+            if m.start() > last:
+                emit_chunk(text[last:m.start()])
+            tok_orig = m.group(0); tok_low = tok_orig.lower()
+            i = local_idx.get(tok_low)
+            done = False
+            if i is not None:
+                if   tok_orig == tok_low:               case = 0
+                elif tok_orig == tok_low.capitalize():  case = 1
+                elif tok_orig == tok_low.upper():       case = 2
+                else:                                   case = -1
+                if case >= 0:
+                    _emit_varint(out, ((i << 2) | case) + 1)
+                    done = True
+            if not done:
+                out.append(0); _emit_varint(out, len(tok_orig)); out.extend(tok_orig)   # FIX #2 (cosmetic)
+            last = m.end()
+        if last < len(text):
+            emit_chunk(text[last:])
+        return bytes(out)
+
+    struct = bytearray()
+    text_chunks = []
+    for kind, payload in toks:
+        if kind in (0, 3):
+            struct.append(0); _emit_varint(struct, len(text_chunks)); text_chunks.append(payload)
+        elif kind == 1:
+            name, attrs_raw, selfclose = payload
+            ti = _idx_or_add(tag_names, name)
+            ams = list(_XML_ATTR_RE.finditer(attrs_raw))
+            attr_pairs = []
+            for am in ams:
+                aname = am.group(1)
+                aval  = am.group(2) if am.group(2) is not None else am.group(3)
+                ai = _idx_or_add(attr_names, aname)
+                vi = _idx_or_add(attr_vals,  aval)
+                attr_pairs.append((ai, vi))
+            if attr_pairs:
+                ci = _add_compound(ti, attr_pairs)
+                struct.append(2 if selfclose else 1)
+                _emit_varint(struct, ci)
+            else:
+                struct.append(4 if selfclose else 5)
+                _emit_varint(struct, ti)
+        elif kind == 2:
+            struct.append(3); _emit_varint(struct, _idx_or_add(tag_names, payload))
+
+    encoded_texts = [encode_text(t) for t in text_chunks]
+
+    out = bytearray([0x58, 0x5D])
+    for lst, seed in zip((tag_names, attr_names, attr_vals),
+                         (_DOCX_TAGS, _DOCX_ATTRS, _DOCX_VALS)):
+        new_items = lst[len(seed):]
+        _emit_varint(out, len(new_items))
+        for s in new_items:
+            _emit_varint(out, len(s)); out += s
+    new_compounds = compounds[len(_DOCX_COMPOUNDS_SEED):]
+    _emit_varint(out, len(new_compounds))
+    for (ti, pairs) in new_compounds:
+        _emit_varint(out, ti)
+        _emit_varint(out, len(pairs))
+        for ai, vi in pairs:
+            _emit_varint(out, ai); _emit_varint(out, vi)
+    _emit_varint(out, len(local_words))
+    for w in local_words:
+        _emit_varint(out, len(w)); out += w
+    _emit_varint(out, len(struct)); out += struct
+    _emit_varint(out, len(encoded_texts))
+    for t in encoded_texts:
+        _emit_varint(out, len(t)); out += t
     return bytes(out)
 
 def _xml_decode_v2_words_impl(payload):
@@ -977,23 +1277,7 @@ def _xml_decode_v2_words_impl(payload):
     for _ in range(n_text):
         ln, pos = _read_varint(payload, pos)
         encoded_texts.append(payload[pos:pos+ln]); pos += ln
-
-    def _word_decode(blob):
-        out = bytearray(); p = 0; nb = len(blob)
-        while p < nb:
-            code, p = _read_varint(blob, p)
-            if code == 0:
-                ln, p = _read_varint(blob, p); out += blob[p:p+ln]; p += ln
-            else:
-                x = code - 1; i = x >> 2; c = x & 3
-                if i >= len(rb): raise TransformError(f"words idx {i}>={len(rb)}")
-                if c == 0: out += rb[i]
-                elif c == 1: out += rcap[i]
-                elif c == 2: out += rup[i]
-                else: raise TransformError(f"words case {c}")
-        return bytes(out)
-
-    texts = [_word_decode(et) for et in encoded_texts]
+    texts = [_word_decode_text(et, rb, rcap, rup) for et in encoded_texts]
     out = bytearray(); sp = 0
     while sp < len(struct):
         op = struct[sp]; sp += 1
@@ -1013,11 +1297,382 @@ def _xml_decode_v2_words_impl(payload):
         else: raise TransformError(f"xml v2w op {op}")
     return bytes(out)
 
+def _xml_decode_v3_compound(payload):
+    if _GLOBAL_REF_BYTES is None:
+        raise TransformError("compound variant requires global ref dict")
+    rb = _GLOBAL_REF_BYTES; rcap = _GLOBAL_REF_CAP; rup = _GLOBAL_REF_UP
+    if len(payload) < 2 or payload[0] != 0x58 or payload[1] != 0x5C:
+        raise TransformError("compound magic")
+    pos = 2
+    dicts = [list(_DOCX_TAGS), list(_DOCX_ATTRS), list(_DOCX_VALS)]
+    for idx in range(3):
+        cnt, pos = _read_varint(payload, pos)
+        for _ in range(cnt):
+            ln, pos = _read_varint(payload, pos)
+            dicts[idx].append(payload[pos:pos+ln]); pos += ln
+    tag_names, attr_names, attr_vals = dicts
+    compounds = list(_DOCX_COMPOUNDS_SEED)
+    n_new, pos = _read_varint(payload, pos)
+    for _ in range(n_new):
+        ti,    pos = _read_varint(payload, pos)
+        n_att, pos = _read_varint(payload, pos)
+        pairs = []
+        for _ in range(n_att):
+            ai, pos = _read_varint(payload, pos)
+            vi, pos = _read_varint(payload, pos)
+            pairs.append((ai, vi))
+        compounds.append((ti, pairs))
+    struct_len, pos = _read_varint(payload, pos)
+    struct = payload[pos:pos+struct_len]; pos += struct_len
+    n_text, pos = _read_varint(payload, pos)
+    encoded_texts = []
+    for _ in range(n_text):
+        ln, pos = _read_varint(payload, pos)
+        encoded_texts.append(payload[pos:pos+ln]); pos += ln
+    texts = [_word_decode_text(et, rb, rcap, rup) for et in encoded_texts]
+    out = bytearray(); sp = 0
+    while sp < len(struct):
+        op = struct[sp]; sp += 1
+        if op == 0:
+            idx, sp = _read_varint(struct, sp); out += texts[idx]
+        elif op in (1, 2):
+            ci, sp = _read_varint(struct, sp)
+            ti, pairs = compounds[ci]
+            out += b'<' + tag_names[ti]
+            for ai, vi in pairs:
+                out += b' ' + attr_names[ai] + b'="' + attr_vals[vi] + b'"'
+            out += b'/>' if op == 2 else b'>'
+        elif op == 3:
+            ti, sp = _read_varint(struct, sp)
+            out += b'</' + tag_names[ti] + b'>'
+        elif op in (4, 5):
+            ti, sp = _read_varint(struct, sp)
+            out += b'<' + tag_names[ti] + (b'/>' if op == 4 else b'>')
+        else:
+            raise TransformError(f"compound op {op}")
+    return bytes(out)
+
+def _xml_decode_v4_localdict(payload):
+    if len(payload) < 2 or payload[0] != 0x58 or payload[1] != 0x5D:
+        raise TransformError("localdict magic")
+    pos = 2
+    dicts = [list(_DOCX_TAGS), list(_DOCX_ATTRS), list(_DOCX_VALS)]
+    for idx in range(3):
+        cnt, pos = _read_varint(payload, pos)
+        for _ in range(cnt):
+            ln, pos = _read_varint(payload, pos)
+            dicts[idx].append(payload[pos:pos+ln]); pos += ln
+    tag_names, attr_names, attr_vals = dicts
+    compounds = list(_DOCX_COMPOUNDS_SEED)
+    n_new, pos = _read_varint(payload, pos)
+    for _ in range(n_new):
+        ti,    pos = _read_varint(payload, pos)
+        n_att, pos = _read_varint(payload, pos)
+        pairs = []
+        for _ in range(n_att):
+            ai, pos = _read_varint(payload, pos)
+            vi, pos = _read_varint(payload, pos)
+            pairs.append((ai, vi))
+        compounds.append((ti, pairs))
+    n_words, pos = _read_varint(payload, pos)
+    local_words = []
+    for _ in range(n_words):
+        ln, pos = _read_varint(payload, pos)
+        local_words.append(payload[pos:pos+ln]); pos += ln
+    struct_len, pos = _read_varint(payload, pos)
+    struct = payload[pos:pos+struct_len]; pos += struct_len
+    n_text, pos = _read_varint(payload, pos)
+    encoded_texts = []
+    for _ in range(n_text):
+        ln, pos = _read_varint(payload, pos)
+        encoded_texts.append(payload[pos:pos+ln]); pos += ln
+    def decode_text(blob):
+        out = bytearray(); p = 0; nb = len(blob)
+        while p < nb:
+            code, p = _read_varint(blob, p)
+            if code == 0:
+                ln, p = _read_varint(blob, p)
+                out += blob[p:p+ln]; p += ln
+            else:
+                x = code - 1; i = x >> 2; c = x & 3
+                if i >= len(local_words):
+                    raise TransformError(f"localdict idx {i}>={len(local_words)}")
+                w = local_words[i]
+                if   c == 0: out += w
+                elif c == 1: out += w.capitalize()
+                elif c == 2: out += w.upper()
+                elif c == 3: out += w
+                else:        raise TransformError(f"localdict case {c}")
+        return bytes(out)
+    texts = [decode_text(et) for et in encoded_texts]
+    out = bytearray(); sp = 0
+    while sp < len(struct):
+        op = struct[sp]; sp += 1
+        if op == 0:
+            idx, sp = _read_varint(struct, sp); out += texts[idx]
+        elif op in (1, 2):
+            ci, sp = _read_varint(struct, sp)
+            ti, pairs = compounds[ci]
+            out += b'<' + tag_names[ti]
+            for ai, vi in pairs:
+                out += b' ' + attr_names[ai] + b'="' + attr_vals[vi] + b'"'
+            out += b'/>' if op == 2 else b'>'
+        elif op == 3:
+            ti, sp = _read_varint(struct, sp)
+            out += b'</' + tag_names[ti] + b'>'
+        elif op in (4, 5):
+            ti, sp = _read_varint(struct, sp)
+            out += b'<' + tag_names[ti] + (b'/>' if op == 4 else b'>')
+        else:
+            raise TransformError(f"localdict op {op}")
+    return bytes(out)
+
+# ------------------------------------------------------------------
+#  0x5E — nested-compound encoding (intra-document subtree dedup)
+# ------------------------------------------------------------------
+def _xml_encode_v5_nested(d, ref_idx):
+    """
+    0x5E — nested-compound encoding.
+    Same flat pass as 0x5C, but detects balanced no-text subtrees (typically
+    <w:rPr>...</w:rPr> and <w:pPr>...</w:pPr>) and hoists each unique one into
+    a reusable "nested compound".  Each reuse becomes op 6 + varint = ~2 bytes.
+    """
+    if not d or not ref_idx:
+        return None
+    toks = list(_xml_scan_tokens(d))
+    if not toks:
+        return None
+
+    tag_names  = list(_DOCX_TAGS)
+    attr_names = list(_DOCX_ATTRS)
+    attr_vals  = list(_DOCX_VALS)
+    compounds  = list(_DOCX_COMPOUNDS_SEED)
+    compound_idx = {c: i for i, c in enumerate(compounds)}
+
+    def _add_compound(ti, attr_pairs):
+        key = (ti, tuple(attr_pairs))
+        i = compound_idx.get(key)
+        if i is None:
+            i = len(compounds); compounds.append(key); compound_idx[key] = i
+        return i
+
+    # ---- PASS 1: flat encode + collect candidate subtrees ----
+    text_chunks = []
+    struct_flat = bytearray()
+    stack = []           # [tag_idx, start_pos, has_text]
+    candidates = []      # (start, end, sig_bytes)
+
+    for kind, payload in toks:
+        if kind == 0:
+            struct_flat.append(0)
+            _emit_varint(struct_flat, len(text_chunks))
+            text_chunks.append(payload)
+            for e in stack: e[2] = True
+        elif kind == 1:
+            name, attrs_raw, selfclose = payload
+            ti = _idx_or_add(tag_names, name)
+            ams = list(_XML_ATTR_RE.finditer(attrs_raw))
+            attr_pairs = []
+            for am in ams:
+                aname = am.group(1)
+                aval  = am.group(2) if am.group(2) is not None else am.group(3)
+                ai = _idx_or_add(attr_names, aname)
+                vi = _idx_or_add(attr_vals,  aval)
+                attr_pairs.append((ai, vi))
+            start = len(struct_flat)
+            if attr_pairs:
+                ci = _add_compound(ti, attr_pairs)
+                struct_flat.append(2 if selfclose else 1)
+                _emit_varint(struct_flat, ci)
+            else:
+                struct_flat.append(4 if selfclose else 5)
+                _emit_varint(struct_flat, ti)
+            if not selfclose:
+                stack.append([ti, start, False])
+        elif kind == 2:
+            name = payload
+            ti = _idx_or_add(tag_names, name)
+            struct_flat.append(3)
+            _emit_varint(struct_flat, ti)
+            if stack and stack[-1][0] == ti:
+                _, start, has_text = stack.pop()
+                if not has_text:
+                    end = len(struct_flat)
+                    sig = bytes(struct_flat[start:end])
+                    if len(sig) >= 3:
+                        candidates.append((start, end, sig))
+        else:  # kind 3: comment/CDATA/doctype — treat as text
+            struct_flat.append(0)
+            _emit_varint(struct_flat, len(text_chunks))
+            text_chunks.append(payload)
+            for e in stack: e[2] = True
+
+    # ---- Filter 1: only sigs whose repetition pays for the one-time desc ----
+    # per-occurrence cost with nesting ≈ 2 bytes (op 6 + 1-byte varint ref)
+    # desc cost = 1 (len varint) + len(sig)
+    sig_counts = Counter(c[2] for c in candidates)
+    kept = []
+    for sig, cnt in sig_counts.items():
+        if cnt < 2: continue
+        saving = cnt * (len(sig) - 2) - (len(sig) + 2)
+        if saving > 0:
+            kept.append((saving, sig))
+    kept.sort(key=lambda x: -x[0])
+    nested = [s for _, s in kept]
+    nested_idx = {s: i for i, s in enumerate(nested)}
+    if not nested:
+        return None
+
+    # ---- Greedy longest-first non-overlapping span pick ----
+    span_cands = []
+    for start, end, sig in candidates:
+        ni = nested_idx.get(sig)
+        if ni is not None:
+            span_cands.append((end - start, start, end, ni))
+    span_cands.sort(key=lambda x: -x[0])
+    taken = []
+    final_map = {}   # start -> (end, nested_idx)
+    for length, start, end, ni in span_cands:
+        if any(start < te and end > ts for ts, te in taken):
+            continue
+        final_map[start] = (end, ni)
+        taken.append((start, end))
+
+    # ---- Recount: drop sigs whose *actual* usage in the non-overlapping
+    #      span pick doesn't pay for the one-time desc ----
+    actual_cnt = Counter(ni for _, ni in final_map.values())
+    kept_mask = [i for i, sig in enumerate(nested)
+                 if actual_cnt.get(i, 0) * (len(sig) - 2) > (len(sig) + 2)]
+    if not kept_mask:
+        return None
+    remap = {old: new for new, old in enumerate(kept_mask)}
+    nested = [nested[i] for i in kept_mask]
+    final_map = {start: (end, remap[ni])
+                 for start, (end, ni) in final_map.items() if ni in remap}
+    if not final_map:
+        return None
+
+    # ---- PASS 2: re-emit with op 6 for nested refs ----
+    struct = bytearray()
+    flat = bytes(struct_flat)
+    sp = 0
+    for start in sorted(final_map.keys()):
+        end, ni = final_map[start]
+        struct += flat[sp:start]
+        struct.append(6)
+        _emit_varint(struct, ni)
+        sp = end
+    struct += flat[sp:]
+
+    # ---- Assemble ----
+    encoded_texts = [_word_encode_text(t, ref_idx) for t in text_chunks]
+    out = bytearray([0x58, 0x5E])
+    for lst, seed in zip((tag_names, attr_names, attr_vals),
+                         (_DOCX_TAGS, _DOCX_ATTRS, _DOCX_VALS)):
+        new_items = lst[len(seed):]
+        _emit_varint(out, len(new_items))
+        for s in new_items:
+            _emit_varint(out, len(s)); out += s
+    new_compounds = compounds[len(_DOCX_COMPOUNDS_SEED):]
+    _emit_varint(out, len(new_compounds))
+    for (ti, pairs) in new_compounds:
+        _emit_varint(out, ti)
+        _emit_varint(out, len(pairs))
+        for ai, vi in pairs:
+            _emit_varint(out, ai); _emit_varint(out, vi)
+    _emit_varint(out, len(nested))
+    for sig in nested:
+        _emit_varint(out, len(sig)); out += sig
+    _emit_varint(out, len(struct)); out += struct
+    _emit_varint(out, len(encoded_texts))
+    for t in encoded_texts:
+        _emit_varint(out, len(t)); out += t
+    return bytes(out)
+
+
+def _decode_nested_ops(out, struct, compounds, tag_names, attr_names, attr_vals,
+                       texts, nested, depth):
+    if depth > 16:
+        raise TransformError("nested depth overflow")
+    sp = 0
+    while sp < len(struct):
+        op = struct[sp]; sp += 1
+        if op == 0:
+            idx, sp = _read_varint(struct, sp); out += texts[idx]
+        elif op in (1, 2):
+            ci, sp = _read_varint(struct, sp)
+            ti, pairs = compounds[ci]
+            out += b'<' + tag_names[ti]
+            for ai, vi in pairs:
+                out += b' ' + attr_names[ai] + b'="' + attr_vals[vi] + b'"'
+            out += b'/>' if op == 2 else b'>'
+        elif op == 3:
+            ti, sp = _read_varint(struct, sp)
+            out += b'</' + tag_names[ti] + b'>'
+        elif op in (4, 5):
+            ti, sp = _read_varint(struct, sp)
+            out += b'<' + tag_names[ti] + (b'/>' if op == 4 else b'>')
+        elif op == 6:
+            ni, sp = _read_varint(struct, sp)
+            if ni >= len(nested):
+                raise TransformError(f"nested idx {ni}>={len(nested)}")
+            _decode_nested_ops(out, nested[ni], compounds, tag_names, attr_names,
+                               attr_vals, texts, nested, depth + 1)
+        else:
+            raise TransformError(f"nested op {op}")
+
+
+def _xml_decode_v5_nested(payload):
+    if _GLOBAL_REF_BYTES is None:
+        raise TransformError("nested variant requires global ref dict")
+    rb = _GLOBAL_REF_BYTES; rcap = _GLOBAL_REF_CAP; rup = _GLOBAL_REF_UP
+    if len(payload) < 2 or payload[0] != 0x58 or payload[1] != 0x5E:
+        raise TransformError("nested magic")
+    pos = 2
+    dicts = [list(_DOCX_TAGS), list(_DOCX_ATTRS), list(_DOCX_VALS)]
+    for idx in range(3):
+        cnt, pos = _read_varint(payload, pos)
+        for _ in range(cnt):
+            ln, pos = _read_varint(payload, pos)
+            dicts[idx].append(payload[pos:pos+ln]); pos += ln
+    tag_names, attr_names, attr_vals = dicts
+    compounds = list(_DOCX_COMPOUNDS_SEED)
+    n_new, pos = _read_varint(payload, pos)
+    for _ in range(n_new):
+        ti,    pos = _read_varint(payload, pos)
+        n_att, pos = _read_varint(payload, pos)
+        pairs = []
+        for _ in range(n_att):
+            ai, pos = _read_varint(payload, pos)
+            vi, pos = _read_varint(payload, pos)
+            pairs.append((ai, vi))
+        compounds.append((ti, pairs))
+    n_nested, pos = _read_varint(payload, pos)
+    nested = []
+    for _ in range(n_nested):
+        ln, pos = _read_varint(payload, pos)
+        nested.append(payload[pos:pos+ln]); pos += ln
+    struct_len, pos = _read_varint(payload, pos)
+    struct = payload[pos:pos+struct_len]; pos += struct_len
+    n_text, pos = _read_varint(payload, pos)
+    encoded_texts = []
+    for _ in range(n_text):
+        ln, pos = _read_varint(payload, pos)
+        encoded_texts.append(payload[pos:pos+ln]); pos += ln
+    texts = [_word_decode_text(et, rb, rcap, rup) for et in encoded_texts]
+    out = bytearray()
+    _decode_nested_ops(out, struct, compounds, tag_names, attr_names, attr_vals,
+                       texts, nested, 0)
+    return bytes(out)
+
 def _xml_decode_v2(payload):
     if len(payload) < 2 or payload[0] != 0x58:
         raise TransformError("xml magic")
     if payload[1] == 0x5A: return _xml_decode_bits(payload)
     if payload[1] == 0x5B: return _xml_decode_v2_words_impl(payload)
+    if payload[1] == 0x5C: return _xml_decode_v3_compound(payload)
+    if payload[1] == 0x5D: return _xml_decode_v4_localdict(payload)
+    if payload[1] == 0x5E: return _xml_decode_v5_nested(payload)
     if payload[1] == 0x58: seeds = ([], [], [])
     elif payload[1] == 0x59: seeds = (list(_DOCX_TAGS), list(_DOCX_ATTRS), list(_DOCX_VALS))
     else: raise TransformError("xml magic")
@@ -1064,12 +1719,19 @@ def _best_xml_encode(d, ref_idx=None):
             if dec_fn(p) != d: continue
             if best is None or len(p) < len(best): best = p
         except Exception: continue
+    try:
+        p = _xml_encode_v4_localdict(d)
+        if p is not None and _xml_decode_v2(p) == d:
+            if best is None or len(p) < len(best): best = p
+    except Exception: pass
     if ref_idx:
-        try:
-            p = _xml_encode_v2_words(d, ref_idx)
-            if p is not None and _xml_decode_v2(p) == d:
-                if best is None or len(p) < len(best): best = p
-        except Exception: pass
+        for enc_fn in (_xml_encode_v2_words, _xml_encode_v3_compound,
+                       _xml_encode_v5_nested):
+            try:
+                p = enc_fn(d, ref_idx)
+                if p is not None and _xml_decode_v2(p) == d:
+                    if best is None or len(p) < len(best): best = p
+            except Exception: pass
     return best
 
 PRIMES = [p for p in range(2, 256) if all(p % d != 0 for d in range(2, int(p**0.5) + 1))]
@@ -1141,9 +1803,6 @@ def _parse_ext(fname):
     if v < 0x100: return "a", v + 1
     return "b", v - 0xFF
 
-# ══════════════════════════════════════════════════════════════════════
-#  DOCX / ZIP container helpers  (used by t_docx / r_docx)
-# ══════════════════════════════════════════════════════════════════════
 def _parse_zip_entries(d):
     if len(d) < 22 or d[:4] != ZIP_MAGIC:
         raise TransformError("not a zip (local sig)")
@@ -1238,9 +1897,6 @@ def _find_deflate_params(raw, target):
             pass
     return None
 
-# ══════════════════════════════════════════════════════════════════════
-# COMPRESSOR
-# ══════════════════════════════════════════════════════════════════════
 class Compressor:
     TIMEOUT = 300; VS = False; USE_MP = True
     TOP_K = 100; FAST = True; BLOCK = 4096
@@ -1424,9 +2080,6 @@ class Compressor:
         L = len(d); s = sum(d) % 256
         return max(1, min(256, ((L*13 + s*17) % 256) + 1))
 
-    # ═══════════════════════════════════════════════════════════════════
-    # 22 algorithm FAMILIES for a84-a255
-    # ═══════════════════════════════════════════════════════════════════
     def _F_dstride(self, k):
         def f(d):
             n = len(d)
@@ -1787,7 +2440,6 @@ class Compressor:
         if i < 168:  return self._F_add_reverse(i - 160)
         return self._F_delta_reverse(i - 168 + 1)
 
-    # ─── Backend helpers ─────────────────────────────────────────────
     def _leptonc(self, d):
         if not HAS_LEPTON: return None
         if len(d) < 2 or d[:2] != b'\xff\xd8': return None
@@ -2080,7 +2732,6 @@ class Compressor:
             return _xml_decode_v2(enc)
         raise TransformError(f"t_xml mode {mode}")
 
-    # ─── Container-aware DOCX transform ─────────────────────────────
     def t_docx(self, d):
         if not d or d[:4] != ZIP_MAGIC:
             return None
@@ -2106,7 +2757,6 @@ class Compressor:
             fn_low = filename.lower()
             crc = struct.unpack('<I', lh[14:18])[0]
 
-            # ── JPEG branch: try Lepton (byte-identical only) ──
             if HAS_LEPTON and fn_low.endswith(('.jpg', '.jpeg', '.jpe')):
                 try: jpeg_raw = zlib.decompress(entry['compressed'], -15)
                 except Exception: jpeg_raw = None
@@ -2131,7 +2781,6 @@ class Compressor:
                                 }
                                 continue
 
-            # ── XML/RELS branch ──
             if not fn_low.endswith(('.xml', '.rels')):
                 continue
             try: raw = zlib.decompress(entry['compressed'], -15)
@@ -2145,6 +2794,9 @@ class Compressor:
                 (lambda x: _xml_encode_v2(x),                          lambda p, x: _xml_decode_v2(p) == x),
                 (lambda x: _xml_encode_bits(x),                        lambda p, x: _xml_decode_bits(p) == x),
                 (lambda x: _xml_encode_v2_words(x, self.ref_idx),      lambda p, x: _xml_decode_v2(p) == x),
+                (lambda x: _xml_encode_v3_compound(x, self.ref_idx),   lambda p, x: _xml_decode_v2(p) == x),
+                (lambda x: _xml_encode_v4_localdict(x),                lambda p, x: _xml_decode_v2(p) == x),
+                (lambda x: _xml_encode_v5_nested(x, self.ref_idx),     lambda p, x: _xml_decode_v2(p) == x),
             ):
                 try:
                     enc = enc_fn(raw)
@@ -2263,7 +2915,6 @@ class Compressor:
         out += central_dir + eocd
         return bytes(out)
 
-    # ─── Block-Huffman ───────────────────────────────────────────────
     def _huff_block_encode(self, data, block_size, max_size=None):
         if not data: return b''
         out = bytearray()
@@ -2354,7 +3005,6 @@ class Compressor:
             except Exception: continue
         return best
 
-    # ─── Ultra chain (kept for backward-compatible decode only) ──────
     def _ultra_compress(self, data):
         if not data or not HAS_LZMA: return None
         try: lz = lzma.compress(data, preset=9 | lzma.PRESET_EXTREME)
@@ -2389,7 +3039,6 @@ class Compressor:
         try: return lzma.decompress(lz)
         except Exception as e: raise TransformError(f"ultra: lzma {e}")
 
-    # ─── a1-a83 individual transforms (unchanged) ───────────────────
     def t00(self, d):
         if not d: return struct.pack('>I', 0)
         br, bl, bsh = None, float('inf'), []
@@ -3373,16 +4022,12 @@ class Compressor:
         return self._xor_pattern(d, self.pattern47)
     r47 = t47
 
-    # ─── a48–a56 (previously missing) ───────────────────────────────
     def t48(self, d):
-        """a48: XOR with repeating golden-ratio 8-byte pattern."""
         if not d: return b''
         pat = (0x9E3779B97F4A7C15).to_bytes(8, 'big')
         return self._xor_pattern(d, pat)
     r48 = t48
-
     def t49(self, d):
-        """a49: XOR with LCG keystream seeded from length."""
         if not d: return b''
         s = ((len(d) * 0x9E3779B1) ^ 0xDEADBEEF) & 0xFFFFFFFF
         out = bytearray(len(d))
@@ -3391,29 +4036,21 @@ class Compressor:
             out[i] = d[i] ^ ((s >> 16) & 0xFF)
         return bytes(out)
     r49 = t49
-
     def t50(self, d):
-        """a50: XOR with Fibonacci byte stream."""
         if not d: return b''
         out = bytearray(d); fb = self.fib; L = len(d)
         for i in range(L): out[i] ^= fb[i % len(fb)] & 0xFF
         return bytes(out)
     r50 = t50
-
     def t51(self, d):
-        """a51: byte reverse."""
         if not d: return b''
         return bytes(d[::-1])
     r51 = t51
-
     def t52(self, d):
-        """a52: XOR with position-dependent mask (i*0x37+0x5A)."""
         if not d: return b''
         return bytes(d[i] ^ ((i * 0x37 + 0x5A) & 0xFF) for i in range(len(d)))
     r52 = t52
-
     def t53(self, d):
-        """a53: XOR with rotated pi-digit stream."""
         if not d: return b''
         L = len(d); sh = L % len(self.PI)
         pr = self.PI[sh:] + self.PI[:sh]
@@ -3421,9 +4058,7 @@ class Compressor:
         for i in range(L): out[i] = d[i] ^ pr[i % len(pr)]
         return bytes(out)
     r53 = t53
-
     def t54(self, d):
-        """a54: ADD position-dependent mask (i*0x1B+0x2F)."""
         if not d: return b''
         out = bytearray(len(d))
         for i in range(len(d)):
@@ -3435,17 +4070,13 @@ class Compressor:
         for i in range(len(d)):
             out[i] = (d[i] - ((i * 0x1B + 0x2F) & 0xFF)) & 0xFF
         return bytes(out)
-
     def t55(self, d):
-        """a55: XOR with prime-number stream."""
         if not d: return b''
         out = bytearray(d); L = len(d); P = PRIMES
         for i in range(L): out[i] ^= P[i % len(P)]
         return bytes(out)
     r55 = t55
-
     def t56(self, d):
-        """a56: reverse each 8-byte group (last group may be shorter)."""
         if not d: return b''
         n = len(d); o = bytearray(d); w = 8
         for i in range(0, n, w):
@@ -3453,7 +4084,6 @@ class Compressor:
             o[i:i + len(chunk)] = chunk[::-1]
         return bytes(o)
     r56 = t56
-    # ─────────────────────────────────────────────────────────────────
 
     def t59(self, d):
         if not d: return b''
@@ -4105,7 +4735,7 @@ class Compressor:
         eager_f[38] = self._t38; eager_r[38] = self._r38
         eager_f[39] = self._t39; eager_r[39] = self._r39
         eager_f[40] = self._t40; eager_r[40] = self._r40
-        for i in range(41, 57):        # 41..47 + 48..56 all registered now
+        for i in range(41, 57):
             eager_f[i] = getattr(self, f"t{i}"); eager_r[i] = getattr(self, f"r{i}")
         eager_f[57] = self.t57; eager_r[57] = self.r57
         eager_f[58] = self.t58; eager_r[58] = self.r58
@@ -4548,7 +5178,6 @@ class Compressor:
             print("  FAIL _best_xml_encode"); return False
         print(f"  _best_xml_encode picked: magic {best[:2].hex()} ({len(best):,} bytes)")
 
-        # Word-tokenized XML structural
         wenc = _xml_encode_v2_words(docx_bytes, self.ref_idx)
         if wenc is not None:
             if _xml_decode_v2(wenc) != docx_bytes:
@@ -4556,7 +5185,27 @@ class Compressor:
             print(f"  words variant 0x5B : {len(docx_bytes):,} → {len(wenc):,} bytes "
                   f"({len(wenc)/len(docx_bytes)*100:.1f}%)")
 
-        # Huffman
+        cenc = _xml_encode_v3_compound(docx_bytes, self.ref_idx)
+        if cenc is not None:
+            if _xml_decode_v2(cenc) != docx_bytes:
+                print("  FAIL compound variant round-trip"); return False
+            print(f"  compound 0x5C  : {len(docx_bytes):,} → {len(cenc):,} bytes "
+                  f"({len(cenc)/len(docx_bytes)*100:.1f}%)")
+
+        lenc = _xml_encode_v4_localdict(docx_bytes)
+        if lenc is not None:
+            if _xml_decode_v2(lenc) != docx_bytes:
+                print("  FAIL localdict variant round-trip"); return False
+            print(f"  localdict 0x5D: {len(docx_bytes):,} → {len(lenc):,} bytes "
+                  f"({len(lenc)/len(docx_bytes)*100:.1f}%)")
+
+        nenc = _xml_encode_v5_nested(docx_bytes, self.ref_idx)
+        if nenc is not None:
+            if _xml_decode_v2(nenc) != docx_bytes:
+                print("  FAIL nested variant round-trip"); return False
+            print(f"  nested    0x5E: {len(docx_bytes):,} → {len(nenc):,} bytes "
+                  f"({len(nenc)/len(docx_bytes)*100:.1f}%)")
+
         huff_sample = (b'<?xml version="1.0"?>' +
                        b'<w:p><w:r><w:t>Hello, World!</w:t></w:r></w:p>' * 200)
         huff_best = self._best_huff_block(huff_sample)
@@ -4565,7 +5214,6 @@ class Compressor:
                 print("  huff_block: FAILED round-trip"); return False
             print(f"  huff_block: {len(huff_sample):,} → {len(huff_best):,} bytes")
 
-        # DOCX container-aware
         _dz = io.BytesIO()
         with zipfile.ZipFile(_dz, 'w', zipfile.ZIP_DEFLATED) as _zz:
             _zz.writestr('[Content_Types].xml',
@@ -4593,7 +5241,6 @@ class Compressor:
                   f"{len(docx_enc):,} bytes "
                   f"({len(docx_enc)/len(docx_test)*100:.1f}%)")
 
-        # Ultra chain verify (decode only)
         if HAS_LZMA:
             ultra_test = self._ultra_compress(b"ultra chain test " * 100)
             if ultra_test is not None:
@@ -4633,7 +5280,7 @@ def main():
     print(f"* 0x0100..0xFFFF → pair   b1..b{MAX_PAIRS}")
     print("* Extension: <original>.aXXXX  (XXXX = 4 hex digits)")
     print(f"* Pipeline  : 256 singles → 65280 pairs → final cmix pass")
-    print(f"* XML v3    : t_xml picks XY (varint) / XZ (bit) / XW (word)")
+    print(f"* XML v3    : t_xml picks XY / XZ / XW / XC / XD / XE (nested)")
     print(f"* DOCX      : container-aware ZIP+xml (Lepton JPEG, word-token XML)")
     print(f"* a84-a255  : 22 algorithm families (delta/transpose/swap/bitrev/…)")
     print(f"* Self-test : fast mode — runs in ~0.5 s")
@@ -4649,6 +5296,7 @@ def main():
         print("1) Compress (fast)")
         print("2) Decompress")
         print("3) Self-test")
+        print("4) Inspect file (per-entry size comparison)")
         ch = input("> ").strip()
         if ch == "1":
             f = input("Input file: ").strip()
@@ -4661,6 +5309,42 @@ def main():
             c.decompress(f, o)
         elif ch == "3":
             c.selftest()
+        elif ch == "4":
+            f = input("File to inspect: ").strip()
+            if not f or not os.path.exists(f): print("No file."); continue
+            with open(f, "rb") as fh: data = fh.read()
+            if data[:4] == b"PK\x03\x04":
+                entries, _, _ = _parse_zip_entries(data)
+                for e in entries:
+                    lh = e['local_header']
+                    fn = lh[30:30+struct.unpack('<H', lh[26:28])[0]].decode('utf-8', 'replace')
+                    if not fn.lower().endswith(('.xml', '.rels')): continue
+                    try: raw = zlib.decompress(e['compressed'], -15)
+                    except Exception: continue
+                    cands = {
+                        "XY": _xml_encode_v2(raw),
+                        "XZ": _xml_encode_bits(raw),
+                        "XW": _xml_encode_v2_words(raw, c.ref_idx),
+                        "XC": _xml_encode_v3_compound(raw, c.ref_idx),
+                        "XD": _xml_encode_v4_localdict(raw),
+                        "XE": _xml_encode_v5_nested(raw, c.ref_idx),
+                    }
+                    print(f"\n{fn}  raw={len(raw):,}  word-deflate={len(e['compressed']):,}")
+                    for name, enc in cands.items():
+                        if enc is None:
+                            print(f"  {name}: None"); continue
+                        rt = 'OK' if _xml_decode_v2(enc) == raw else 'FAIL'
+                        print(f"  {name}: raw={len(enc):>7,}  cback={len(c.cback(enc)):>7,}  rt={rt}")
+            else:
+                for name, fn in [("XY", _xml_encode_v2),
+                                 ("XZ", _xml_encode_bits),
+                                 ("XW", lambda x: _xml_encode_v2_words(x, c.ref_idx)),
+                                 ("XC", lambda x: _xml_encode_v3_compound(x, c.ref_idx)),
+                                 ("XD", _xml_encode_v4_localdict),
+                                 ("XE", lambda x: _xml_encode_v5_nested(x, c.ref_idx))]:
+                    enc = fn(data)
+                    print(f"  {name}: raw={len(enc) if enc else 0:,}  "
+                          f"cback={len(c.cback(enc)) if enc else 0:,}")
         else: print("Invalid")
 
 if __name__ == "__main__":
