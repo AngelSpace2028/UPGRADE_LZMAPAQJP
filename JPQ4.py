@@ -1,6 +1,6 @@
 #!/usr/bin/env python3 written by Jurijus Pacalovas
 # -*- coding: utf-8 -*-
-# PPMD_1.6 — Lossless Tournament + XML structural v3 (XY/XZ/XW/XC/XD) + Qiskit mask
+# PPMD_1.6 — Lossless Tournament + XML structural v3 (XY/XZ/XW/XC/XD/XE) + Qiskit mask
 # + wide-base minus transforms (a77-a83) + 22-family diverse filler (a84-a255)
 # EXTENSION-AS-HEADER — saves the 2 bytes inside the file
 
@@ -1427,6 +1427,244 @@ def _xml_decode_v4_localdict(payload):
             raise TransformError(f"localdict op {op}")
     return bytes(out)
 
+# ------------------------------------------------------------------
+#  0x5E — nested-compound encoding (intra-document subtree dedup)
+# ------------------------------------------------------------------
+def _xml_encode_v5_nested(d, ref_idx):
+    """
+    0x5E — nested-compound encoding.
+    Same flat pass as 0x5C, but detects balanced no-text subtrees (typically
+    <w:rPr>...</w:rPr> and <w:pPr>...</w:pPr>) and hoists each unique one into
+    a reusable "nested compound".  Each reuse becomes op 6 + varint = ~2 bytes.
+    """
+    if not d or not ref_idx:
+        return None
+    toks = list(_xml_scan_tokens(d))
+    if not toks:
+        return None
+
+    tag_names  = list(_DOCX_TAGS)
+    attr_names = list(_DOCX_ATTRS)
+    attr_vals  = list(_DOCX_VALS)
+    compounds  = list(_DOCX_COMPOUNDS_SEED)
+    compound_idx = {c: i for i, c in enumerate(compounds)}
+
+    def _add_compound(ti, attr_pairs):
+        key = (ti, tuple(attr_pairs))
+        i = compound_idx.get(key)
+        if i is None:
+            i = len(compounds); compounds.append(key); compound_idx[key] = i
+        return i
+
+    # ---- PASS 1: flat encode + collect candidate subtrees ----
+    text_chunks = []
+    struct_flat = bytearray()
+    stack = []           # [tag_idx, start_pos, has_text]
+    candidates = []      # (start, end, sig_bytes)
+
+    for kind, payload in toks:
+        if kind == 0:
+            struct_flat.append(0)
+            _emit_varint(struct_flat, len(text_chunks))
+            text_chunks.append(payload)
+            for e in stack: e[2] = True
+        elif kind == 1:
+            name, attrs_raw, selfclose = payload
+            ti = _idx_or_add(tag_names, name)
+            ams = list(_XML_ATTR_RE.finditer(attrs_raw))
+            attr_pairs = []
+            for am in ams:
+                aname = am.group(1)
+                aval  = am.group(2) if am.group(2) is not None else am.group(3)
+                ai = _idx_or_add(attr_names, aname)
+                vi = _idx_or_add(attr_vals,  aval)
+                attr_pairs.append((ai, vi))
+            start = len(struct_flat)
+            if attr_pairs:
+                ci = _add_compound(ti, attr_pairs)
+                struct_flat.append(2 if selfclose else 1)
+                _emit_varint(struct_flat, ci)
+            else:
+                struct_flat.append(4 if selfclose else 5)
+                _emit_varint(struct_flat, ti)
+            if not selfclose:
+                stack.append([ti, start, False])
+        elif kind == 2:
+            name = payload
+            ti = _idx_or_add(tag_names, name)
+            struct_flat.append(3)
+            _emit_varint(struct_flat, ti)
+            if stack and stack[-1][0] == ti:
+                _, start, has_text = stack.pop()
+                if not has_text:
+                    end = len(struct_flat)
+                    sig = bytes(struct_flat[start:end])
+                    if len(sig) >= 3:
+                        candidates.append((start, end, sig))
+        else:  # kind 3: comment/CDATA/doctype — treat as text
+            struct_flat.append(0)
+            _emit_varint(struct_flat, len(text_chunks))
+            text_chunks.append(payload)
+            for e in stack: e[2] = True
+
+    # ---- Filter 1: only sigs whose repetition pays for the one-time desc ----
+    # per-occurrence cost with nesting ≈ 2 bytes (op 6 + 1-byte varint ref)
+    # desc cost = 1 (len varint) + len(sig)
+    sig_counts = Counter(c[2] for c in candidates)
+    kept = []
+    for sig, cnt in sig_counts.items():
+        if cnt < 2: continue
+        saving = cnt * (len(sig) - 2) - (len(sig) + 2)
+        if saving > 0:
+            kept.append((saving, sig))
+    kept.sort(key=lambda x: -x[0])
+    nested = [s for _, s in kept]
+    nested_idx = {s: i for i, s in enumerate(nested)}
+    if not nested:
+        return None
+
+    # ---- Greedy longest-first non-overlapping span pick ----
+    span_cands = []
+    for start, end, sig in candidates:
+        ni = nested_idx.get(sig)
+        if ni is not None:
+            span_cands.append((end - start, start, end, ni))
+    span_cands.sort(key=lambda x: -x[0])
+    taken = []
+    final_map = {}   # start -> (end, nested_idx)
+    for length, start, end, ni in span_cands:
+        if any(start < te and end > ts for ts, te in taken):
+            continue
+        final_map[start] = (end, ni)
+        taken.append((start, end))
+
+    # ---- Recount: drop sigs whose *actual* usage in the non-overlapping
+    #      span pick doesn't pay for the one-time desc ----
+    actual_cnt = Counter(ni for _, ni in final_map.values())
+    kept_mask = [i for i, sig in enumerate(nested)
+                 if actual_cnt.get(i, 0) * (len(sig) - 2) > (len(sig) + 2)]
+    if not kept_mask:
+        return None
+    remap = {old: new for new, old in enumerate(kept_mask)}
+    nested = [nested[i] for i in kept_mask]
+    final_map = {start: (end, remap[ni])
+                 for start, (end, ni) in final_map.items() if ni in remap}
+    if not final_map:
+        return None
+
+    # ---- PASS 2: re-emit with op 6 for nested refs ----
+    struct = bytearray()
+    flat = bytes(struct_flat)
+    sp = 0
+    for start in sorted(final_map.keys()):
+        end, ni = final_map[start]
+        struct += flat[sp:start]
+        struct.append(6)
+        _emit_varint(struct, ni)
+        sp = end
+    struct += flat[sp:]
+
+    # ---- Assemble ----
+    encoded_texts = [_word_encode_text(t, ref_idx) for t in text_chunks]
+    out = bytearray([0x58, 0x5E])
+    for lst, seed in zip((tag_names, attr_names, attr_vals),
+                         (_DOCX_TAGS, _DOCX_ATTRS, _DOCX_VALS)):
+        new_items = lst[len(seed):]
+        _emit_varint(out, len(new_items))
+        for s in new_items:
+            _emit_varint(out, len(s)); out += s
+    new_compounds = compounds[len(_DOCX_COMPOUNDS_SEED):]
+    _emit_varint(out, len(new_compounds))
+    for (ti, pairs) in new_compounds:
+        _emit_varint(out, ti)
+        _emit_varint(out, len(pairs))
+        for ai, vi in pairs:
+            _emit_varint(out, ai); _emit_varint(out, vi)
+    _emit_varint(out, len(nested))
+    for sig in nested:
+        _emit_varint(out, len(sig)); out += sig
+    _emit_varint(out, len(struct)); out += struct
+    _emit_varint(out, len(encoded_texts))
+    for t in encoded_texts:
+        _emit_varint(out, len(t)); out += t
+    return bytes(out)
+
+
+def _decode_nested_ops(out, struct, compounds, tag_names, attr_names, attr_vals,
+                       texts, nested, depth):
+    if depth > 16:
+        raise TransformError("nested depth overflow")
+    sp = 0
+    while sp < len(struct):
+        op = struct[sp]; sp += 1
+        if op == 0:
+            idx, sp = _read_varint(struct, sp); out += texts[idx]
+        elif op in (1, 2):
+            ci, sp = _read_varint(struct, sp)
+            ti, pairs = compounds[ci]
+            out += b'<' + tag_names[ti]
+            for ai, vi in pairs:
+                out += b' ' + attr_names[ai] + b'="' + attr_vals[vi] + b'"'
+            out += b'/>' if op == 2 else b'>'
+        elif op == 3:
+            ti, sp = _read_varint(struct, sp)
+            out += b'</' + tag_names[ti] + b'>'
+        elif op in (4, 5):
+            ti, sp = _read_varint(struct, sp)
+            out += b'<' + tag_names[ti] + (b'/>' if op == 4 else b'>')
+        elif op == 6:
+            ni, sp = _read_varint(struct, sp)
+            if ni >= len(nested):
+                raise TransformError(f"nested idx {ni}>={len(nested)}")
+            _decode_nested_ops(out, nested[ni], compounds, tag_names, attr_names,
+                               attr_vals, texts, nested, depth + 1)
+        else:
+            raise TransformError(f"nested op {op}")
+
+
+def _xml_decode_v5_nested(payload):
+    if _GLOBAL_REF_BYTES is None:
+        raise TransformError("nested variant requires global ref dict")
+    rb = _GLOBAL_REF_BYTES; rcap = _GLOBAL_REF_CAP; rup = _GLOBAL_REF_UP
+    if len(payload) < 2 or payload[0] != 0x58 or payload[1] != 0x5E:
+        raise TransformError("nested magic")
+    pos = 2
+    dicts = [list(_DOCX_TAGS), list(_DOCX_ATTRS), list(_DOCX_VALS)]
+    for idx in range(3):
+        cnt, pos = _read_varint(payload, pos)
+        for _ in range(cnt):
+            ln, pos = _read_varint(payload, pos)
+            dicts[idx].append(payload[pos:pos+ln]); pos += ln
+    tag_names, attr_names, attr_vals = dicts
+    compounds = list(_DOCX_COMPOUNDS_SEED)
+    n_new, pos = _read_varint(payload, pos)
+    for _ in range(n_new):
+        ti,    pos = _read_varint(payload, pos)
+        n_att, pos = _read_varint(payload, pos)
+        pairs = []
+        for _ in range(n_att):
+            ai, pos = _read_varint(payload, pos)
+            vi, pos = _read_varint(payload, pos)
+            pairs.append((ai, vi))
+        compounds.append((ti, pairs))
+    n_nested, pos = _read_varint(payload, pos)
+    nested = []
+    for _ in range(n_nested):
+        ln, pos = _read_varint(payload, pos)
+        nested.append(payload[pos:pos+ln]); pos += ln
+    struct_len, pos = _read_varint(payload, pos)
+    struct = payload[pos:pos+struct_len]; pos += struct_len
+    n_text, pos = _read_varint(payload, pos)
+    encoded_texts = []
+    for _ in range(n_text):
+        ln, pos = _read_varint(payload, pos)
+        encoded_texts.append(payload[pos:pos+ln]); pos += ln
+    texts = [_word_decode_text(et, rb, rcap, rup) for et in encoded_texts]
+    out = bytearray()
+    _decode_nested_ops(out, struct, compounds, tag_names, attr_names, attr_vals,
+                       texts, nested, 0)
+    return bytes(out)
+
 def _xml_decode_v2(payload):
     if len(payload) < 2 or payload[0] != 0x58:
         raise TransformError("xml magic")
@@ -1434,6 +1672,7 @@ def _xml_decode_v2(payload):
     if payload[1] == 0x5B: return _xml_decode_v2_words_impl(payload)
     if payload[1] == 0x5C: return _xml_decode_v3_compound(payload)
     if payload[1] == 0x5D: return _xml_decode_v4_localdict(payload)
+    if payload[1] == 0x5E: return _xml_decode_v5_nested(payload)
     if payload[1] == 0x58: seeds = ([], [], [])
     elif payload[1] == 0x59: seeds = (list(_DOCX_TAGS), list(_DOCX_ATTRS), list(_DOCX_VALS))
     else: raise TransformError("xml magic")
@@ -1486,7 +1725,8 @@ def _best_xml_encode(d, ref_idx=None):
             if best is None or len(p) < len(best): best = p
     except Exception: pass
     if ref_idx:
-        for enc_fn in (_xml_encode_v2_words, _xml_encode_v3_compound):
+        for enc_fn in (_xml_encode_v2_words, _xml_encode_v3_compound,
+                       _xml_encode_v5_nested):
             try:
                 p = enc_fn(d, ref_idx)
                 if p is not None and _xml_decode_v2(p) == d:
@@ -2556,6 +2796,7 @@ class Compressor:
                 (lambda x: _xml_encode_v2_words(x, self.ref_idx),      lambda p, x: _xml_decode_v2(p) == x),
                 (lambda x: _xml_encode_v3_compound(x, self.ref_idx),   lambda p, x: _xml_decode_v2(p) == x),
                 (lambda x: _xml_encode_v4_localdict(x),                lambda p, x: _xml_decode_v2(p) == x),
+                (lambda x: _xml_encode_v5_nested(x, self.ref_idx),     lambda p, x: _xml_decode_v2(p) == x),
             ):
                 try:
                     enc = enc_fn(raw)
@@ -4958,6 +5199,13 @@ class Compressor:
             print(f"  localdict 0x5D: {len(docx_bytes):,} → {len(lenc):,} bytes "
                   f"({len(lenc)/len(docx_bytes)*100:.1f}%)")
 
+        nenc = _xml_encode_v5_nested(docx_bytes, self.ref_idx)
+        if nenc is not None:
+            if _xml_decode_v2(nenc) != docx_bytes:
+                print("  FAIL nested variant round-trip"); return False
+            print(f"  nested    0x5E: {len(docx_bytes):,} → {len(nenc):,} bytes "
+                  f"({len(nenc)/len(docx_bytes)*100:.1f}%)")
+
         huff_sample = (b'<?xml version="1.0"?>' +
                        b'<w:p><w:r><w:t>Hello, World!</w:t></w:r></w:p>' * 200)
         huff_best = self._best_huff_block(huff_sample)
@@ -5032,7 +5280,7 @@ def main():
     print(f"* 0x0100..0xFFFF → pair   b1..b{MAX_PAIRS}")
     print("* Extension: <original>.aXXXX  (XXXX = 4 hex digits)")
     print(f"* Pipeline  : 256 singles → 65280 pairs → final cmix pass")
-    print(f"* XML v3    : t_xml picks XY / XZ / XW / XC / XD (localdict)")
+    print(f"* XML v3    : t_xml picks XY / XZ / XW / XC / XD / XE (nested)")
     print(f"* DOCX      : container-aware ZIP+xml (Lepton JPEG, word-token XML)")
     print(f"* a84-a255  : 22 algorithm families (delta/transpose/swap/bitrev/…)")
     print(f"* Self-test : fast mode — runs in ~0.5 s")
@@ -5079,6 +5327,7 @@ def main():
                         "XW": _xml_encode_v2_words(raw, c.ref_idx),
                         "XC": _xml_encode_v3_compound(raw, c.ref_idx),
                         "XD": _xml_encode_v4_localdict(raw),
+                        "XE": _xml_encode_v5_nested(raw, c.ref_idx),
                     }
                     print(f"\n{fn}  raw={len(raw):,}  word-deflate={len(e['compressed']):,}")
                     for name, enc in cands.items():
@@ -5091,7 +5340,8 @@ def main():
                                  ("XZ", _xml_encode_bits),
                                  ("XW", lambda x: _xml_encode_v2_words(x, c.ref_idx)),
                                  ("XC", lambda x: _xml_encode_v3_compound(x, c.ref_idx)),
-                                 ("XD", _xml_encode_v4_localdict)]:
+                                 ("XD", _xml_encode_v4_localdict),
+                                 ("XE", lambda x: _xml_encode_v5_nested(x, c.ref_idx))]:
                     enc = fn(data)
                     print(f"  {name}: raw={len(enc) if enc else 0:,}  "
                           f"cback={len(c.cback(enc)) if enc else 0:,}")
