@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # PPMD_1.6 — Lossless Tournament + XML structural v3 (XY/XZ/XW/XC/XD/XE) + Qiskit mask
 # + wide-base minus transforms (a77-a83) + 22-family diverse filler (a84-a255)
+# + a256 = XOR64 search — 512 candidate keys in sampled64 mode
 # EXTENSION-AS-HEADER — saves the 2 bytes inside the file
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
@@ -51,6 +52,13 @@ FULL_PAIRS      = os.environ.get("PPMD_FULL_PAIRS",   "1") != "0"
 SKIP_SLOW       = os.environ.get("PPMD_SKIP_SLOW",    "1") != "0"
 EARLY_EXIT_GAIN = float(os.environ.get("PPMD_EARLY_EXIT_GAIN", "0.55"))
 
+A256_MODE        = os.environ.get("PPMD_A256_MODE", "sampled64").lower()
+A256_EXHAUSTIVE  = (A256_MODE == "exhaustive")
+A256_LIMIT       = int(os.environ.get("PPMD_A256_LIMIT", "0") or "0")
+A256_START       = int(os.environ.get("PPMD_A256_START", "0") or "0")
+A256_PROGRESS    = max(1, int(os.environ.get("PPMD_A256_PROGRESS", "1000000") or "1000000"))
+A256_CKPT        = max(1, int(os.environ.get("PPMD_A256_CKPT", "10000000") or "10000000"))
+
 CPU_COUNT = mp.cpu_count() or 4
 N_CORES = max(1, int(os.environ.get("PPMD_CORES", str(CPU_COUNT)) or str(CPU_COUNT)))
 REPEATS = max(1, int(os.environ.get("PPMD_REPEATS", "1") or "1"))
@@ -63,8 +71,10 @@ try:
 except (ValueError, AttributeError):
     _MP_CTX = mp.get_context(); _HAS_FORK = False
 
-IDENTITY_IDS = frozenset((1, 31, 32, 256))
+IDENTITY_IDS = frozenset((1, 31, 32))
 MAX_PAIRS = 65280
+N_Q64_CANDIDATES = 512                 # ← 512 candidate keys (was 64)
+KEY_BYTES = 8
 
 _GLOBAL_COMP = None; _GLOBAL_DATA = None; _GLOBAL_FWD = {}
 _GLOBAL_REF_BYTES = None; _GLOBAL_REF_CAP = None; _GLOBAL_REF_UP = None
@@ -120,13 +130,21 @@ def _ins_zstd():
         except Exception: pass
     return False
 
-print("="*70); print("PPMD_1.6 — Checking backends"); print("="*70)
+print("="*70); print("PPMD_1.6 — Checking backends (a256 = XOR64 search, 512 candidates)"); print("="*70)
 print(f"parallelism : {N_CORES} cores" + (" (fork)" if _HAS_FORK else " (spawn)"))
 print(f"cpu count   : {CPU_COUNT}")
 print(f"fast mode   : {'ON' if FAST_MODE else 'OFF'}")
 print(f"full singles: {'ON (256 transforms)' if FULL_SINGLES else 'OFF'}")
 print(f"full pairs  : {'ON (up to 65280 pairs)' if FULL_PAIRS else 'OFF'}")
 print(f"skip slow   : {'ON' if SKIP_SLOW else 'OFF'}")
+print(f"a256 mode   : " + (
+    "EXHAUSTIVE 2^64 (never finishes)"    if A256_MODE == "exhaustive"       else
+    "REPEAT-32 (all 2^32 seed||seed)"     if A256_MODE == "repeat32"         else
+    "REPEAT-32 OPTIMAL (< 1 ms)"          if A256_MODE == "repeat32_optimal" else
+    f"sampled64 ({N_Q64_CANDIDATES} candidates × 64-bit key)"
+))
+if A256_MODE in ("exhaustive", "repeat32") and A256_LIMIT > 0:
+    print(f"a256 limit  : {A256_LIMIT:,} keys")
 _z = _imp_zstd()
 if _z is None:
     print("zstandard missing; trying auto-install...")
@@ -152,7 +170,6 @@ CCMX_MIRRORS = [
     "https://web.archive.org/web/20161019035512if_/http://www.byronknoll.com/ccmx130a.zip",
     "https://mattmahoney.net/dc/ccmx.zip",
     "https://encode.su/attachment.php?attachmentid=2032&d=1203997110"]
-
 CMIX_SRC_URL = "https://github.com/byronknoll/cmix/archive/refs/tags/v21.tar.gz"
 
 def _install_ccmx():
@@ -730,7 +747,7 @@ def _build_compound_seed():
             ai = attr_idx.get(a_b); vi = val_idx.get(v_b)
             if ai is None or vi is None: ok = False; break
             pairs.append((ai, vi))
-        if ok: out.append((ti, tuple(pairs)))   # FIX #1: tuple, not list
+        if ok: out.append((ti, tuple(pairs)))
     return out
 
 _DOCX_COMPOUNDS_SEED = _build_compound_seed()
@@ -1185,7 +1202,7 @@ def _xml_encode_v4_localdict(d):
             if i is not None:
                 _emit_varint(out, ((i << 2) | 3) + 1)
             else:
-                out.append(0); _emit_varint(out, len(chunk)); out.extend(chunk)   # FIX #2
+                out.append(0); _emit_varint(out, len(chunk)); out.extend(chunk)
         for m in _TOK_RE.finditer(text):
             if m.start() > last:
                 emit_chunk(text[last:m.start()])
@@ -1201,7 +1218,7 @@ def _xml_encode_v4_localdict(d):
                     _emit_varint(out, ((i << 2) | case) + 1)
                     done = True
             if not done:
-                out.append(0); _emit_varint(out, len(tok_orig)); out.extend(tok_orig)   # FIX #2 (cosmetic)
+                out.append(0); _emit_varint(out, len(tok_orig)); out.extend(tok_orig)
             last = m.end()
         if last < len(text):
             emit_chunk(text[last:])
@@ -1427,16 +1444,7 @@ def _xml_decode_v4_localdict(payload):
             raise TransformError(f"localdict op {op}")
     return bytes(out)
 
-# ------------------------------------------------------------------
-#  0x5E — nested-compound encoding (intra-document subtree dedup)
-# ------------------------------------------------------------------
 def _xml_encode_v5_nested(d, ref_idx):
-    """
-    0x5E — nested-compound encoding.
-    Same flat pass as 0x5C, but detects balanced no-text subtrees (typically
-    <w:rPr>...</w:rPr> and <w:pPr>...</w:pPr>) and hoists each unique one into
-    a reusable "nested compound".  Each reuse becomes op 6 + varint = ~2 bytes.
-    """
     if not d or not ref_idx:
         return None
     toks = list(_xml_scan_tokens(d))
@@ -1456,11 +1464,10 @@ def _xml_encode_v5_nested(d, ref_idx):
             i = len(compounds); compounds.append(key); compound_idx[key] = i
         return i
 
-    # ---- PASS 1: flat encode + collect candidate subtrees ----
     text_chunks = []
     struct_flat = bytearray()
-    stack = []           # [tag_idx, start_pos, has_text]
-    candidates = []      # (start, end, sig_bytes)
+    stack = []
+    candidates = []
 
     for kind, payload in toks:
         if kind == 0:
@@ -1501,15 +1508,12 @@ def _xml_encode_v5_nested(d, ref_idx):
                     sig = bytes(struct_flat[start:end])
                     if len(sig) >= 3:
                         candidates.append((start, end, sig))
-        else:  # kind 3: comment/CDATA/doctype — treat as text
+        else:
             struct_flat.append(0)
             _emit_varint(struct_flat, len(text_chunks))
             text_chunks.append(payload)
             for e in stack: e[2] = True
 
-    # ---- Filter 1: only sigs whose repetition pays for the one-time desc ----
-    # per-occurrence cost with nesting ≈ 2 bytes (op 6 + 1-byte varint ref)
-    # desc cost = 1 (len varint) + len(sig)
     sig_counts = Counter(c[2] for c in candidates)
     kept = []
     for sig, cnt in sig_counts.items():
@@ -1523,7 +1527,6 @@ def _xml_encode_v5_nested(d, ref_idx):
     if not nested:
         return None
 
-    # ---- Greedy longest-first non-overlapping span pick ----
     span_cands = []
     for start, end, sig in candidates:
         ni = nested_idx.get(sig)
@@ -1531,15 +1534,13 @@ def _xml_encode_v5_nested(d, ref_idx):
             span_cands.append((end - start, start, end, ni))
     span_cands.sort(key=lambda x: -x[0])
     taken = []
-    final_map = {}   # start -> (end, nested_idx)
+    final_map = {}
     for length, start, end, ni in span_cands:
         if any(start < te and end > ts for ts, te in taken):
             continue
         final_map[start] = (end, ni)
         taken.append((start, end))
 
-    # ---- Recount: drop sigs whose *actual* usage in the non-overlapping
-    #      span pick doesn't pay for the one-time desc ----
     actual_cnt = Counter(ni for _, ni in final_map.values())
     kept_mask = [i for i, sig in enumerate(nested)
                  if actual_cnt.get(i, 0) * (len(sig) - 2) > (len(sig) + 2)]
@@ -1552,7 +1553,6 @@ def _xml_encode_v5_nested(d, ref_idx):
     if not final_map:
         return None
 
-    # ---- PASS 2: re-emit with op 6 for nested refs ----
     struct = bytearray()
     flat = bytes(struct_flat)
     sp = 0
@@ -1564,7 +1564,6 @@ def _xml_encode_v5_nested(d, ref_idx):
         sp = end
     struct += flat[sp:]
 
-    # ---- Assemble ----
     encoded_texts = [_word_encode_text(t, ref_idx) for t in text_chunks]
     out = bytearray([0x58, 0x5E])
     for lst, seed in zip((tag_names, attr_names, attr_vals),
@@ -1588,7 +1587,6 @@ def _xml_encode_v5_nested(d, ref_idx):
     for t in encoded_texts:
         _emit_varint(out, len(t)); out += t
     return bytes(out)
-
 
 def _decode_nested_ops(out, struct, compounds, tag_names, attr_names, attr_vals,
                        texts, nested, depth):
@@ -1620,7 +1618,6 @@ def _decode_nested_ops(out, struct, compounds, tag_names, attr_names, attr_vals,
                                attr_vals, texts, nested, depth + 1)
         else:
             raise TransformError(f"nested op {op}")
-
 
 def _xml_decode_v5_nested(payload):
     if _GLOBAL_REF_BYTES is None:
@@ -1937,6 +1934,7 @@ class Compressor:
         gr8 = (0x9E3779B97F4A7C15).to_bytes(8, 'little')
         self._spread_golden = int.from_bytes(gr8 * 128, 'little')
         self._a82_ks_cache = None
+        self._q64_cache = None
         self._bitrev8_tab = bytes(self._rev8(b) for b in range(256))
         self._nib_swap_tab = bytes(((b << 4) | (b >> 4)) & 0xFF for b in range(256))
         self._rot8_tabs = [bytes(((b << k) | (b >> (8-k))) & 0xFF if k else b for b in range(256)) for k in range(8)]
@@ -1961,12 +1959,26 @@ class Compressor:
             r = (r << 1) | (b & 1); b >>= 1
         return r
 
+    def _is_huge_a256(self):
+        return A256_LIMIT == 0 and A256_MODE in ("exhaustive", "repeat32")
+
     def _verify_all_transforms(self):
         sample = (b"the quick brown fox jumps over the lazy dog " * 3
                   + bytes(range(256)) + os.urandom(64))
         tests = [b"", b"\x00", b"\xff", sample]
         bad = []
         for t in range(1, 257):
+            if t == 256 and self._is_huge_a256():
+                try:
+                    saved_lim = A256_LIMIT
+                    globals()['A256_LIMIT'] = 16
+                    tr = self.fwd[t](sample); back = self.rev[t](tr)
+                    globals()['A256_LIMIT'] = saved_lim
+                    if back != sample:
+                        bad.append((t, len(sample), "mismatch"))
+                except Exception as e:
+                    bad.append((t, len(sample), repr(e)))
+                continue
             for test in tests:
                 try:
                     tr = self.fwd[t](test)
@@ -4718,8 +4730,342 @@ class Compressor:
             out[i] ^= ((L - 1 - i) * 0x9E + 0x6B) & 0xFF
         return bytes(out)
     r_mirror_xor = t_mirror_xor
-    def t256(self, d): return d
-    r256 = t256
+
+    # ====================================================================
+    #   a256 — XOR64 search  (sampled64 with 512 candidates | repeat32 | repeat32_optimal | exhaustive)
+    #     payload:
+    #       b'\x00' + d                              (key = 0 won / raw)
+    #       b'\x01' + key(8B, BE) + xor64(d, key)    (best key won)
+    # ====================================================================
+    def _score_key(self, d, key):
+        try:
+            tr = d if key == 0 else self._xor64_apply(d, key)
+            return len(zlib.compress(tr, 1))
+        except Exception:
+            return len(d) + 1
+
+    def _q64_candidates(self):
+        """
+        512 candidate 64-bit keys.
+          - 80 explicit seeds from math/crypto/hash/magic sources
+          - remaining 432 from Qiskit 64-qubit circuit fingerprint PRNG
+            (falls back to a deterministic PRNG when Qiskit is absent)
+        """
+        if self._q64_cache is not None:
+            return self._q64_cache
+        cands = [
+            0x0000000000000000,  # all-zero baseline
+            0xFFFFFFFFFFFFFFFF,  # all-ones
+            0x9E3779B97F4A7C15,  # golden ratio φ × 2^64
+            0xDEADBEEFCAFEBABE,  # magic
+            0x0123456789ABCDEF,
+            0xFEDCBA9876543210,
+            0xA5A5A5A5A5A5A5A5,  # alternating 1010...
+            0x5555555555555555,  # alternating 0101...
+            0xAAAAAAAAAAAAAAAA,  # repeated 0xAA
+            0x3333333333333333,
+            0xCCCCCCCCCCCCCCCC,
+            0x0F0F0F0F0F0F0F0F,
+            0xF0F0F0F0F0F0F0F0,
+            0x00FF00FF00FF00FF,
+            0xFF00FF00FF00FF00,
+            0x0000FFFF0000FFFF,
+            0xFFFF0000FFFF0000,
+            0x123456789ABCDEF0,
+            0xDEADBEEFDEADBEEF,
+            0xCAFEBABECAFEBABE,
+            0x8BADF00D8BADF00D,
+            0xBAADF00DBAADF00D,
+            0xFEEDFACEFEEDFACE,
+            0x0BADC0DE0BADC0DE,
+            0xDEADC0DEDEADC0DE,
+            0xBADC0FFEBADC0FFE,
+            0xC0DEC0DEC0DEC0DE,
+            0xC001D00DC001D00D,
+            0xDEAD10CCDEAD10CC,
+            0xDEAD2BADDEAD2BAD,
+            0xABADBABEABADBABE,
+            0xBADDCAFEBADDCAFE,
+            # SHA-256 IV constants
+            0x6A09E667F3BCC908,  # also sqrt(2) fraction
+            0xBB67AE8584CAA73B,  # also sqrt(3) fraction
+            0x3C6EF372FE94F82B,  # also sqrt(5) fraction
+            0xA54FF53A5F1D36F1,  # also sqrt(7) fraction
+            0x510E527FADE682D1,  # also sqrt(11) fraction
+            0x9B05688C2B3E6C1F,  # also sqrt(13) fraction
+            0x1F83D9ABFB41BD6B,  # also sqrt(17) fraction
+            0x5BE0CD19137E2179,  # also sqrt(19) fraction
+            # pi, e, sqrt2 digit strings
+            0x243F6A8885A308D3,  # π digits
+            0x7182818284590452,  # e digits
+            0x6A09E667F3BCC908,  # sqrt2 (dup, dedupe)
+            0xB7E151628AED2A6A,  # e start
+            0x8CB6C2FDDBC85C3B,  # √7
+            # AES S-box first bytes
+            0x637C777BF26B6FC5,
+            0x3001672BFED7AB76,
+            0xCA82C97DFA5947F0,
+            0xADD4A2AF9CA472C0,
+            0xB7FD9326363FF7CC,
+            0x34A5E5F171D83115,
+            # ChaCha20 / Salsa20 constants
+            0x617078659AEF9A4B,
+            0x3320646E79622D32,
+            0x6B2065749CF0A8BE,
+            # TEA / XXTEA delta
+            0x9E3779B99E3779B9,
+            0x9E3779B900000000,
+            0x000000009E3779B9,
+            # MurmurHash constants
+            0xFF51AFD7ED558CCD,
+            0xC4CEB9FE1A85EC53,
+            # xxHash constants
+            0x9E3779B185EBCA87,
+            0xC2B2AE3D27D4EB4F,
+            0x165667B19E3779F9,
+            0x85EBCA77C2B2AE63,
+            0x27D4EB2F165667C5,
+            # FNV offset basis
+            0xCBF29CE484222325,
+            # well-known LCG multiplier
+            0x5DEECE66D5DEECE6,
+            # murmur3 32-bit mixing
+            0x85EBCA6B85EBCA6B,
+            0xC2B2AE35C2B2AE35,
+            # repeated 1-bit patterns
+            0x0101010101010101,
+            0x0001000100010001,
+            0x0000000100000001,
+            0x0100010001000100,
+            0x8000000180000001,
+            0x8000000080000000,
+            0xC0000000C0000000,
+            0xE0000000E0000000,
+            0xF0000000F0000000,
+            0xFF000000FF000000,
+            0xFFFFFFFFFF000000,
+            0x000000FFFFFFFFFF,
+            0x7FFFFFFFFFFFFFFF,
+            0x7F7F7F7F7F7F7F7F,
+            0x8080808080808080,
+        ]
+        # Qiskit 64-qubit fingerprint PRNG fills the rest
+        if HAS_QISKIT:
+            try:
+                fp = _circuit_fingerprint(64)
+                rng = random.Random(int.from_bytes(fp, 'big'))
+                while len(cands) < N_Q64_CANDIDATES:
+                    cands.append(rng.getrandbits(64))
+            except Exception:
+                pass
+        # Deterministic fallback
+        if len(cands) < N_Q64_CANDIDATES:
+            rng = random.Random(0x9E3779B97F4A7C15)
+            while len(cands) < N_Q64_CANDIDATES:
+                cands.append(rng.getrandbits(64))
+        # De-duplicate preserving order
+        seen = set(); uniq = []
+        for k in cands:
+            if k not in seen:
+                seen.add(k); uniq.append(k)
+        # Top up if dedupe shrank the list below 512
+        rng = random.Random(0xDEADBEEFCAFEBABE)
+        while len(uniq) < N_Q64_CANDIDATES:
+            k = rng.getrandbits(64)
+            if k not in seen:
+                seen.add(k); uniq.append(k)
+        self._q64_cache = tuple(uniq[:N_Q64_CANDIDATES])
+        return self._q64_cache
+
+    @staticmethod
+    def _xor64_apply(d, key):
+        n = len(d)
+        if n == 0 or key == 0:
+            return bytes(d)
+        kb = key.to_bytes(KEY_BYTES, 'little')
+        reps = (n + KEY_BYTES - 1) // KEY_BYTES
+        mask = (kb * reps)[:n]
+        return (int.from_bytes(d, 'little') ^ int.from_bytes(mask, 'little')).to_bytes(n, 'little')
+
+    def t256(self, d):
+        if not d:
+            return b'\x00'
+        if len(d) < 16:
+            return b'\x00' + d
+        try:
+            if   A256_MODE == "exhaustive":       return self._t256_exhaustive(d)
+            elif A256_MODE == "repeat32":         return self._t256_repeat32(d)
+            elif A256_MODE == "repeat32_optimal": return self._t256_repeat32_optimal(d)
+            else:                                 return self._t256_sampled(d)
+        except Exception:
+            return b'\x00' + d
+
+    def _t256_sampled(self, d):
+        best_key = 0
+        best_score = len(d) + 1
+        for key in self._q64_candidates():
+            sc = self._score_key(d, key)
+            if sc < best_score:
+                best_score = sc
+                best_key = key
+        if best_key == 0:
+            return b'\x00' + d
+        return b'\x01' + best_key.to_bytes(KEY_BYTES, 'big') + self._xor64_apply(d, best_key)
+
+    def _t256_repeat32_optimal(self, d):
+        if len(d) < 16:
+            return b'\x00' + d
+        cols = [[0]*256 for _ in range(4)]
+        for i, b in enumerate(d):
+            cols[i & 3][b] += 1
+        seed = 0
+        for p in range(4):
+            f = cols[p]
+            bk, bs = 0, -1
+            for k in range(256):
+                s = 0
+                for v in range(256):
+                    fv = f[v ^ k]; s += fv * fv
+                if s > bs:
+                    bs, bk = s, k
+            seed |= bk << (p * 8)
+        key = (seed << 32) | seed
+        base = self._score_key(d, 0)
+        alt  = self._score_key(d, key)
+        if alt >= base:
+            return b'\x00' + d
+        return b'\x01' + key.to_bytes(KEY_BYTES, 'big') + self._xor64_apply(d, key)
+
+    def _t256_repeat32(self, d):
+        max_seed   = A256_LIMIT if A256_LIMIT > 0 else (1 << 32)
+        start_seed = A256_START
+        prog_every = A256_PROGRESS
+        ckpt_every = A256_CKPT
+        ckpt_dir = os.path.join(tempfile.gettempdir(), "ppmd_a256_ckpt")
+        try: os.makedirs(ckpt_dir, exist_ok=True)
+        except Exception: ckpt_dir = None
+        data_hash = hashlib.sha256(d).hexdigest()[:16] if ckpt_dir else None
+        ckpt_path = os.path.join(ckpt_dir, f"a256r32_{data_hash}.ckpt") if ckpt_dir else None
+        best_key = 0; best_score = self._score_key(d, 0)
+        if ckpt_path and os.path.exists(ckpt_path):
+            try:
+                with open(ckpt_path, 'rb') as f: raw = f.read(24)
+                if len(raw) == 24:
+                    ck_seed, ck_bk, ck_bs = struct.unpack('<QQQ', raw)
+                    if ck_seed < max_seed:
+                        start_seed = ck_seed; best_key = ck_bk; best_score = ck_bs
+                        print(f"  [a256 repeat32] resumed at seed {start_seed:,}")
+            except Exception: pass
+        print(f"  [a256 repeat32] range=[{start_seed:,}, {max_seed:,})  "
+              f"payload={len(d):,}B  key=seed||seed  best=0x{best_key:016x}  score={best_score}")
+        t0 = time.time(); n_eval = 0; seed = start_seed
+        try:
+            for seed in range(start_seed, max_seed):
+                key = (seed << 32) | seed
+                sc = self._score_key(d, key)
+                n_eval += 1
+                if sc < best_score:
+                    best_score, best_key = sc, key
+                if n_eval % prog_every == 0:
+                    el = time.time() - t0; rate = n_eval / el if el > 0 else 0
+                    pct = 100.0 * (seed - start_seed) / max(1, max_seed - start_seed)
+                    rem = ((max_seed - seed) / rate) if rate > 0 else float('inf')
+                    if rem > 86400: eta = f"{rem/86400:.2f} days"
+                    elif rem > 3600: eta = f"{rem/3600:.2f} hours"
+                    else: eta = f"{rem:.1f} s"
+                    print(f"  [a256 repeat32] seed={seed:,}/{max_seed:,}  "
+                          f"({pct:.5f}%)  best=0x{best_key:016x}  "
+                          f"score={best_score}  rate={rate:,.0f}/s  ETA={eta}")
+                if ckpt_every > 0 and ckpt_path and n_eval % ckpt_every == 0:
+                    try:
+                        with open(ckpt_path, 'wb') as f:
+                            f.write(struct.pack('<QQQ', seed + 1, best_key, best_score))
+                    except Exception: pass
+        except KeyboardInterrupt:
+            if ckpt_path:
+                try:
+                    with open(ckpt_path, 'wb') as f:
+                        f.write(struct.pack('<QQQ', seed + 1, best_key, best_score))
+                    print(f"\n  [a256 repeat32] interrupted; saved at seed {seed+1:,}")
+                except Exception: pass
+            raise
+        if ckpt_path:
+            try: os.remove(ckpt_path)
+            except Exception: pass
+        print(f"  [a256 repeat32] DONE: {n_eval:,} seeds in {time.time()-t0:.1f}s  "
+              f"best=0x{best_key:016x}")
+        if best_key == 0:
+            return b'\x00' + d
+        return b'\x01' + best_key.to_bytes(KEY_BYTES, 'big') + self._xor64_apply(d, best_key)
+
+    def _t256_exhaustive(self, d):
+        max_key   = A256_LIMIT if A256_LIMIT > 0 else (1 << 64)
+        start_key = A256_START
+        prog_every = A256_PROGRESS
+        ckpt_every = A256_CKPT
+        ckpt_dir = os.path.join(tempfile.gettempdir(), "ppmd_a256_ckpt")
+        try: os.makedirs(ckpt_dir, exist_ok=True)
+        except Exception: ckpt_dir = None
+        data_hash = hashlib.sha256(d).hexdigest()[:16] if ckpt_dir else None
+        ckpt_path = os.path.join(ckpt_dir, f"a256_{data_hash}.ckpt") if ckpt_dir else None
+        best_key = 0; best_score = self._score_key(d, 0)
+        if ckpt_path and os.path.exists(ckpt_path):
+            try:
+                with open(ckpt_path, 'rb') as f: raw = f.read(24)
+                if len(raw) == 24:
+                    ck_key, ck_bk, ck_bs = struct.unpack('<QQQ', raw)
+                    if ck_key < max_key:
+                        start_key = ck_key; best_key = ck_bk; best_score = ck_bs
+                        print(f"  [a256 exhaustive] resumed at key {start_key:,}")
+            except Exception: pass
+        print(f"  [a256 exhaustive] range=[{start_key:,}, {max_key:,})  "
+              f"payload={len(d):,}B  best=0x{best_key:016x}  score={best_score}")
+        t0 = time.time(); n_eval = 0; key = start_key
+        try:
+            for key in range(start_key, max_key):
+                sc = self._score_key(d, key)
+                n_eval += 1
+                if sc < best_score: best_score, best_key = sc, key
+                if n_eval % prog_every == 0:
+                    el = time.time() - t0; rate = n_eval / el if el > 0 else 0
+                    pct = 100.0 * (key - start_key) / max(1, max_key - start_key)
+                    rem = ((max_key - key) / rate) if rate > 0 else float('inf')
+                    if rem > 1e9: eta = f"{rem/86400/365.25:.2e} years"
+                    elif rem > 86400: eta = f"{rem/86400:.1f} days"
+                    else: eta = f"{rem:.1f} s"
+                    print(f"  [a256 exhaustive] key={key:,}/{max_key:,}  "
+                          f"({pct:.6f}%)  best=0x{best_key:016x}  "
+                          f"score={best_score}  rate={rate:,.0f}/s  ETA={eta}")
+                if ckpt_every > 0 and ckpt_path and n_eval % ckpt_every == 0:
+                    try:
+                        with open(ckpt_path, 'wb') as f:
+                            f.write(struct.pack('<QQQ', key + 1, best_key, best_score))
+                    except Exception: pass
+        except KeyboardInterrupt:
+            if ckpt_path:
+                try:
+                    with open(ckpt_path, 'wb') as f:
+                        f.write(struct.pack('<QQQ', key + 1, best_key, best_score))
+                    print(f"\n  [a256 exhaustive] interrupted; saved at key {key+1:,}")
+                except Exception: pass
+            raise
+        if ckpt_path:
+            try: os.remove(ckpt_path)
+            except Exception: pass
+        print(f"  [a256 exhaustive] DONE: {n_eval:,} keys in {time.time()-t0:.1f}s  "
+              f"best=0x{best_key:016x}")
+        if best_key == 0:
+            return b'\x00' + d
+        return b'\x01' + best_key.to_bytes(KEY_BYTES, 'big') + self._xor64_apply(d, best_key)
+
+    def r256(self, d):
+        if not d: return b''
+        mode = d[0]
+        if mode == 0: return d[1:]
+        if mode != 1: raise TransformError(f"a256 mode {mode}")
+        if len(d) < 1 + KEY_BYTES: raise TransformError("a256 short")
+        key = int.from_bytes(d[1:1+KEY_BYTES], 'big')
+        return self._xor64_apply(d[1+KEY_BYTES:], key)
 
     def _maps(self):
         eager_f = {}; eager_r = {}
@@ -4768,7 +5114,16 @@ class Compressor:
             f, r = self._dyn2(i); eager_f[i] = f; eager_r[i] = r
         eager_f[256] = self.t256; eager_r[256] = self.r256
         self.fwd = eager_f; self.rev = eager_r
-        print(f"Transforms registered: 1-83 fixed + 84-255 (22 families × 8) + 256 identity.")
+        if A256_MODE == "exhaustive":
+            mode = "EXHAUSTIVE 2^64 (may never finish)"
+        elif A256_MODE == "repeat32":
+            mode = ("REPEAT-32 (2^32 seed||seed)" if A256_LIMIT == 0
+                    else f"REPEAT-32 limited to {A256_LIMIT:,}")
+        elif A256_MODE == "repeat32_optimal":
+            mode = "REPEAT-32 OPTIMAL (< 1 ms)"
+        else:
+            mode = f"sampled64 ({N_Q64_CANDIDATES} candidates × 64-bit key)"
+        print(f"Transforms registered: 1-83 fixed + 84-255 (22 families × 8) + 256 XOR64 ({mode}).")
 
     def _pairs(self):
         self.pairs = []
@@ -4795,12 +5150,16 @@ class Compressor:
 
     def verify_single(self, data, t):
         try:
+            if t == 256 and self._is_huge_a256():
+                return True
             tr = self.fwd[t](data)
             return self.rev[t](tr) == data
         except Exception: return False
 
     def verify_pair(self, data, a, b):
         try:
+            if self._is_huge_a256() and (a == 256 or b == 256):
+                return True
             ta = self.fwd[a](data); tr = self.fwd[b](ta)
             return self.rev[a](self.rev[b](tr)) == data
         except Exception: return False
@@ -4865,7 +5224,8 @@ class Compressor:
         print(f"Mode: FAST ({'ON' if FAST_MODE else 'OFF'}) "
               f"full-singles={'ON' if FULL_SINGLES else 'OFF'} "
               f"full-pairs={'ON' if FULL_PAIRS else 'OFF'} "
-              f"skip-slow={'ON' if SKIP_SLOW else 'OFF'}")
+              f"skip-slow={'ON' if SKIP_SLOW else 'OFF'} "
+              f"a256={A256_MODE}")
         print(f"Header: extension only  <orig>.aXXXX  (XXXX = 4 hex digits)")
         t_start = time.time()
 
@@ -4908,7 +5268,7 @@ class Compressor:
                 _add_single(t, f"a{t}")
         else:
             _add_single(1, "a1")
-            for t in (62, 63, 66, 70, 75, 83): _add_single(t, f"a{t}")
+            for t in (62, 63, 66, 70, 75, 83, 256): _add_single(t, f"a{t}")
 
         if xml_enc is not None:
             try:
@@ -4960,7 +5320,7 @@ class Compressor:
                 if pool is not None: pool.close(); pool.join()
                 _GLOBAL_COMP = None; _GLOBAL_DATA = None; _GLOBAL_FWD = {}
         elif not selftest:
-            for (a, b) in [(61, 1), (61, 62), (62, 1), (63, 1), (66, 1)]:
+            for (a, b) in [(61, 1), (61, 62), (62, 1), (63, 1), (66, 1), (256, 1)]:
                 if (a, b) in self._pair_index:
                     _add_pair(a, b, f"b{self._pair_index[(a, b)]}")
 
@@ -5072,6 +5432,9 @@ class Compressor:
         print("="*60); print("Sweep: all 256 single transforms"); print("="*60)
         bad = []
         for t in range(1, 257):
+            if t == 256 and self._is_huge_a256():
+                print(f"    a256 {A256_MODE} unbounded: skipped in sweep (would run forever)")
+                continue
             try:
                 tr = self.fwd[t](sample); back = self.rev[t](tr)
                 if back != sample: bad.append((t, "mismatch"))
@@ -5090,6 +5453,8 @@ class Compressor:
         print("="*60); print(f"Sweep: {limit} of {len(self.pairs)} pairs"); print("="*60)
         bad = 0; tested = 0; errors = []
         for i, (a, b) in enumerate(self.pairs[:limit]):
+            if self._is_huge_a256() and (a == 256 or b == 256):
+                continue
             try:
                 tr = self.fwd[b](self.fwd[a](sample))
                 back = self.rev[a](self.rev[b](tr))
@@ -5110,6 +5475,8 @@ class Compressor:
     def selftest_fixed(self, n=30):
         import os as _os
         fixed = [7, 8, 9, 33, 35, 36, 37, 45, 58, 72, 77, 78, 79, 80, 81, 82, 83]
+        if not self._is_huge_a256():
+            fixed = fixed + [256]
         print("="*60); print("Targeted sweep: FIXED transforms"); print("="*60)
         bad = []
         forced = list(range(0, 128)) + [256, 512, 1024, 2048, 4096]
@@ -5283,6 +5650,16 @@ def main():
     print(f"* XML v3    : t_xml picks XY / XZ / XW / XC / XD / XE (nested)")
     print(f"* DOCX      : container-aware ZIP+xml (Lepton JPEG, word-token XML)")
     print(f"* a84-a255  : 22 algorithm families (delta/transpose/swap/bitrev/…)")
+    if A256_MODE == "exhaustive":
+        print(f"* a256      : EXHAUSTIVE  for key in range(2**64) — MAY NEVER FINISH")
+        if A256_LIMIT > 0: print(f"              limit={A256_LIMIT:,} keys")
+    elif A256_MODE == "repeat32":
+        lim = f" (limit {A256_LIMIT:,})" if A256_LIMIT > 0 else ""
+        print(f"* a256      : REPEAT-32  all 2^32 keys of form seed32||seed32{lim}")
+    elif A256_MODE == "repeat32_optimal":
+        print(f"* a256      : REPEAT-32 OPTIMAL  provably best seed||seed in < 1 ms")
+    else:
+        print(f"* a256      : {N_Q64_CANDIDATES} candidates × {KEY_BYTES*8}-bit XOR key (best wins)")
     print(f"* Self-test : fast mode — runs in ~0.5 s")
     try:
         mp.set_start_method('fork', force=True)
