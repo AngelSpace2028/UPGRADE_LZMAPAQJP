@@ -1,9 +1,11 @@
-#!/usr/bin/env python3 written by Jurijus Pacalovas
+#!/usr/bin/env python3
+# written by Jurijus Pacalovas
 # -*- coding: utf-8 -*-
 # PPMD_1.6 — Lossless Tournament + XML structural v3 (XY/XZ/XW/XC/XD/XE) + Qiskit mask
 # + wide-base minus transforms (a77-a83) + 22-family diverse filler (a84-a255)
 # + a256 = XOR64 search — 512 candidate keys in sampled64 mode
 # EXTENSION-AS-HEADER — saves the 2 bytes inside the file
+# + XLSX / PPTX seed dictionaries (container-aware path now earns real gains)
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -73,7 +75,7 @@ except (ValueError, AttributeError):
 
 IDENTITY_IDS = frozenset((1, 31, 32))
 MAX_PAIRS = 65280
-N_Q64_CANDIDATES = 512                 # ← 512 candidate keys (was 64)
+N_Q64_CANDIDATES = 512
 KEY_BYTES = 8
 
 _GLOBAL_COMP = None; _GLOBAL_DATA = None; _GLOBAL_FWD = {}
@@ -629,6 +631,172 @@ _DOCX_VALS = [
     b'core-properties+xml', b'extended-properties+xml', b'relationships+xml',
     b'docx', b'docm', b'dotx', b'dotm',
 ]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH #1 — XLSX SpreadsheetML seed tags / attrs / vals
+# ═══════════════════════════════════════════════════════════════════════════
+_DOCX_TAGS += [
+    b'worksheet', b'sheetData', b'sheetPr', b'sheetViews', b'sheetView',
+    b'dimension', b'sheetFormatPr', b'cols', b'col', b'row', b'c', b'v', b'f',
+    b'is', b't', b'si', b'rPh', b'phoneticPr', b'r', b'mergeCells',
+    b'mergeCell', b'hyperlinks', b'hyperlink', b'autoFilter', b'filterColumn',
+    b'filters', b'filter', b'dataValidations', b'dataValidation',
+    b'conditionalFormatting', b'cfRule', b'pageMargins', b'pageSetup',
+    b'headerFooter', b'drawing', b'legacyDrawing', b'extLst', b'ext',
+    b'workbook', b'workbookPr', b'workbookProtection', b'bookViews', b'workbookView',
+    b'sheets', b'sheet', b'functionGroups', b'functionGroup', b'externalReferences',
+    b'definedNames', b'definedName', b'calcPr', b'oleSize', b'pivotCaches',
+    b'styleSheet', b'numFmts', b'numFmt', b'fonts', b'font', b'fills', b'fill',
+    b'patternFill', b'gradientFill', b'fgColor', b'bgColor', b'stop',
+    b'borders', b'border', b'cellXfs', b'xf', b'cellStyleXfs', b'cellStyles', b'cellStyle',
+    b'dxfs', b'tableStyles', b'tableStyle', b'tableStyleElement',
+    b'colors', b'indexedColors', b'rgbColor', b'color',
+    b'sst', b'plotArea', b'layout', b'ser', b'cat',
+    b'val', b'numRef', b'strRef', b'barChart', b'barDir', b'grouping', b'serLines',
+    b'lineChart', b'pieChart', b'scatterChart', b'areaChart', b'legend',
+    b'legendPos', b'tx', b'rich', b'bodyPr', b'lstStyle',
+    b'a:theme', b'a:themeElements', b'a:clrScheme', b'a:dk1', b'a:lt1',
+    b'a:dk2', b'a:lt2', b'a:accent1', b'a:accent2', b'a:accent3',
+    b'a:accent4', b'a:accent5', b'a:accent6', b'a:hlink', b'a:folHlink',
+    b'a:fontScheme', b'a:majorFont', b'a:minorFont', b'a:latin',
+    b'a:ea', b'a:cs', b'a:font', b'a:fmtScheme', b'a:fillStyleLst',
+    b'a:lnStyleLst', b'a:effectStyleLst', b'a:bgFillStyleLst',
+]
+_DOCX_ATTRS += [
+    b'r', b't', b's', b'ref', b'spans', b'count', b'uniqueCount',
+    b'formatCode', b'numFmtId', b'fontId', b'fillId', b'borderId', b'xfId',
+    b'applyNumberFormat', b'applyFont', b'applyFill', b'applyBorder',
+    b'applyAlignment', b'applyProtection',
+    b'horizontal', b'vertical', b'wrapText', b'shrinkToFit', b'indent',
+    b'textRotation', b'readingOrder', b'justifyLastLine',
+    b'sheetId', b'state', b'tabSelected', b'hideFormula',
+    b'caption', b'description', b'hidden',
+    b'localSheetId', b'comment', b'customMenu', b'help',
+    b'statusBar', b'size', b'show', b'date1904', b'filterMode',
+    b'customFormat', b'customHeight', b'zeroHeight', b'thickTop',
+    b'thickBottom', b'outlineLevel', b'collapsed', b'ph', b'activeTab',
+    b'firstSheet', b'firstSheetId', b'filterButton',
+    b'rightToLeft', b'end', b'pane', b'xSplit', b'ySplit',
+    b'topLeftCell', b'activePane', b'view', b'zoomScale',
+    b'zoomScaleNormal', b'showGridLines', b'showRowColHeaders',
+    b'allowFilter', b'showFormulas', b'showZeros',
+    b'xmlns', b'xmlns:r', b'xmlns:mc', b'xmlns:x14ac',
+]
+_DOCX_VALS += [
+    b's', b'n', b'b', b'e', b'str', b'inlineStr', b'd',
+    b'General', b'0.00', b'#,##0', b'#,##0.00',
+    b'0%', b'0.00%', b'0.00E+00', b'# ?/?', b'# ??/??',
+    b'yyyy-mm-dd', b'd-mmm-yy', b'd-mmm', b'mmm-yy',
+    b'h:mm AM/PM', b'h:mm:ss AM/PM', b'h:mm', b'h:mm:ss',
+    b'm/d/yy h:mm', b'mm:ss', b'[h]:mm:ss', b'mm:ss.0',
+    b'yyyy-mm-dd h:mm:ss', b'@',
+    b'FF000000', b'FFFFFFFF', b'FFC00000', b'FFFF0000', b'FF00B050',
+    b'FF0070C0', b'FFED7D31', b'FFA5A5A5', b'FFFFC000',
+    b'FF5B9BD5', b'FF70AD47', b'FF7030A0', b'FFFF7C80',
+    b'Aptos', b'Calibri Light', b'Cambria Math',
+    b'22', b'28', b'36', b'48', b'72',
+    b'solid', b'medium', b'thin', b'hair', b'mediumDashed',
+    b'dashDot', b'mediumDashDot', b'dashDotDot', b'mediumDashDotDot', b'slantDashDot',
+    b'visible', b'veryHidden',
+    b'1:1', b'1:2', b'1:3', b'1:4', b'A1:Z1', b'A1:AZ1',
+    b'http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet',
+    b'http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles',
+    b'http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings',
+    b'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml',
+    b'application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml',
+    b'application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml',
+    b'application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml',
+    b'application/vnd.openxmlformats-officedocument.spreadsheetml.chartsheet+xml',
+    b'application/vnd.openxmlformats-officedocument.drawing+xml',
+    b'application/vnd.openxmlformats-officedocument.chart+xml',
+]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH #2 — PPTX PresentationML seed tags / attrs / vals
+# ═══════════════════════════════════════════════════════════════════════════
+_DOCX_TAGS += [
+    b'p:sld', b'p:sldLayout', b'p:sldMaster', b'p:sldSz', b'p:notesSz',
+    b'p:presentation', b'p:notesMaster', b'p:notes',
+    b'p:sldIdLst', b'p:sldId', b'p:sldLayoutIdLst', b'p:sldLayoutId',
+    b'p:sldMasterIdLst', b'p:sldMasterId', b'p:notesMasterIdLst',
+    b'p:notesMasterId', b'p:handoutMasterIdLst', b'p:handoutMasterId',
+    b'p:sp', b'p:spPr', b'p:txBody', b'p:nvSpPr', b'p:nvPr', b'p:nvPicPr',
+    b'p:nvGraphicFramePr', b'p:nvCxnSpPr', b'p:nvGrpSpPr',
+    b'p:pic', b'p:graphicFrame', b'p:grpSp', b'p:grpSpPr', b'p:cxnSp',
+    b'p:cNvPr', b'p:cNvSpPr', b'p:cNvPicPr', b'p:cNvGraphicFramePr',
+    b'p:cNvCxnSpPr', b'p:cNvGrpSpPr',
+    b'p:cSld', b'p:clrMapOvr', b'p:bg', b'p:bgRef', b'p:bgPr',
+    b'p:style', b'p:txStyles', b'p:titleStyle', b'p:bodyStyle', b'p:otherStyle',
+    b'p:clrMap', b'p:extLst', b'p:ext',
+    b'p:transition', b'p:timing', b'p:anim', b'p:animEffect', b'p:animMotion',
+    b'p:animRot', b'p:animScale', b'p:audio', b'p:video', b'p:cmd', b'p:cond',
+    b'p:childTnLst', b'p:seq', b'p:prevCondLst', b'p:nextCondLst',
+    b'a:tbl', b'a:tblPr', b'a:tblGrid', b'a:gridCol', b'a:tr', b'a:tc',
+    b'a:tcPr', b'a:tcTxBody', b'a:tableStyleId',
+    b'a:p', b'a:pPr', b'a:rPr', b'a:defRPr', b'a:endParaRPr',
+    b'a:bodyPr', b'a:lstStyle', b'a:br', b'a:fld',
+    b'a:spPr', b'a:custGeom', b'a:pathLst', b'a:path', b'a:moveTo', b'a:lnTo',
+    b'a:cubicBezTo', b'a:quadBezTo', b'a:close', b'a:pt', b'a:gdLst', b'a:gd',
+    b'a:ahLst', b'a:ahXY', b'a:ahPts', b'a:cxnLst', b'a:cxn', b'a:rect',
+    b'a:prstTxWarp',
+    b'a:sysClr', b'a:prstClr', b'a:scrgbClr', b'a:hslClr', b'a:lumMod',
+    b'a:lumOff', b'a:satMod', b'a:tint', b'a:shade', b'a:alpha',
+    b'a:hue', b'a:sat', b'a:lum',
+    b'a:gradFill', b'a:gsLst', b'a:gs', b'a:pattFill',
+    b'a:noFill', b'a:srcRect', b'a:tile', b'a:effectLst', b'a:effectDag',
+    b'a:outerShdw', b'a:innerShdw', b'a:glow', b'a:reflection',
+    b'a:scene3d', b'a:sp3d', b'a:bevelT', b'a:bevelB', b'a:flatTx',
+    b'a:softEdge', b'a:prstShdw',
+]
+_DOCX_ATTRS += [
+    b'p:sz', b'p:type', b'p:r', b'p:ph', b'p:idx', b'p:lvl',
+    b'p:marL', b'p:marR', b'p:marT', b'p:marB', b'p:indent',
+    b'p:algn', b'p:defTabSz', b'p:rtl', b'p:eaLnBrk', b'p:latinLnBrk',
+    b'p:hangingPunct', b'p:spcBef', b'p:spcAft', b'p:buClrTx',
+    b'p:buSzTx', b'p:buFontTx', b'p:buNone', b'p:buAutoNum',
+    b'p:buChar', b'p:buBlip', b'p:normAutofit', b'p:spAutoFit',
+    b'p:noAutofit', b'p:fontScale', b'p:lnSpcReduction',
+    b'p:showMasterSp', b'p:showMasterPhAnim',
+    b'p:useBgFill', b'p:followMasterBackground',
+    b'a:anchor', b'a:anchorCtr', b'a:wrap', b'a:lIns', b'a:tIns', b'a:rIns',
+    b'a:bIns', b'a:numCol', b'a:numRow', b'a:horzOverflow',
+    b'a:vertOverflow', b'a:vert', b'a:spcFirstLastPara',
+    b'a:cap', b'a:baseline',
+    b'a:b', b'a:i', b'a:u', b'a:strike', b'a:sz', b'a:color',
+    b'a:typeface', b'a:pitchFamily', b'a:charset', b'a:panose',
+    b'a:fmla', b'a:desc',
+    b'a:chOff', b'a:chExt', b'a:bwMode',
+]
+_DOCX_VALS += [
+    b'9144000', b'6858000', b'12192000',
+    b'screen4x3', b'screen16x9', b'screen16x10', b'A4', b'letter',
+    b'custom',
+    b'title', b'body', b'ctrTitle', b'subTitle', b'dt', b'ftr', b'sldNum',
+    b'obj', b'pic', b'chart', b'tbl', b'media', b'clipArt', b'dgm', b'ole',
+    b'l', b'ctr', b'just', b'dist', b'thaiDist', b'low', b'high',
+    b'full', b'text', b'background', b'logo',
+    b'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide',
+    b'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout',
+    b'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster',
+    b'http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesMaster',
+    b'http://schemas.openxmlformats.org/officeDocument/2006/relationships/handoutMaster',
+    b'http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide',
+    b'http://schemas.openxmlformats.org/officeDocument/2006/relationships/audio',
+    b'http://schemas.openxmlformats.org/officeDocument/2006/relationships/video',
+    b'application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml',
+    b'application/vnd.openxmlformats-officedocument.presentationml.slide+xml',
+    b'application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml',
+    b'application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml',
+    b'application/vnd.openxmlformats-officedocument.presentationml.notesMaster+xml',
+    b'application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml',
+    b'application/vnd.openxmlformats-officedocument.presentationml.handoutMaster+xml',
+    b'application/vnd.openxmlformats-officedocument.presentationml.presProps+xml',
+    b'application/vnd.openxmlformats-officedocument.presentationml.viewProps+xml',
+    b'application/vnd.openxmlformats-officedocument.presentationml.tableStyles+xml',
+    b'application/vnd.openxmlformats-officedocument.drawingml.chart+xml',
+    b'application/vnd.openxmlformats-officedocument.drawingml.diagramData+xml',
+]
+
 _DOCX_TAGS  = list(dict.fromkeys(_DOCX_TAGS))
 _DOCX_ATTRS = list(dict.fromkeys(_DOCX_ATTRS))
 _DOCX_VALS  = list(dict.fromkeys(_DOCX_VALS))
@@ -732,6 +900,98 @@ _DOCX_COMPOUND_SEEDS_RAW = [
     (b'w:dstrike',  []),
     (b'w:vanish',   []),
     (b'w:noProof',  []),
+]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH #3 — XLSX + PPTX compound seeds (tag+attr+val → single varint)
+# ═══════════════════════════════════════════════════════════════════════════
+_DOCX_COMPOUND_SEEDS_RAW += [
+    # ---- XLSX worksheet.xml boilerplate ----
+    (b'sheetPr',        []),
+    (b'sheetViews',     []),
+    (b'sheetView',      [(b'workbookViewId', b'0')]),
+    (b'sheetView',      [(b'workbookViewId', b'0'), (b'showGridLines', b'1')]),
+    (b'dimension',      [(b'ref', b'A1')]),
+    (b'sheetFormatPr',  [(b'defaultRowHeight', b'15')]),
+    (b'cols',           []),
+    (b'sheetData',      []),
+    (b'row',            [(b'r', b'1')]),
+    (b'c',              [(b't', b's')]),
+    (b'c',              [(b't', b'n')]),
+    (b'c',              []),
+    (b'v',              []),
+    (b'f',              []),
+    (b'is',             []),
+    (b't',              [(b'xml:space', b'preserve')]),
+    (b't',              []),
+    # ---- XLSX workbook.xml ----
+    (b'workbookPr',     [(b'date1904', b'0')]),
+    (b'workbookPr',     []),
+    (b'bookViews',      []),
+    (b'workbookView',   [(b'xWindow', b'0'), (b'yWindow', b'0'),
+                         (b'windowWidth', b'16384'), (b'windowHeight', b'8192')]),
+    (b'sheets',         []),
+    (b'sheet',          []),
+    (b'calcPr',         [(b'calcId', b'191029')]),
+    (b'calcPr',         []),
+    # ---- XLSX styles.xml ----
+    (b'styleSheet',     []),
+    (b'numFmts',        [(b'count', b'0')]),
+    (b'fonts',          [(b'count', b'1')]),
+    (b'fills',          [(b'count', b'2')]),
+    (b'borders',        [(b'count', b'1')]),
+    (b'cellStyleXfs',   [(b'count', b'1')]),
+    (b'cellXfs',        [(b'count', b'1')]),
+    (b'cellStyles',     [(b'count', b'1')]),
+    (b'dxfs',           [(b'count', b'0')]),
+    (b'tableStyles',    [(b'count', b'0'), (b'defaultTableStyle', b'TableStyleMedium2'),
+                         (b'defaultPivotStyle', b'PivotStyleLight16')]),
+    (b'font',           []),
+    (b'fill',           []),
+    (b'border',         []),
+    (b'xf',             [(b'numFmtId', b'0'), (b'fontId', b'0'), (b'fillId', b'0'),
+                         (b'borderId', b'0'), (b'xfId', b'0')]),
+    (b'xf',             []),
+    # ---- PPTX presentation.xml ----
+    (b'sldMasterIdLst', []),
+    (b'sldIdLst',       []),
+    (b'sldSz',          [(b'cx', b'9144000'), (b'cy', b'6858000')]),
+    (b'sldSz',          [(b'cx', b'9144000'), (b'cy', b'6858000'),
+                         (b'type', b'screen4x3')]),
+    (b'notesSz',        [(b'cx', b'6858000'), (b'cy', b'9144000')]),
+    (b'defaultTextStyle', []),
+    (b'clrMap',         [(b'bg1', b'lt1'), (b'tx1', b'dk1'),
+                         (b'bg2', b'lt2'), (b'tx2', b'dk2'),
+                         (b'accent1', b'accent1'), (b'accent2', b'accent2'),
+                         (b'accent3', b'accent3'), (b'accent4', b'accent4'),
+                         (b'accent5', b'accent5'), (b'accent6', b'accent6'),
+                         (b'hlink', b'hlink'), (b'folHlink', b'folHlink')]),
+    # ---- PPTX slide.xml boilerplate ----
+    (b'cSld',           []),
+    (b'spTree',         []),
+    (b'grpSp',          []),
+    (b'grpSpPr',        []),
+    (b'xfrm',           []),
+    (b'off',            [(b'x', b'0'), (b'y', b'0')]),
+    (b'ext',            []),
+    (b'chOff',          [(b'x', b'0'), (b'y', b'0')]),
+    (b'chExt',          []),
+    (b'sp',             []),
+    (b'nvSpPr',         []),
+    (b'cNvPr',          [(b'id', b'1'), (b'name', b'')]),
+    (b'cNvSpPr',        []),
+    (b'spPr',           []),
+    (b'txBody',         []),
+    (b'bodyPr',         [(b'rtlCol', b'0')]),
+    (b'bodyPr',         []),
+    (b'lstStyle',       []),
+    (b'p',              []),
+    (b'pPr',            []),
+    (b'r',              []),
+    (b'rPr',            [(b'lang', b'en-US'), (b'dirty', b'0')]),
+    (b't',              []),
+    (b'endParaRPr',     [(b'lang', b'en-US'), (b'dirty', b'0')]),
+    (b'endParaRPr',     [(b'lang', b'en-US')]),
 ]
 
 def _build_compound_seed():
@@ -4731,12 +4991,6 @@ class Compressor:
         return bytes(out)
     r_mirror_xor = t_mirror_xor
 
-    # ====================================================================
-    #   a256 — XOR64 search  (sampled64 with 512 candidates | repeat32 | repeat32_optimal | exhaustive)
-    #     payload:
-    #       b'\x00' + d                              (key = 0 won / raw)
-    #       b'\x01' + key(8B, BE) + xor64(d, key)    (best key won)
-    # ====================================================================
     def _score_key(self, d, key):
         try:
             tr = d if key == 0 else self._xor64_apply(d, key)
@@ -4745,111 +4999,39 @@ class Compressor:
             return len(d) + 1
 
     def _q64_candidates(self):
-        """
-        512 candidate 64-bit keys.
-          - 80 explicit seeds from math/crypto/hash/magic sources
-          - remaining 432 from Qiskit 64-qubit circuit fingerprint PRNG
-            (falls back to a deterministic PRNG when Qiskit is absent)
-        """
         if self._q64_cache is not None:
             return self._q64_cache
         cands = [
-            0x0000000000000000,  # all-zero baseline
-            0xFFFFFFFFFFFFFFFF,  # all-ones
-            0x9E3779B97F4A7C15,  # golden ratio φ × 2^64
-            0xDEADBEEFCAFEBABE,  # magic
-            0x0123456789ABCDEF,
-            0xFEDCBA9876543210,
-            0xA5A5A5A5A5A5A5A5,  # alternating 1010...
-            0x5555555555555555,  # alternating 0101...
-            0xAAAAAAAAAAAAAAAA,  # repeated 0xAA
-            0x3333333333333333,
-            0xCCCCCCCCCCCCCCCC,
-            0x0F0F0F0F0F0F0F0F,
-            0xF0F0F0F0F0F0F0F0,
-            0x00FF00FF00FF00FF,
-            0xFF00FF00FF00FF00,
-            0x0000FFFF0000FFFF,
-            0xFFFF0000FFFF0000,
-            0x123456789ABCDEF0,
-            0xDEADBEEFDEADBEEF,
-            0xCAFEBABECAFEBABE,
-            0x8BADF00D8BADF00D,
-            0xBAADF00DBAADF00D,
-            0xFEEDFACEFEEDFACE,
-            0x0BADC0DE0BADC0DE,
-            0xDEADC0DEDEADC0DE,
-            0xBADC0FFEBADC0FFE,
-            0xC0DEC0DEC0DEC0DE,
-            0xC001D00DC001D00D,
-            0xDEAD10CCDEAD10CC,
-            0xDEAD2BADDEAD2BAD,
-            0xABADBABEABADBABE,
-            0xBADDCAFEBADDCAFE,
-            # SHA-256 IV constants
-            0x6A09E667F3BCC908,  # also sqrt(2) fraction
-            0xBB67AE8584CAA73B,  # also sqrt(3) fraction
-            0x3C6EF372FE94F82B,  # also sqrt(5) fraction
-            0xA54FF53A5F1D36F1,  # also sqrt(7) fraction
-            0x510E527FADE682D1,  # also sqrt(11) fraction
-            0x9B05688C2B3E6C1F,  # also sqrt(13) fraction
-            0x1F83D9ABFB41BD6B,  # also sqrt(17) fraction
-            0x5BE0CD19137E2179,  # also sqrt(19) fraction
-            # pi, e, sqrt2 digit strings
-            0x243F6A8885A308D3,  # π digits
-            0x7182818284590452,  # e digits
-            0x6A09E667F3BCC908,  # sqrt2 (dup, dedupe)
-            0xB7E151628AED2A6A,  # e start
-            0x8CB6C2FDDBC85C3B,  # √7
-            # AES S-box first bytes
-            0x637C777BF26B6FC5,
-            0x3001672BFED7AB76,
-            0xCA82C97DFA5947F0,
-            0xADD4A2AF9CA472C0,
-            0xB7FD9326363FF7CC,
-            0x34A5E5F171D83115,
-            # ChaCha20 / Salsa20 constants
-            0x617078659AEF9A4B,
-            0x3320646E79622D32,
-            0x6B2065749CF0A8BE,
-            # TEA / XXTEA delta
-            0x9E3779B99E3779B9,
-            0x9E3779B900000000,
-            0x000000009E3779B9,
-            # MurmurHash constants
-            0xFF51AFD7ED558CCD,
-            0xC4CEB9FE1A85EC53,
-            # xxHash constants
-            0x9E3779B185EBCA87,
-            0xC2B2AE3D27D4EB4F,
-            0x165667B19E3779F9,
-            0x85EBCA77C2B2AE63,
-            0x27D4EB2F165667C5,
-            # FNV offset basis
-            0xCBF29CE484222325,
-            # well-known LCG multiplier
-            0x5DEECE66D5DEECE6,
-            # murmur3 32-bit mixing
-            0x85EBCA6B85EBCA6B,
-            0xC2B2AE35C2B2AE35,
-            # repeated 1-bit patterns
-            0x0101010101010101,
-            0x0001000100010001,
-            0x0000000100000001,
-            0x0100010001000100,
-            0x8000000180000001,
-            0x8000000080000000,
-            0xC0000000C0000000,
-            0xE0000000E0000000,
-            0xF0000000F0000000,
-            0xFF000000FF000000,
-            0xFFFFFFFFFF000000,
-            0x000000FFFFFFFFFF,
-            0x7FFFFFFFFFFFFFFF,
-            0x7F7F7F7F7F7F7F7F,
-            0x8080808080808080,
+            0x0000000000000000, 0xFFFFFFFFFFFFFFFF, 0x9E3779B97F4A7C15,
+            0xDEADBEEFCAFEBABE, 0x0123456789ABCDEF, 0xFEDCBA9876543210,
+            0xA5A5A5A5A5A5A5A5, 0x5555555555555555, 0xAAAAAAAAAAAAAAAA,
+            0x3333333333333333, 0xCCCCCCCCCCCCCCCC, 0x0F0F0F0F0F0F0F0F,
+            0xF0F0F0F0F0F0F0F0, 0x00FF00FF00FF00FF, 0xFF00FF00FF00FF00,
+            0x0000FFFF0000FFFF, 0xFFFF0000FFFF0000, 0x123456789ABCDEF0,
+            0xDEADBEEFDEADBEEF, 0xCAFEBABECAFEBABE, 0x8BADF00D8BADF00D,
+            0xBAADF00DBAADF00D, 0xFEEDFACEFEEDFACE, 0x0BADC0DE0BADC0DE,
+            0xDEADC0DEDEADC0DE, 0xBADC0FFEBADC0FFE, 0xC0DEC0DEC0DEC0DE,
+            0xC001D00DC001D00D, 0xDEAD10CCDEAD10CC, 0xDEAD2BADDEAD2BAD,
+            0xABADBABEABADBABE, 0xBADDCAFEBADDCAFE,
+            0x6A09E667F3BCC908, 0xBB67AE8584CAA73B, 0x3C6EF372FE94F82B,
+            0xA54FF53A5F1D36F1, 0x510E527FADE682D1, 0x9B05688C2B3E6C1F,
+            0x1F83D9ABFB41BD6B, 0x5BE0CD19137E2179,
+            0x243F6A8885A308D3, 0x7182818284590452, 0xB7E151628AED2A6A,
+            0x8CB6C2FDDBC85C3B,
+            0x637C777BF26B6FC5, 0x3001672BFED7AB76, 0xCA82C97DFA5947F0,
+            0xADD4A2AF9CA472C0, 0xB7FD9326363FF7CC, 0x34A5E5F171D83115,
+            0x617078659AEF9A4B, 0x3320646E79622D32, 0x6B2065749CF0A8BE,
+            0x9E3779B99E3779B9, 0x9E3779B900000000, 0x000000009E3779B9,
+            0xFF51AFD7ED558CCD, 0xC4CEB9FE1A85EC53,
+            0x9E3779B185EBCA87, 0xC2B2AE3D27D4EB4F, 0x165667B19E3779F9,
+            0x85EBCA77C2B2AE63, 0x27D4EB2F165667C5, 0xCBF29CE484222325,
+            0x5DEECE66D5DEECE6, 0x85EBCA6B85EBCA6B, 0xC2B2AE35C2B2AE35,
+            0x0101010101010101, 0x0001000100010001, 0x0000000100000001,
+            0x0100010001000100, 0x8000000180000001, 0x8000000080000000,
+            0xC0000000C0000000, 0xE0000000E0000000, 0xF0000000F0000000,
+            0xFF000000FF000000, 0xFFFFFFFFFF000000, 0x000000FFFFFFFFFF,
+            0x7FFFFFFFFFFFFFFF, 0x7F7F7F7F7F7F7F7F, 0x8080808080808080,
         ]
-        # Qiskit 64-qubit fingerprint PRNG fills the rest
         if HAS_QISKIT:
             try:
                 fp = _circuit_fingerprint(64)
@@ -4858,17 +5040,14 @@ class Compressor:
                     cands.append(rng.getrandbits(64))
             except Exception:
                 pass
-        # Deterministic fallback
         if len(cands) < N_Q64_CANDIDATES:
             rng = random.Random(0x9E3779B97F4A7C15)
             while len(cands) < N_Q64_CANDIDATES:
                 cands.append(rng.getrandbits(64))
-        # De-duplicate preserving order
         seen = set(); uniq = []
         for k in cands:
             if k not in seen:
                 seen.add(k); uniq.append(k)
-        # Top up if dedupe shrank the list below 512
         rng = random.Random(0xDEADBEEFCAFEBABE)
         while len(uniq) < N_Q64_CANDIDATES:
             k = rng.getrandbits(64)
