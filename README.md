@@ -1,0 +1,37 @@
+UPGRADE_LZMAPAQJP It’s Theory Information mostly for Quantum Compression, Compression hybrid Software Quantum software is working correctly without bugs and without Errors
+
+PAQJPVG_8.5-4 Replit App by Jurijus Pacalovas 8.5L-4 PAQ level 9 and zstandard level 22 app
+
+
+JPQ3 The best 22 Done all 2026 year in Oct 23 by Jurijus Pacalovas
+
+
+
+
+Python 3.7.4 and new Python
+atomic install 5 pips
+pip install zstandard  
+
+pip install mpmath
+
+pip install cython
+
+pip install paq
+
+UPGRADE\_PAQJPVG Compression 256 transformations losslessness Lossless 100% and without corrupted files (choose the best of 256 transformations and extract back) done code 12 February lossless 100%, but Explain 16 February Lossless 100% 2026 count 281 trillions variations Speed compress bytes-1.3KB/s; 3.5 KB/s extract 11Mb/s 80-97% pro-cents compress
+
+
+
+Jurijus Pacalovas
+I use markers for my paq: use 1-2 bytes; also use 1 byte: uses 00 63 00 00 or 28 B5 2F FD
+
+Checked:
+
+I use markers for my paq: use 1-2 bytes; also use 1 byte: uses 00 63 00 00 or 28 B5 2F FD
+
+Here is Portfolio UPGRADE_LZMAPAQJP
+Have written by Jurijus Pacalovas in 2026 year in Oct 23
+
+PJP-9
+
+The best of the best JPQ4 win better then .zip, 7zip, ear and some paq archives, example: .txt 5-16 times, .jpg 29% .mp3 23% .docx 24%

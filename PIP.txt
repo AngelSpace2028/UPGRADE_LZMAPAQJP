@@ -1,0 +1,6 @@
+pip install qiskit
+pip install mpmath
+pip install cython
+pip install paq
+pip install zstd
+pip install zstandard
