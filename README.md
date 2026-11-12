@@ -5,7 +5,7 @@ PAQJPVG_8.5-4 Replit App by Jurijus Pacalovas 8.5L-4 PAQ level 9 and zstandard l
 
 JPQ3 The best 22 Done all 2026 year in Oct 23 by Jurijus Pacalovas
 
-
+Speed check code added for JPQ4
 
 
 Python 3.7.4 and new Python
