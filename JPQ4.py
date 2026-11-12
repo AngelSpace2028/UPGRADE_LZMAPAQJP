@@ -6,6 +6,7 @@
 # + a256 = XOR64 search — 512 candidate keys in sampled64 mode
 # EXTENSION-AS-HEADER — saves the 2 bytes inside the file
 # + XLSX / PPTX seed dictionaries (container-aware path now earns real gains)
+# + speed (KB/s, ms/KB) + variation rate (variations / KB / s)
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -5420,20 +5421,25 @@ class Compressor:
                 print(f"  XML pre-pass skipped ({e})"); xml_enc = None
 
         candidates = []
+        variations_evaluated = 0          # NEW — counts every transform attempt
         def _add_single(t, tag):
+            nonlocal variations_evaluated
             try:
                 if not self.verify_single(data, t):
                     print(f"  [{tag}] NOT REVERSIBLE — skipped"); return
                 tr = self.fwd[t](data); c = self.cback(tr)
+                variations_evaluated += 1
                 candidates.append((len(c), "a", t, tag, c))
             except Exception as e:
                 print(f"  [{tag}] failed: {e}")
 
         def _add_pair(a, b, tag):
+            nonlocal variations_evaluated
             try:
                 if not self.verify_pair(data, a, b):
                     print(f"  [{tag}] NOT REVERSIBLE — skipped"); return
                 ta = self.fwd[a](data); tr = self.fwd[b](ta); c = self.cback(tr)
+                variations_evaluated += 1
                 pidx = self._pair_index[(a, b)]
                 if pidx > MAX_PAIRS: return
                 candidates.append((len(c), "b", pidx, tag, c))
@@ -5453,6 +5459,7 @@ class Compressor:
             try:
                 if self.verify_single(data, 61):
                     c2 = self.cback(xml_enc)
+                    variations_evaluated += 1
                     candidates.append((len(c2), "a", 61, "a61", c2))
             except Exception as e: print(f"  [a61] failed: {e}")
 
@@ -5484,6 +5491,7 @@ class Compressor:
                     if err or size is None: continue
                     sized.append((size, idx, a, b))
                 sized.sort()
+                variations_evaluated += len(sized)
                 top_k = min(TOP_VERIFY, len(sized))
                 print(f"  tournament: {len(sized)} viable pairs; verifying top {top_k} ...")
                 for sz, idx, a, b in sized[:top_k]:
@@ -5543,14 +5551,49 @@ class Compressor:
         self._write(out, best_blob)
 
         elapsed = time.time() - t_start
+        # ---- speed metrics (per-second throughput + per-1KB timing) ----
+        bps       = len(data) / elapsed if elapsed > 0 else 0.0
+        kbps      = bps / 1024.0
+        mbps      = kbps / 1024.0
+        out_bps   = len(best_blob) / elapsed if elapsed > 0 else 0.0
+        out_kbps  = out_bps / 1024.0
+        out_mbps  = out_kbps / 1024.0
+        ms_per_kb = (elapsed / (len(data) / 1024.0)) * 1000.0 if len(data) else 0.0
+        out_ms_per_kb = (elapsed / (len(best_blob) / 1024.0)) * 1000.0 if len(best_blob) else 0.0
+        ratio     = (len(best_blob) / len(data) * 100.0) if len(data) else 0.0
+
+        # ---- CALCULATION RATE: variations per KB per second ----
+        file_kb   = len(data) / 1024.0
+        total_var = variations_evaluated + 1          # +1 for the final cmix attempt
+        var_per_sec       = total_var / elapsed if elapsed > 0 else 0.0
+        var_per_kb        = total_var / file_kb if file_kb   > 0 else 0.0
+        var_per_kb_per_s  = var_per_kb / elapsed if elapsed > 0 else 0.0
+        sec_per_var_kb    = (elapsed * file_kb / total_var) if total_var > 0 else 0.0
+
         print("\n" + "="*64)
         print(f"WINNER: {out}")
         print(f"  Method   : {label}")
-        print(f"  Size     : {len(best_blob):,} bytes  ({len(best_blob)/len(data)*100:.2f}%)")
+        print(f"  Size     : {len(best_blob):,} bytes  ({ratio:.2f}% of original)")
         print(f"  Original : {len(data):,} bytes")
-        print(f"  Saved    : {len(data)-len(best_blob):,} bytes")
+        print(f"  Saved    : {len(data)-len(best_blob):,} bytes  ({(100-ratio):.2f}%)")
         print(f"  Time     : {elapsed:.4f} s")
-        print(f"  Speed    : {len(data)/elapsed:,.0f} bytes/s")
+        print(f"  ---- SPEED (input throughput) ----")
+        print(f"  Speed    : {bps:,.0f} bytes/s")
+        print(f"  Speed    : {kbps:,.3f} KB/s  (input)")
+        if mbps >= 0.01:
+            print(f"  Speed    : {mbps:,.3f} MB/s  (input)")
+        print(f"  Time/KB  : {ms_per_kb:.4f} ms  per 1 KB compressed input")
+        print(f"  ---- SPEED (output throughput) ----")
+        print(f"  Speed    : {out_kbps:,.3f} KB/s  (compressed output written)")
+        print(f"  Time/KB  : {out_ms_per_kb:.4f} ms  per 1 KB of compressed output")
+        print(f"  ---- CALCULATION RATE (transform variations) ----")
+        print(f"  Variations evaluated  : {total_var:,}  "
+              f"({variations_evaluated} singles/pairs + 1 cmix)")
+        print(f"  Variations / second   : {var_per_sec:,.2f}")
+        print(f"  Variations / KB       : {var_per_kb:,.2f}")
+        print(f"  Variations / KB / s   : {var_per_kb_per_s:.2f}   "
+              f"<-- how many per 1 KB per 1 s")
+        print(f"  Seconds / variation·KB: {sec_per_var_kb:.6f}")
         print(f"  Header   : (in extension) {ext}")
         print(f"  Note     : Do NOT rename the file — the extension IS the header.")
 
@@ -5566,6 +5609,7 @@ class Compressor:
 
     def decompress(self, infile, outfile=""):
         if not self._require_file(infile): return False
+        d_start = time.time()
         try:
             with open(infile, 'rb') as f: blob = f.read()
         except (PermissionError, OSError) as e:
@@ -5603,7 +5647,18 @@ class Compressor:
             if not outfile: outfile = base + ".out"
 
         self._write(outfile, orig)
+        d_elapsed = time.time() - d_start
+        d_kbps = (len(blob) / 1024.0) / d_elapsed if d_elapsed > 0 else 0.0
+        d_mbps = d_kbps / 1024.0
+        d_ms_per_kb = (d_elapsed / (len(blob) / 1024.0)) * 1000.0 if len(blob) else 0.0
+        out_kbps = (len(orig) / 1024.0) / d_elapsed if d_elapsed > 0 else 0.0
         print(f"-> {outfile} ({len(orig)} bytes)")
+        print(f"  Decompressed in : {d_elapsed:.4f} s")
+        print(f"  Decomp speed    : {d_kbps:,.3f} KB/s  (compressed input)")
+        if d_mbps >= 0.01:
+            print(f"  Decomp speed    : {d_mbps:,.3f} MB/s  (compressed input)")
+        print(f"  Output speed    : {out_kbps:,.3f} KB/s  (original output)")
+        print(f"  Decomp Time/KB  : {d_ms_per_kb:.4f} ms per 1 KB")
         return True
 
     def selftest_all_transforms(self, sample=None):
