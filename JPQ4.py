@@ -7,6 +7,7 @@
 # EXTENSION-AS-HEADER — saves the 2 bytes inside the file
 # + XLSX / PPTX seed dictionaries (container-aware path now earns real gains)
 # + speed (KB/s, ms/KB) + variation rate (variations / KB / s)
+# + XZ FIX: _emit_idx_bits / _read_idx_bits now handle indices ≥ 255
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -1141,31 +1142,55 @@ def _read_len_bits(bits, pos):
         if not (b & 0x80): return n, pos
         shift += 7
 
+# ───────────────────────────────────────────────────────────────────────────
+# XZ FIX — handle indices ≥ 255 (tag / attr / val lists grow past 255 after
+# the XLSX / PPTX patches). Encoding:
+#   idx <  255 : 8-bit index (fast path, identical to old behaviour)
+#   idx ≥  255 : sentinel 0xFF + 1-bit flag 0 + varint(idx)         [extended]
+#   literal    : sentinel 0xFF + 1-bit flag 1 + varint(len) + raw   [literal]
+# The decoder mirrors it exactly. When the extension branch is used we do NOT
+# append to the list (the entry already exists); when the literal branch is
+# used we append (same rule as before).
+# ───────────────────────────────────────────────────────────────────────────
 def _emit_idx_bits(bits, lst, s):
     try:
         idx = lst.index(s)
-        _emit_bits(bits, idx, 8)
-        return
     except ValueError:
-        pass
-    _emit_bits(bits, 255, 8)
-    _emit_len_bits(bits, len(s))
-    for c in s: _emit_bits(bits, c, 8)
-    if len(lst) < 255:
-        lst.append(s)
+        idx = None
+    if idx is not None and idx < 255:
+        _emit_bits(bits, idx, 8)           # fast path — unchanged
+        return
+    _emit_bits(bits, 255, 8)               # sentinel
+    if idx is not None:
+        _emit_bits(bits, 0, 1)             # flag=0 → extended index
+        _emit_len_bits(bits, idx)          # varint(idx)
+    else:
+        _emit_bits(bits, 1, 1)             # flag=1 → literal
+        _emit_len_bits(bits, len(s))
+        for c in s: _emit_bits(bits, c, 8)
+        if len(lst) < 255:
+            lst.append(s)                  # grow list; both sides do it
 
 def _read_idx_bits(bits, pos, lst):
-    idx = _rdb(bits, pos, 8); pos += 8
-    if idx < 255:
-        if idx >= len(lst): raise TransformError(f"xml bit idx {idx}>={len(lst)}")
+    idx8 = _rdb(bits, pos, 8); pos += 8
+    if idx8 < 255:
+        if idx8 >= len(lst):
+            raise TransformError(f"xml bit idx {idx8}>={len(lst)}")
+        return lst[idx8], pos
+    esc = _rdb(bits, pos, 1); pos += 1
+    if esc == 0:                           # extended index
+        idx, pos = _read_len_bits(bits, pos)
+        if idx >= len(lst):
+            raise TransformError(f"xml bit ext idx {idx}>={len(lst)}")
         return lst[idx], pos
+    # literal
     ln, pos = _read_len_bits(bits, pos)
     s = bytearray()
     for _ in range(ln):
         s.append(_rdb(bits, pos, 8)); pos += 8
     result = bytes(s)
     if len(lst) < 255:
-        lst.append(result)
+        lst.append(result)                 # same append rule as encoder
     return result, pos
 
 def _xml_encode_bits(d):
@@ -5421,7 +5446,7 @@ class Compressor:
                 print(f"  XML pre-pass skipped ({e})"); xml_enc = None
 
         candidates = []
-        variations_evaluated = 0          # NEW — counts every transform attempt
+        variations_evaluated = 0
         def _add_single(t, tag):
             nonlocal variations_evaluated
             try:
@@ -5551,7 +5576,6 @@ class Compressor:
         self._write(out, best_blob)
 
         elapsed = time.time() - t_start
-        # ---- speed metrics (per-second throughput + per-1KB timing) ----
         bps       = len(data) / elapsed if elapsed > 0 else 0.0
         kbps      = bps / 1024.0
         mbps      = kbps / 1024.0
@@ -5562,9 +5586,8 @@ class Compressor:
         out_ms_per_kb = (elapsed / (len(best_blob) / 1024.0)) * 1000.0 if len(best_blob) else 0.0
         ratio     = (len(best_blob) / len(data) * 100.0) if len(data) else 0.0
 
-        # ---- CALCULATION RATE: variations per KB per second ----
         file_kb   = len(data) / 1024.0
-        total_var = variations_evaluated + 1          # +1 for the final cmix attempt
+        total_var = variations_evaluated + 1
         var_per_sec       = total_var / elapsed if elapsed > 0 else 0.0
         var_per_kb        = total_var / file_kb if file_kb   > 0 else 0.0
         var_per_kb_per_s  = var_per_kb / elapsed if elapsed > 0 else 0.0
