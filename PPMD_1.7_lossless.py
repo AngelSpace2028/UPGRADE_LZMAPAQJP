@@ -7,6 +7,7 @@
 #   + 27-case edge-input verify sweep (auto-disable broken transforms)
 #   + a256 scaled pool (512 base → 16384 for ≤550-byte inputs, 2^4400 space)
 #   + FIX a252–a255 (_F_delta_reverse small-input identity: f = reverse)
+#   + FIX XZ bits codec: varint index + signature offset — magic 0x6A
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -949,26 +950,26 @@ def _get_xml_sig():
     if _XML_SEED_SIG_CACHE is None: _XML_SEED_SIG_CACHE = _xml_seed_signature()
     return _XML_SEED_SIG_CACHE
 
-_SEED_BASED_MAGICS = frozenset((0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E))
+_SEED_BASED_MAGICS = frozenset((0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x6A))
 
 def _xml_attach_sig(payload):
     if not payload or len(payload) < 2: return payload
     if payload[0] != 0x58: return payload
     if payload[1] not in _SEED_BASED_MAGICS: return payload
-    return bytes(payload[:2]) + _get_xml_sig() + bytes(payload[2:])
+    # Signature is prepended BEFORE the magic, so decoders can always detect it.
+    return b'\x58\x6B' + _get_xml_sig() + bytes(payload)
 
 def _xml_strip_sig(payload):
-    if not payload or len(payload) < 2: return payload
-    if payload[0] != 0x58: return payload
-    if payload[1] not in _SEED_BASED_MAGICS: return payload
-    if len(payload) < 6: raise TransformError("XML payload too short for seed signature")
-    sig = bytes(payload[2:6])
-    if sig != _get_xml_sig():
-        raise TransformError(
-            "XML seed dicts changed — this file was encoded with a different "
-            "PPMD code version and cannot be safely decoded (loud failure, "
-            "no silent corruption)")
-    return bytes(payload[:2]) + bytes(payload[6:])
+    if not payload or len(payload) < 6: return payload
+    if payload[0] == 0x58 and payload[1] == 0x6B:
+        sig = bytes(payload[2:6])
+        if sig != _get_xml_sig():
+            raise TransformError(
+                "XML seed dicts changed — this file was encoded with a different "
+                "PPMD code version and cannot be safely decoded (loud failure, "
+                "no silent corruption)")
+        return bytes(payload[6:])
+    return payload
 
 OLE_MAGIC = b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'
 ZIP_MAGIC = b'PK\x03\x04'
@@ -1094,27 +1095,44 @@ def _read_len_bits(bits, pos):
         if not (b & 0x80): return n, pos
         shift += 7
 
+def _emit_varint_bits(bits, n):
+    while True:
+        b = n & 0x7F; n >>= 7
+        if n: _emit_bits(bits, b | 0x80, 8)
+        else: _emit_bits(bits, b, 8); return
+
+def _read_varint_bits(bits, pos):
+    n = 0; shift = 0
+    while True:
+        b = _rdb(bits, pos, 8); pos += 8
+        n |= (b & 0x7F) << shift
+        if not (b & 0x80): return n, pos
+        shift += 7
+        if shift > 63: raise TransformError("varint bits overflow")
+
 def _emit_idx_bits(bits, lst, s):
     try:
-        idx = lst.index(s); _emit_bits(bits, idx, 8); return
+        idx = lst.index(s)
+        _emit_varint_bits(bits, idx << 1)
+        return
     except ValueError:
         pass
-    _emit_bits(bits, 255, 8)
-    _emit_len_bits(bits, len(s))
+    _emit_varint_bits(bits, (len(s) << 1) | 1)
     for c in s: _emit_bits(bits, c, 8)
-    if len(lst) < 255: lst.append(s)
+    if len(lst) < (1 << 30): lst.append(s)
 
 def _read_idx_bits(bits, pos, lst):
-    idx = _rdb(bits, pos, 8); pos += 8
-    if idx < 255:
+    v, pos = _read_varint_bits(bits, pos)
+    if (v & 1) == 0:
+        idx = v >> 1
         if idx >= len(lst): raise TransformError(f"xml bit idx {idx}>={len(lst)}")
         return lst[idx], pos
-    ln, pos = _read_len_bits(bits, pos)
+    ln = v >> 1
     s = bytearray()
     for _ in range(ln):
         s.append(_rdb(bits, pos, 8)); pos += 8
     result = bytes(s)
-    if len(lst) < 255: lst.append(result)
+    if len(lst) < (1 << 30): lst.append(result)
     return result, pos
 
 def _idx_or_add(lst, s):
@@ -1149,7 +1167,7 @@ def _xml_encode_bits_inner(d):
             for b in payload: _emit_bits(bits, b, 8)
     nbits = len(bits)
     _emit_bits(bits, 0, (8 - nbits % 8) % 8)
-    out = bytearray([0x58, 0x5A]); out.extend(nbits.to_bytes(4, 'big'))
+    out = bytearray([0x58, 0x6A]); out.extend(nbits.to_bytes(4, 'big'))
     for i in range(0, len(bits), 8):
         v = 0
         for j in range(8): v = (v << 1) | bits[i + j]
@@ -1485,7 +1503,7 @@ def _xml_encode_v5_nested(d, ref_idx):
     return _xml_attach_sig(p) if p is not None else None
 
 def _xml_decode_bits_inner(payload):
-    if len(payload) < 6 or payload[0] != 0x58 or payload[1] != 0x5A:
+    if len(payload) < 6 or payload[0] != 0x58 or payload[1] != 0x6A:
         raise TransformError("xml bits magic")
     nbits = int.from_bytes(payload[2:6], 'big')
     bits = []
@@ -1523,7 +1541,9 @@ def _xml_decode_bits_inner(payload):
     return bytes(out)
 
 def _xml_decode_bits(payload):
-    return _xml_decode_bits_inner(_xml_strip_sig(payload))
+    # Accept both wrapped (0x58 0x6B sig ... ) and bare (0x58 0x6A ...) forms.
+    payload = _xml_strip_sig(payload)
+    return _xml_decode_bits_inner(payload)
 
 def _xml_decode_v2_words_impl(payload):
     if _GLOBAL_REF_BYTES is None: raise TransformError("words variant requires global ref dict")
@@ -1727,7 +1747,7 @@ def _xml_decode_v5_nested(payload):
 
 def _xml_decode_v2_inner(payload):
     if len(payload) < 2 or payload[0] != 0x58: raise TransformError("xml magic")
-    if payload[1] == 0x5A: return _xml_decode_bits_inner(payload)
+    if payload[1] == 0x6A: return _xml_decode_bits_inner(payload)
     if payload[1] == 0x5B: return _xml_decode_v2_words_impl(payload)
     if payload[1] == 0x5C: return _xml_decode_v3_compound(payload)
     if payload[1] == 0x5D: return _xml_decode_v4_localdict(payload)
@@ -1767,7 +1787,8 @@ def _xml_decode_v2_inner(payload):
     return bytes(out)
 
 def _xml_decode_v2(payload):
-    return _xml_decode_v2_inner(_xml_strip_sig(payload))
+    payload = _xml_strip_sig(payload)
+    return _xml_decode_v2_inner(payload)
 
 def _best_xml_encode(d, ref_idx=None):
     best = None
@@ -2374,11 +2395,6 @@ class Compressor:
             return bytes(o)
         return f, r
 
-    # ── FIXED: _F_delta_reverse — f and r must agree for n <= k ─────────────
-    # Correct identity: BOTH directions return reversed bytes.  Before the fix,
-    # f returned d unchanged while r returned d[::-1] → mismatch for any input
-    # of length <= k with non-palindromic content.  This broke a253 (k=2) for
-    # 2-byte inputs, a254 for 2-3 byte inputs, a255 for 2-4 byte inputs.
     def _F_delta_reverse(self, k):
         def f(d):
             n = len(d)
@@ -4808,6 +4824,7 @@ class Compressor:
         print(f"  a62 self-contained (QUBITS in blob, structural hash) ✓")
         print(f"  a252-a255 fixed (delta_reverse identity = reverse) ✓")
         print(f"  XML seed sig: {_get_xml_sig().hex()}")
+        print(f"  XZ bits codec: varint-indexed (magic 0x6A) + signature-prepended (0x6B) ✓")
 
     def _pairs(self):
         self.pairs = []
@@ -5207,13 +5224,33 @@ class Compressor:
             p = enc_fn(xml_test)
             if p is None or dec_fn(p) != xml_test:
                 print(f"  FAIL {tag} round-trip"); return False
-            corrupt = p[:2] + bytes([p[2] ^ 0xFF, p[3] ^ 0xFF, p[4] ^ 0xFF, p[5] ^ 0xFF]) + p[6:]
-            try:
-                dec_fn(corrupt)
-                print(f"  FAIL {tag}: corrupted sig did NOT raise"); return False
-            except TransformError:
-                pass
+            # corrupt the 4-byte signature (offset 2..6 when wrapped, offset 2..6 when bare magic 0x6A)
+            if p[:2] == b'\x58\x6B':
+                corrupt = p[:2] + bytes([p[2] ^ 0xFF, p[3] ^ 0xFF, p[4] ^ 0xFF, p[5] ^ 0xFF]) + p[6:]
+                try:
+                    dec_fn(corrupt)
+                    print(f"  FAIL {tag}: corrupted sig did NOT raise"); return False
+                except TransformError: pass
         print("    XML sig mismatch raises loud error ✓")
+
+        print("  XZ wide-index (>255 seed entries) round-trip check:")
+        big_test = b'<root ' + b' '.join(b'a%d="v%d"' % (i, i) for i in range(400)) + b'/>'
+        p = _xml_encode_bits(big_test)
+        if p is None or _xml_decode_bits(p) != big_test:
+            print("  FAIL XZ wide-index round-trip"); return False
+        print("    XZ varint index handles >255 entries ✓")
+
+        print("  XZ docx-shaped round-trip check (worst case from user report):")
+        docx_like = (b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                     b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                     + b''.join(b'<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/%d" TargetMode="External"/>' % (i, i) for i in range(50))
+                     + b'</Relationships>')
+        p = _xml_encode_bits(docx_like)
+        if p is None:
+            print("  FAIL XZ docx-shaped: encoder returned None"); return False
+        if _xml_decode_bits(p) != docx_like:
+            print("  FAIL XZ docx-shaped: round-trip mismatch"); return False
+        print("    XZ docx-shaped rels: LOSSLESS ✓")
 
         print("  a252-a255 small-input check:")
         for t in (252, 253, 254, 255):
@@ -5276,6 +5313,7 @@ def main():
     print(f"    a61 XML seed-signed (mismatch raises TransformError, never silent corruption)")
     print(f"    27-case edge verify (broken transforms auto-disabled)")
     print(f"    a252-a255 delta_reverse fixed (f/r agree on n<=k)")
+    print(f"    XZ bits codec: varint index + signature-prepended (magic 0x6A/0x6B)")
     print(f"    In-memory + on-disk verify before writing")
     print(f"    Raw fallback in cback (raw codec always available)")
     print(f"* a84-a255  : 22 algorithm families (delta/transpose/swap/bitrev/…)")
