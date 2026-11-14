@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # written by Jurijus Pacalovas
 # -*- coding: utf-8 -*-
-# PPMD_1.6 — 100% LOSSLESS EDITION
+# PPMD_1.7 — 100% LOSSLESS EDITION
 #   + a62 quantum transform self-contained (structural hash, QUBITS in blob)
 #   + a61 XML transforms seed-signed (loud failure, never silent corruption)
 #   + 27-case edge-input verify sweep (auto-disable broken transforms)
 #   + a256 scaled pool (512 base → 16384 for ≤550-byte inputs, 2^4400 space)
+#   + FIX a252–a255 (_F_delta_reverse small-input identity: f = reverse)
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -134,7 +135,7 @@ def _ins_zstd():
         except Exception: pass
     return False
 
-print("="*70); print("PPMD_1.6 — 100% LOSSLESS (a62 self-contained, a61 seed-signed)"); print("="*70)
+print("="*70); print("PPMD_1.7 — 100% LOSSLESS (a62 self-contained, a61 seed-signed)"); print("="*70)
 print(f"parallelism : {N_CORES} cores" + (" (fork)" if _HAS_FORK else " (spawn)"))
 print(f"cpu count   : {CPU_COUNT}")
 print(f"fast mode   : {'ON' if FAST_MODE else 'OFF'}")
@@ -309,42 +310,22 @@ def _build_seed_circuit(n_qubits):
     return qc
 
 def _circuit_fingerprint(n_qubits):
-    """Deterministic, VERSION-INDEPENDENT 32-byte fingerprint of the seed circuit.
-
-    Does NOT depend on qiskit version, qiskit presence, or QASM output format.
-    Reconstructs the circuit operations directly so the fingerprint is stable
-    across every Python / qiskit install for a given n_qubits. This is what
-    guarantees a62 (quantum transform) is 100% lossless across environments.
-    """
     n = min(max(1, n_qubits), 4400)
     hasher = hashlib.sha256()
     hasher.update(b"PPMD_QS_STRUCT_V2|")
-    hasher.update(str(n).encode())
-    hasher.update(b"|")
-    # Layer 1: h(q) for all q
-    for q in range(n):
-        hasher.update(b"H")
-    # Layer 2: t(q) + rz(pi/(q+1.0), q)
+    hasher.update(str(n).encode()); hasher.update(b"|")
+    for q in range(n): hasher.update(b"H")
     for q in range(n):
         hasher.update(b"T")
-        angle = math.pi / (q + 1.0)
-        hasher.update(struct.pack('<d', angle))
-    # Layer 3: cx(q, q+1) + rz(pi/(2**(q+1)), q+1)
+        hasher.update(struct.pack('<d', math.pi / (q + 1.0)))
     for q in range(n - 1):
         hasher.update(b"CX")
-        try:
-            denom = 2.0 ** (q + 1)
-            angle = math.pi / denom
-        except (OverflowError, ZeroDivisionError):
-            angle = 0.0
+        try: angle = math.pi / (2.0 ** (q + 1))
+        except (OverflowError, ZeroDivisionError): angle = 0.0
         if angle < 1e-300:
-            hasher.update(b"TINY")
-            hasher.update(struct.pack('<Q', q))
-        else:
-            hasher.update(struct.pack('<d', angle))
-    # Layer 4: h(q) for all q
-    for q in range(n):
-        hasher.update(b"H")
+            hasher.update(b"TINY"); hasher.update(struct.pack('<Q', q))
+        else: hasher.update(struct.pack('<d', angle))
+    for q in range(n): hasher.update(b"H")
     return hasher.digest()
 
 _QPERM_CACHE = {}; _QMASK_CACHE = {}
@@ -361,18 +342,13 @@ def quantum_pair_permutation(n_pairs, n_qubits):
     _QPERM_CACHE[key] = perm; return perm
 
 def quantum_bytes_mask(n_qubits, n_bytes):
-    """Deterministic mask — works with OR without qiskit installed.
-    Same n_qubits → same mask on every machine, every Python version."""
-    if n_qubits < 1 or n_bytes <= 0:
-        return b"\x00" * max(0, n_bytes)
+    if n_qubits < 1 or n_bytes <= 0: return b"\x00" * max(0, n_bytes)
     key = (n_qubits, n_bytes)
-    if key in _QMASK_CACHE:
-        return _QMASK_CACHE[key]
+    if key in _QMASK_CACHE: return _QMASK_CACHE[key]
     fp = _circuit_fingerprint(n_qubits)
     rng = random.Random(int.from_bytes(fp, "big") ^ 0x9E3779B97F4A7C15)
     out = bytes(rng.randrange(256) for _ in range(n_bytes))
-    _QMASK_CACHE[key] = out
-    return out
+    _QMASK_CACHE[key] = out; return out
 
 QUBIT_LIMIT = 4400
 
@@ -413,7 +389,7 @@ print(f"\nBackends: zstd={'Y' if HAS_ZSTD else 'N'} lzma={'Y' if HAS_LZMA else '
       f"pyppmd={'Y' if HAS_PPMD else 'N'} zpaq={'Y' if HAS_ZPAQ else 'N'} "
       f"ccmx={'Y' if HAS_CCMX else 'N'} cmix={'Y' if HAS_CMIX else 'N'} "
       f"lepton={'Y' if HAS_LEPTON else 'N'} qiskit={'Y' if HAS_QISKIT else 'N'}")
-PROGNAME = "PPMD_1.6-LOSSLESS"
+PROGNAME = "PPMD_1.7-LOSSLESS"
 
 REF_TEXT = (
     "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. "
@@ -664,7 +640,6 @@ _DOCX_VALS = [
     b'docx', b'docm', b'dotx', b'dotm',
 ]
 
-# --- XLSX SpreadsheetML seeds ---
 _DOCX_TAGS += [
     b'worksheet', b'sheetData', b'sheetPr', b'sheetViews', b'sheetView',
     b'dimension', b'sheetFormatPr', b'cols', b'col', b'row', b'c', b'v', b'f',
@@ -741,7 +716,6 @@ _DOCX_VALS += [
     b'application/vnd.openxmlformats-officedocument.chart+xml',
 ]
 
-# --- PPTX PresentationML seeds ---
 _DOCX_TAGS += [
     b'p:sld', b'p:sldLayout', b'p:sldMaster', b'p:sldSz', b'p:notesSz',
     b'p:presentation', b'p:notesMaster', b'p:notes',
@@ -830,188 +804,109 @@ _DOCX_ATTRS = list(dict.fromkeys(_DOCX_ATTRS))
 _DOCX_VALS  = list(dict.fromkeys(_DOCX_VALS))
 
 _DOCX_COMPOUND_SEEDS_RAW = [
-    (b'w:jc',        [(b'w:val', b'center')]),
-    (b'w:jc',        [(b'w:val', b'both')]),
-    (b'w:jc',        [(b'w:val', b'left')]),
-    (b'w:jc',        [(b'w:val', b'right')]),
-    (b'w:jc',        [(b'w:val', b'distribute')]),
-    (b'w:jc',        [(b'w:val', b'start')]),
-    (b'w:sz',        [(b'w:val', b'24')]),
-    (b'w:sz',        [(b'w:val', b'22')]),
-    (b'w:sz',        [(b'w:val', b'20')]),
-    (b'w:sz',        [(b'w:val', b'28')]),
-    (b'w:sz',        [(b'w:val', b'32')]),
-    (b'w:sz',        [(b'w:val', b'36')]),
-    (b'w:szCs',      [(b'w:val', b'24')]),
-    (b'w:szCs',      [(b'w:val', b'22')]),
-    (b'w:szCs',      [(b'w:val', b'28')]),
-    (b'w:b',         [(b'w:val', b'1')]),
-    (b'w:b',         [(b'w:val', b'0')]),
-    (b'w:b',         []),
-    (b'w:bCs',       []),
-    (b'w:i',         []),
-    (b'w:iCs',       []),
-    (b'w:u',         [(b'w:val', b'single')]),
-    (b'w:color',     [(b'w:val', b'000000')]),
-    (b'w:color',     [(b'w:val', b'1F1F1F')]),
-    (b'w:color',     [(b'w:val', b'2E74B5')]),
-    (b'w:color',     [(b'w:val', b'auto')]),
-    (b'w:color',     [(b'w:val', b'auto'), (b'w:themeColor', b'text1')]),
-    (b'w:pStyle',    [(b'w:val', b'Normal')]),
-    (b'w:pStyle',    [(b'w:val', b'Heading 1')]),
-    (b'w:pStyle',    [(b'w:val', b'Heading 2')]),
-    (b'w:pStyle',    [(b'w:val', b'Heading 3')]),
-    (b'w:pStyle',    [(b'w:val', b'Title')]),
-    (b'w:pStyle',    [(b'w:val', b'Subtitle')]),
-    (b'w:rStyle',    [(b'w:val', b'Hyperlink')]),
-    (b'w:rFonts',    [(b'w:ascii', b'Calibri'), (b'w:hAnsi', b'Calibri')]),
-    (b'w:rFonts',    [(b'w:ascii', b'Arial'), (b'w:hAnsi', b'Arial')]),
-    (b'w:rFonts',    [(b'w:ascii', b'Times New Roman'),
-                      (b'w:hAnsi', b'Times New Roman')]),
-    (b'w:rFonts',    [(b'w:asciiTheme', b'minorHAnsi'),
-                      (b'w:hAnsiTheme', b'minorHAnsi')]),
-    (b'w:lang',      [(b'w:val', b'en-US')]),
-    (b'w:lang',      [(b'w:val', b'en-GB')]),
-    (b'w:vertAlign', [(b'w:val', b'superscript')]),
-    (b'w:vertAlign', [(b'w:val', b'subscript')]),
-    (b'w:pgSz',      [(b'w:w', b'12240'), (b'w:h', b'15840')]),
-    (b'w:pgSz',      [(b'w:w', b'11906'), (b'w:h', b'16838')]),
-    (b'w:pgMar',     [(b'w:top', b'1440'), (b'w:right', b'1440'),
-                      (b'w:bottom', b'1440'), (b'w:left', b'1440'),
-                      (b'w:header', b'720'), (b'w:footer', b'720'),
-                      (b'w:gutter', b'0')]),
-    (b'w:spacing',   [(b'w:after', b'0'), (b'w:line', b'240'),
-                      (b'w:lineRule', b'auto')]),
-    (b'w:spacing',   [(b'w:before', b'0'), (b'w:after', b'0')]),
-    (b'w:ind',       [(b'w:firstLine', b'720')]),
-    (b'w:ind',       [(b'w:left', b'720')]),
-    (b'w:rPr',       []),
-    (b'w:pPr',       []),
-    (b'w:p',         []),
-    (b'w:r',         []),
-    (b'w:t',         [(b'xml:space', b'preserve')]),
-    (b'w:t',         []),
-    (b'w:body',      []),
-    (b'w:document',  []),
-    (b'w:sectPr',    []),
-    (b'w:tbl',       []),
-    (b'w:tr',        []),
-    (b'w:tc',        []),
+    (b'w:jc', [(b'w:val', b'center')]), (b'w:jc', [(b'w:val', b'both')]),
+    (b'w:jc', [(b'w:val', b'left')]),   (b'w:jc', [(b'w:val', b'right')]),
+    (b'w:jc', [(b'w:val', b'distribute')]), (b'w:jc', [(b'w:val', b'start')]),
+    (b'w:sz', [(b'w:val', b'24')]), (b'w:sz', [(b'w:val', b'22')]),
+    (b'w:sz', [(b'w:val', b'20')]), (b'w:sz', [(b'w:val', b'28')]),
+    (b'w:sz', [(b'w:val', b'32')]), (b'w:sz', [(b'w:val', b'36')]),
+    (b'w:szCs', [(b'w:val', b'24')]), (b'w:szCs', [(b'w:val', b'22')]),
+    (b'w:szCs', [(b'w:val', b'28')]),
+    (b'w:b', [(b'w:val', b'1')]), (b'w:b', [(b'w:val', b'0')]), (b'w:b', []),
+    (b'w:bCs', []), (b'w:i', []), (b'w:iCs', []),
+    (b'w:u', [(b'w:val', b'single')]),
+    (b'w:color', [(b'w:val', b'000000')]), (b'w:color', [(b'w:val', b'1F1F1F')]),
+    (b'w:color', [(b'w:val', b'2E74B5')]), (b'w:color', [(b'w:val', b'auto')]),
+    (b'w:color', [(b'w:val', b'auto'), (b'w:themeColor', b'text1')]),
+    (b'w:pStyle', [(b'w:val', b'Normal')]), (b'w:pStyle', [(b'w:val', b'Heading 1')]),
+    (b'w:pStyle', [(b'w:val', b'Heading 2')]), (b'w:pStyle', [(b'w:val', b'Heading 3')]),
+    (b'w:pStyle', [(b'w:val', b'Title')]), (b'w:pStyle', [(b'w:val', b'Subtitle')]),
+    (b'w:rStyle', [(b'w:val', b'Hyperlink')]),
+    (b'w:rFonts', [(b'w:ascii', b'Calibri'), (b'w:hAnsi', b'Calibri')]),
+    (b'w:rFonts', [(b'w:ascii', b'Arial'), (b'w:hAnsi', b'Arial')]),
+    (b'w:rFonts', [(b'w:ascii', b'Times New Roman'), (b'w:hAnsi', b'Times New Roman')]),
+    (b'w:rFonts', [(b'w:asciiTheme', b'minorHAnsi'), (b'w:hAnsiTheme', b'minorHAnsi')]),
+    (b'w:lang', [(b'w:val', b'en-US')]), (b'w:lang', [(b'w:val', b'en-GB')]),
+    (b'w:vertAlign', [(b'w:val', b'superscript')]), (b'w:vertAlign', [(b'w:val', b'subscript')]),
+    (b'w:pgSz', [(b'w:w', b'12240'), (b'w:h', b'15840')]),
+    (b'w:pgSz', [(b'w:w', b'11906'), (b'w:h', b'16838')]),
+    (b'w:pgMar', [(b'w:top', b'1440'), (b'w:right', b'1440'),
+                  (b'w:bottom', b'1440'), (b'w:left', b'1440'),
+                  (b'w:header', b'720'), (b'w:footer', b'720'), (b'w:gutter', b'0')]),
+    (b'w:spacing', [(b'w:after', b'0'), (b'w:line', b'240'), (b'w:lineRule', b'auto')]),
+    (b'w:spacing', [(b'w:before', b'0'), (b'w:after', b'0')]),
+    (b'w:ind', [(b'w:firstLine', b'720')]), (b'w:ind', [(b'w:left', b'720')]),
+    (b'w:rPr', []), (b'w:pPr', []), (b'w:p', []), (b'w:r', []),
+    (b'w:t', [(b'xml:space', b'preserve')]), (b'w:t', []),
+    (b'w:body', []), (b'w:document', []), (b'w:sectPr', []),
+    (b'w:tbl', []), (b'w:tr', []), (b'w:tc', []),
     (b'w:hyperlink', [(b'r:id', b'rId1')]),
     (b'w:bookmarkStart', [(b'w:id', b'0'), (b'w:name', b'_GoBack')]),
     (b'w:proofErr', [(b'w:type', b'spellStart')]),
     (b'w:proofErr', [(b'w:type', b'spellEnd')]),
     (b'w:proofErr', [(b'w:type', b'gramStart')]),
     (b'w:proofErr', [(b'w:type', b'gramEnd')]),
-    (b'w:rsid',     []),
-    (b'w:lang',     [(b'w:eastAsia', b'en-US')]),
-    (b'w:tab',      []),
-    (b'w:br',       []),
-    (b'w:lastRenderedPageBreak', []),
-    (b'w:keepNext', []),
-    (b'w:keepLines', []),
-    (b'w:widowControl', [(b'w:val', b'0')]),
-    (b'w:pageBreakBefore', []),
-    (b'w:outlineLvl', [(b'w:val', b'0')]),
-    (b'w:outlineLvl', [(b'w:val', b'1')]),
+    (b'w:rsid', []), (b'w:lang', [(b'w:eastAsia', b'en-US')]),
+    (b'w:tab', []), (b'w:br', []), (b'w:lastRenderedPageBreak', []),
+    (b'w:keepNext', []), (b'w:keepLines', []),
+    (b'w:widowControl', [(b'w:val', b'0')]), (b'w:pageBreakBefore', []),
+    (b'w:outlineLvl', [(b'w:val', b'0')]), (b'w:outlineLvl', [(b'w:val', b'1')]),
     (b'w:outlineLvl', [(b'w:val', b'2')]),
-    (b'w:shd',      [(b'w:val', b'clear'), (b'w:color', b'auto'),
-                     (b'w:fill', b'FFFFFF')]),
-    (b'w:tblW',     [(b'w:w', b'0'), (b'w:type', b'auto')]),
-    (b'w:tblLayout', [(b'w:type', b'autofit')]),
-    (b'w:tblStyle', [(b'w:val', b'TableGrid')]),
-    (b'w:tcW',      [(b'w:w', b'0'), (b'w:type', b'auto')]),
+    (b'w:shd', [(b'w:val', b'clear'), (b'w:color', b'auto'), (b'w:fill', b'FFFFFF')]),
+    (b'w:tblW', [(b'w:w', b'0'), (b'w:type', b'auto')]),
+    (b'w:tblLayout', [(b'w:type', b'autofit')]), (b'w:tblStyle', [(b'w:val', b'TableGrid')]),
+    (b'w:tcW', [(b'w:w', b'0'), (b'w:type', b'auto')]),
     (b'w:highlight', [(b'w:val', b'none')]),
-    (b'w:caps',     []),
-    (b'w:smallCaps', []),
-    (b'w:strike',   []),
-    (b'w:dstrike',  []),
-    (b'w:vanish',   []),
-    (b'w:noProof',  []),
+    (b'w:caps', []), (b'w:smallCaps', []), (b'w:strike', []),
+    (b'w:dstrike', []), (b'w:vanish', []), (b'w:noProof', []),
 ]
-
 _DOCX_COMPOUND_SEEDS_RAW += [
-    (b'sheetPr',        []),
-    (b'sheetViews',     []),
-    (b'sheetView',      [(b'workbookViewId', b'0')]),
-    (b'sheetView',      [(b'workbookViewId', b'0'), (b'showGridLines', b'1')]),
-    (b'dimension',      [(b'ref', b'A1')]),
-    (b'sheetFormatPr',  [(b'defaultRowHeight', b'15')]),
-    (b'cols',           []),
-    (b'sheetData',      []),
-    (b'row',            [(b'r', b'1')]),
-    (b'c',              [(b't', b's')]),
-    (b'c',              [(b't', b'n')]),
-    (b'c',              []),
-    (b'v',              []),
-    (b'f',              []),
-    (b'is',             []),
-    (b't',              [(b'xml:space', b'preserve')]),
-    (b't',              []),
-    (b'workbookPr',     [(b'date1904', b'0')]),
-    (b'workbookPr',     []),
-    (b'bookViews',      []),
-    (b'workbookView',   [(b'xWindow', b'0'), (b'yWindow', b'0'),
-                         (b'windowWidth', b'16384'), (b'windowHeight', b'8192')]),
-    (b'sheets',         []),
-    (b'sheet',          []),
-    (b'calcPr',         [(b'calcId', b'191029')]),
-    (b'calcPr',         []),
-    (b'styleSheet',     []),
-    (b'numFmts',        [(b'count', b'0')]),
-    (b'fonts',          [(b'count', b'1')]),
-    (b'fills',          [(b'count', b'2')]),
-    (b'borders',        [(b'count', b'1')]),
-    (b'cellStyleXfs',   [(b'count', b'1')]),
-    (b'cellXfs',        [(b'count', b'1')]),
-    (b'cellStyles',     [(b'count', b'1')]),
-    (b'dxfs',           [(b'count', b'0')]),
-    (b'tableStyles',    [(b'count', b'0'), (b'defaultTableStyle', b'TableStyleMedium2'),
-                         (b'defaultPivotStyle', b'PivotStyleLight16')]),
-    (b'font',           []),
-    (b'fill',           []),
-    (b'border',         []),
-    (b'xf',             [(b'numFmtId', b'0'), (b'fontId', b'0'), (b'fillId', b'0'),
-                         (b'borderId', b'0'), (b'xfId', b'0')]),
-    (b'xf',             []),
-    (b'sldMasterIdLst', []),
-    (b'sldIdLst',       []),
-    (b'sldSz',          [(b'cx', b'9144000'), (b'cy', b'6858000')]),
-    (b'sldSz',          [(b'cx', b'9144000'), (b'cy', b'6858000'),
-                         (b'type', b'screen4x3')]),
-    (b'notesSz',        [(b'cx', b'6858000'), (b'cy', b'9144000')]),
+    (b'sheetPr', []), (b'sheetViews', []),
+    (b'sheetView', [(b'workbookViewId', b'0')]),
+    (b'sheetView', [(b'workbookViewId', b'0'), (b'showGridLines', b'1')]),
+    (b'dimension', [(b'ref', b'A1')]),
+    (b'sheetFormatPr', [(b'defaultRowHeight', b'15')]),
+    (b'cols', []), (b'sheetData', []), (b'row', [(b'r', b'1')]),
+    (b'c', [(b't', b's')]), (b'c', [(b't', b'n')]), (b'c', []),
+    (b'v', []), (b'f', []), (b'is', []),
+    (b't', [(b'xml:space', b'preserve')]), (b't', []),
+    (b'workbookPr', [(b'date1904', b'0')]), (b'workbookPr', []),
+    (b'bookViews', []),
+    (b'workbookView', [(b'xWindow', b'0'), (b'yWindow', b'0'),
+                       (b'windowWidth', b'16384'), (b'windowHeight', b'8192')]),
+    (b'sheets', []), (b'sheet', []),
+    (b'calcPr', [(b'calcId', b'191029')]), (b'calcPr', []),
+    (b'styleSheet', []), (b'numFmts', [(b'count', b'0')]),
+    (b'fonts', [(b'count', b'1')]), (b'fills', [(b'count', b'2')]),
+    (b'borders', [(b'count', b'1')]), (b'cellStyleXfs', [(b'count', b'1')]),
+    (b'cellXfs', [(b'count', b'1')]), (b'cellStyles', [(b'count', b'1')]),
+    (b'dxfs', [(b'count', b'0')]),
+    (b'tableStyles', [(b'count', b'0'), (b'defaultTableStyle', b'TableStyleMedium2'),
+                      (b'defaultPivotStyle', b'PivotStyleLight16')]),
+    (b'font', []), (b'fill', []), (b'border', []),
+    (b'xf', [(b'numFmtId', b'0'), (b'fontId', b'0'), (b'fillId', b'0'),
+             (b'borderId', b'0'), (b'xfId', b'0')]),
+    (b'xf', []), (b'sldMasterIdLst', []), (b'sldIdLst', []),
+    (b'sldSz', [(b'cx', b'9144000'), (b'cy', b'6858000')]),
+    (b'sldSz', [(b'cx', b'9144000'), (b'cy', b'6858000'), (b'type', b'screen4x3')]),
+    (b'notesSz', [(b'cx', b'6858000'), (b'cy', b'9144000')]),
     (b'defaultTextStyle', []),
-    (b'clrMap',         [(b'bg1', b'lt1'), (b'tx1', b'dk1'),
-                         (b'bg2', b'lt2'), (b'tx2', b'dk2'),
-                         (b'accent1', b'accent1'), (b'accent2', b'accent2'),
-                         (b'accent3', b'accent3'), (b'accent4', b'accent4'),
-                         (b'accent5', b'accent5'), (b'accent6', b'accent6'),
-                         (b'hlink', b'hlink'), (b'folHlink', b'folHlink')]),
-    (b'cSld',           []),
-    (b'spTree',         []),
-    (b'grpSp',          []),
-    (b'grpSpPr',        []),
-    (b'xfrm',           []),
-    (b'off',            [(b'x', b'0'), (b'y', b'0')]),
-    (b'ext',            []),
-    (b'chOff',          [(b'x', b'0'), (b'y', b'0')]),
-    (b'chExt',          []),
-    (b'sp',             []),
-    (b'nvSpPr',         []),
-    (b'cNvPr',          [(b'id', b'1'), (b'name', b'')]),
-    (b'cNvSpPr',        []),
-    (b'spPr',           []),
-    (b'txBody',         []),
-    (b'bodyPr',         [(b'rtlCol', b'0')]),
-    (b'bodyPr',         []),
-    (b'lstStyle',       []),
-    (b'p',              []),
-    (b'pPr',            []),
-    (b'r',              []),
-    (b'rPr',            [(b'lang', b'en-US'), (b'dirty', b'0')]),
-    (b't',              []),
-    (b'endParaRPr',     [(b'lang', b'en-US'), (b'dirty', b'0')]),
-    (b'endParaRPr',     [(b'lang', b'en-US')]),
+    (b'clrMap', [(b'bg1', b'lt1'), (b'tx1', b'dk1'), (b'bg2', b'lt2'),
+                 (b'tx2', b'dk2'), (b'accent1', b'accent1'), (b'accent2', b'accent2'),
+                 (b'accent3', b'accent3'), (b'accent4', b'accent4'),
+                 (b'accent5', b'accent5'), (b'accent6', b'accent6'),
+                 (b'hlink', b'hlink'), (b'folHlink', b'folHlink')]),
+    (b'cSld', []), (b'spTree', []), (b'grpSp', []), (b'grpSpPr', []),
+    (b'xfrm', []), (b'off', [(b'x', b'0'), (b'y', b'0')]),
+    (b'ext', []), (b'chOff', [(b'x', b'0'), (b'y', b'0')]),
+    (b'chExt', []), (b'sp', []), (b'nvSpPr', []),
+    (b'cNvPr', [(b'id', b'1'), (b'name', b'')]), (b'cNvSpPr', []),
+    (b'spPr', []), (b'txBody', []), (b'bodyPr', [(b'rtlCol', b'0')]),
+    (b'bodyPr', []), (b'lstStyle', []), (b'p', []), (b'pPr', []), (b'r', []),
+    (b'rPr', [(b'lang', b'en-US'), (b'dirty', b'0')]),
+    (b't', []),
+    (b'endParaRPr', [(b'lang', b'en-US'), (b'dirty', b'0')]),
+    (b'endParaRPr', [(b'lang', b'en-US')]),
 ]
 
 def _build_compound_seed():
@@ -1033,64 +928,48 @@ def _build_compound_seed():
 _DOCX_COMPOUNDS_SEED = _build_compound_seed()
 print(f"Compound seed: {len(_DOCX_COMPOUNDS_SEED)} pre-defined OOXML combos")
 
-# ── XML SEED SIGNATURE (100% losslessness across code versions) ──────────────
 _XML_SEED_SIG_CACHE = None
 
 def _xml_seed_signature():
-    """Deterministic 4-byte SHA-256 signature of the XML seed dicts.
-
-    If any seed ever changes, files encoded with the old seeds will FAIL
-    LOUDLY (TransformError) instead of silently corrupting on decode.
-    """
     hasher = hashlib.sha256()
     hasher.update(b"PPMD_XML_SEEDS_V1|")
     for item in _DOCX_TAGS:
-        hasher.update(struct.pack('<I', len(item)))
-        hasher.update(item)
+        hasher.update(struct.pack('<I', len(item))); hasher.update(item)
     for item in _DOCX_ATTRS:
-        hasher.update(struct.pack('<I', len(item)))
-        hasher.update(item)
+        hasher.update(struct.pack('<I', len(item))); hasher.update(item)
     for item in _DOCX_VALS:
-        hasher.update(struct.pack('<I', len(item)))
-        hasher.update(item)
+        hasher.update(struct.pack('<I', len(item))); hasher.update(item)
     for ti, pairs in _DOCX_COMPOUNDS_SEED:
         hasher.update(struct.pack('<II', ti, len(pairs)))
-        for ai, vi in pairs:
-            hasher.update(struct.pack('<II', ai, vi))
+        for ai, vi in pairs: hasher.update(struct.pack('<II', ai, vi))
     return hasher.digest()[:4]
 
 def _get_xml_sig():
     global _XML_SEED_SIG_CACHE
-    if _XML_SEED_SIG_CACHE is None:
-        _XML_SEED_SIG_CACHE = _xml_seed_signature()
+    if _XML_SEED_SIG_CACHE is None: _XML_SEED_SIG_CACHE = _xml_seed_signature()
     return _XML_SEED_SIG_CACHE
 
 _SEED_BASED_MAGICS = frozenset((0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E))
 
 def _xml_attach_sig(payload):
-    """Prepend 4-byte seed signature to a seed-based XML payload."""
     if not payload or len(payload) < 2: return payload
     if payload[0] != 0x58: return payload
     if payload[1] not in _SEED_BASED_MAGICS: return payload
     return bytes(payload[:2]) + _get_xml_sig() + bytes(payload[2:])
 
 def _xml_strip_sig(payload):
-    """Remove 4-byte seed signature; raise if signature mismatches."""
     if not payload or len(payload) < 2: return payload
     if payload[0] != 0x58: return payload
     if payload[1] not in _SEED_BASED_MAGICS: return payload
-    if len(payload) < 6:
-        raise TransformError("XML payload too short for seed signature")
+    if len(payload) < 6: raise TransformError("XML payload too short for seed signature")
     sig = bytes(payload[2:6])
     if sig != _get_xml_sig():
         raise TransformError(
             "XML seed dicts changed — this file was encoded with a different "
             "PPMD code version and cannot be safely decoded (loud failure, "
-            "no silent corruption)"
-        )
+            "no silent corruption)")
     return bytes(payload[:2]) + bytes(payload[6:])
 
-# ── ZIP/XML helpers ──────────────────────────────────────────────────────────
 OLE_MAGIC = b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'
 ZIP_MAGIC = b'PK\x03\x04'
 _ZIP_CENTRAL_SIG   = b'PK\x01\x02'
@@ -1156,8 +1035,7 @@ def _read_varint(buf, pos):
         if sh > 63: raise TransformError("varint overflow")
 
 def _word_encode_text(text, ref_idx):
-    out = bytearray()
-    last = 0
+    out = bytearray(); last = 0
     for m in _TOK_RE.finditer(text):
         if m.start() > last:
             out.append(0); _emit_varint(out, m.start() - last)
@@ -1170,9 +1048,7 @@ def _word_encode_text(text, ref_idx):
             elif tok_orig == tok_low.upper():        code = (i << 2) | 2
             else:                                    code = None
             if code is not None:
-                _emit_varint(out, code + 1)
-                last = m.end()
-                continue
+                _emit_varint(out, code + 1); last = m.end(); continue
         out.append(0); _emit_varint(out, len(tok_orig)); out += tok_orig
         last = m.end()
     if last < len(text):
@@ -1220,16 +1096,13 @@ def _read_len_bits(bits, pos):
 
 def _emit_idx_bits(bits, lst, s):
     try:
-        idx = lst.index(s)
-        _emit_bits(bits, idx, 8)
-        return
+        idx = lst.index(s); _emit_bits(bits, idx, 8); return
     except ValueError:
         pass
     _emit_bits(bits, 255, 8)
     _emit_len_bits(bits, len(s))
     for c in s: _emit_bits(bits, c, 8)
-    if len(lst) < 255:
-        lst.append(s)
+    if len(lst) < 255: lst.append(s)
 
 def _read_idx_bits(bits, pos, lst):
     idx = _rdb(bits, pos, 8); pos += 8
@@ -1241,23 +1114,23 @@ def _read_idx_bits(bits, pos, lst):
     for _ in range(ln):
         s.append(_rdb(bits, pos, 8)); pos += 8
     result = bytes(s)
-    if len(lst) < 255:
-        lst.append(result)
+    if len(lst) < 255: lst.append(result)
     return result, pos
 
-# ── XML encoders (produce raw payload; wrapper adds sig) ─────────────────────
+def _idx_or_add(lst, s):
+    try: return lst.index(s)
+    except ValueError:
+        lst.append(s); return len(lst) - 1
+
 def _xml_encode_bits_inner(d):
     if not d: return None
     toks = list(_xml_scan_tokens(d))
     if not toks: return None
-    tags  = list(_DOCX_TAGS)
-    attrs = list(_DOCX_ATTRS)
-    vals  = list(_DOCX_VALS)
+    tags  = list(_DOCX_TAGS); attrs = list(_DOCX_ATTRS); vals = list(_DOCX_VALS)
     bits = []
     for kind, payload in toks:
         if kind == 0:
-            _emit_bits(bits, 0b000, 3)
-            _emit_len_bits(bits, len(payload))
+            _emit_bits(bits, 0b000, 3); _emit_len_bits(bits, len(payload))
             for b in payload: _emit_bits(bits, b, 8)
         elif kind == 1:
             name, attrs_raw, selfclose = payload
@@ -1268,19 +1141,15 @@ def _xml_encode_bits_inner(d):
             for am in am_list:
                 aname = am.group(1)
                 aval  = am.group(2) if am.group(2) is not None else am.group(3)
-                _emit_idx_bits(bits, attrs, aname)
-                _emit_idx_bits(bits, vals,  aval)
+                _emit_idx_bits(bits, attrs, aname); _emit_idx_bits(bits, vals, aval)
         elif kind == 2:
-            _emit_bits(bits, 0b010, 3)
-            _emit_idx_bits(bits, tags, payload)
+            _emit_bits(bits, 0b010, 3); _emit_idx_bits(bits, tags, payload)
         else:
-            _emit_bits(bits, 0b100, 3)
-            _emit_len_bits(bits, len(payload))
+            _emit_bits(bits, 0b100, 3); _emit_len_bits(bits, len(payload))
             for b in payload: _emit_bits(bits, b, 8)
     nbits = len(bits)
     _emit_bits(bits, 0, (8 - nbits % 8) % 8)
-    out = bytearray([0x58, 0x5A])
-    out.extend(nbits.to_bytes(4, 'big'))
+    out = bytearray([0x58, 0x5A]); out.extend(nbits.to_bytes(4, 'big'))
     for i in range(0, len(bits), 8):
         v = 0
         for j in range(8): v = (v << 1) | bits[i + j]
@@ -1295,11 +1164,8 @@ def _xml_encode_v2_inner(d):
     if not d: return None
     toks = list(_xml_scan_tokens(d))
     if not toks: return None
-    tag_names  = list(_DOCX_TAGS)
-    attr_names = list(_DOCX_ATTRS)
-    attr_vals  = list(_DOCX_VALS)
-    text_chunks = []
-    struct = bytearray()
+    tag_names  = list(_DOCX_TAGS); attr_names = list(_DOCX_ATTRS); attr_vals = list(_DOCX_VALS)
+    text_chunks = []; struct = bytearray()
     for kind, payload in toks:
         if kind == 0:
             struct.append(0); _emit_varint(struct, len(text_chunks)); text_chunks.append(payload)
@@ -1318,7 +1184,7 @@ def _xml_encode_v2_inner(d):
             struct.append(2); _emit_varint(struct, _idx_or_add(tag_names, payload))
         else:
             struct.append(3); _emit_varint(struct, len(text_chunks)); text_chunks.append(payload)
-    out = bytearray(); out.append(0x58); out.append(0x59)
+    out = bytearray([0x58, 0x59])
     for lst, seed in zip((tag_names, attr_names, attr_vals),
                          (_DOCX_TAGS, _DOCX_ATTRS, _DOCX_VALS)):
         new_items = lst[len(seed):]
@@ -1337,11 +1203,8 @@ def _xml_encode_v2_words_inner(d, ref_idx):
     if not d or not ref_idx: return None
     toks = list(_xml_scan_tokens(d))
     if not toks: return None
-    tag_names  = list(_DOCX_TAGS)
-    attr_names = list(_DOCX_ATTRS)
-    attr_vals  = list(_DOCX_VALS)
-    text_chunks = []
-    struct = bytearray()
+    tag_names  = list(_DOCX_TAGS); attr_names = list(_DOCX_ATTRS); attr_vals = list(_DOCX_VALS)
+    text_chunks = []; struct = bytearray()
     for kind, payload in toks:
         if kind == 0:
             struct.append(0); _emit_varint(struct, len(text_chunks)); text_chunks.append(payload)
@@ -1380,66 +1243,50 @@ def _xml_encode_v3_compound_inner(d, ref_idx):
     if not d or not ref_idx: return None
     toks = list(_xml_scan_tokens(d))
     if not toks: return None
-    tag_names  = list(_DOCX_TAGS)
-    attr_names = list(_DOCX_ATTRS)
-    attr_vals  = list(_DOCX_VALS)
-    compounds  = list(_DOCX_COMPOUNDS_SEED)
-    compound_idx = {c: i for i, c in enumerate(compounds)}
+    tag_names  = list(_DOCX_TAGS); attr_names = list(_DOCX_ATTRS); attr_vals = list(_DOCX_VALS)
+    compounds  = list(_DOCX_COMPOUNDS_SEED); compound_idx = {c: i for i, c in enumerate(compounds)}
     def _add_compound(ti, attr_pairs):
-        key = (ti, tuple(attr_pairs))
-        i = compound_idx.get(key)
+        key = (ti, tuple(attr_pairs)); i = compound_idx.get(key)
         if i is None:
             i = len(compounds); compounds.append(key); compound_idx[key] = i
         return i
-    text_chunks = []
-    struct = bytearray()
+    text_chunks = []; struct = bytearray()
     for kind, payload in toks:
         if kind == 0:
-            struct.append(0)
-            _emit_varint(struct, len(text_chunks)); text_chunks.append(payload)
+            struct.append(0); _emit_varint(struct, len(text_chunks)); text_chunks.append(payload)
         elif kind == 1:
             name, attrs_raw, selfclose = payload
             ti = _idx_or_add(tag_names, name)
-            ams = list(_XML_ATTR_RE.finditer(attrs_raw))
-            attr_pairs = []
+            ams = list(_XML_ATTR_RE.finditer(attrs_raw)); attr_pairs = []
             for am in ams:
                 aname = am.group(1)
                 aval  = am.group(2) if am.group(2) is not None else am.group(3)
-                ai = _idx_or_add(attr_names, aname)
-                vi = _idx_or_add(attr_vals,  aval)
+                ai = _idx_or_add(attr_names, aname); vi = _idx_or_add(attr_vals, aval)
                 attr_pairs.append((ai, vi))
             if attr_pairs:
                 ci = _add_compound(ti, attr_pairs)
-                struct.append(2 if selfclose else 1)
-                _emit_varint(struct, ci)
+                struct.append(2 if selfclose else 1); _emit_varint(struct, ci)
             else:
-                struct.append(4 if selfclose else 5)
-                _emit_varint(struct, ti)
+                struct.append(4 if selfclose else 5); _emit_varint(struct, ti)
         elif kind == 2:
-            struct.append(3)
-            _emit_varint(struct, _idx_or_add(tag_names, payload))
+            struct.append(3); _emit_varint(struct, _idx_or_add(tag_names, payload))
         else:
-            struct.append(0)
-            _emit_varint(struct, len(text_chunks)); text_chunks.append(payload)
+            struct.append(0); _emit_varint(struct, len(text_chunks)); text_chunks.append(payload)
     encoded_texts = [_word_encode_text(t, ref_idx) for t in text_chunks]
     out = bytearray([0x58, 0x5C])
     for lst, seed in zip((tag_names, attr_names, attr_vals),
                          (_DOCX_TAGS, _DOCX_ATTRS, _DOCX_VALS)):
         new_items = lst[len(seed):]
         _emit_varint(out, len(new_items))
-        for s in new_items:
-            _emit_varint(out, len(s)); out += s
+        for s in new_items: _emit_varint(out, len(s)); out += s
     new_compounds = compounds[len(_DOCX_COMPOUNDS_SEED):]
     _emit_varint(out, len(new_compounds))
     for (ti, pairs) in new_compounds:
-        _emit_varint(out, ti)
-        _emit_varint(out, len(pairs))
-        for ai, vi in pairs:
-            _emit_varint(out, ai); _emit_varint(out, vi)
+        _emit_varint(out, ti); _emit_varint(out, len(pairs))
+        for ai, vi in pairs: _emit_varint(out, ai); _emit_varint(out, vi)
     _emit_varint(out, len(struct)); out += struct
     _emit_varint(out, len(encoded_texts))
-    for t in encoded_texts:
-        _emit_varint(out, len(t)); out += t
+    for t in encoded_texts: _emit_varint(out, len(t)); out += t
     return bytes(out)
 
 def _xml_encode_v3_compound(d, ref_idx):
@@ -1462,8 +1309,7 @@ def _xml_encode_v4_localdict_inner(d):
     candidates = []
     for chunk, count in freq.items():
         cost = len(chunk) + 1
-        escape_per = 1 + 1 + len(chunk)
-        encoded_per = 2
+        escape_per = 1 + 1 + len(chunk); encoded_per = 2
         benefit = (escape_per - encoded_per) * count - cost
         if benefit > 0: candidates.append((benefit, chunk))
     candidates.sort(reverse=True)
@@ -1480,8 +1326,7 @@ def _xml_encode_v4_localdict_inner(d):
         out = bytearray(); last = 0
         def emit_chunk(chunk):
             i = local_idx.get(chunk)
-            if i is not None:
-                _emit_varint(out, ((i << 2) | 3) + 1)
+            if i is not None: _emit_varint(out, ((i << 2) | 3) + 1)
             else:
                 out.append(0); _emit_varint(out, len(chunk)); out.extend(chunk)
         for m in _TOK_RE.finditer(text):
@@ -1494,8 +1339,7 @@ def _xml_encode_v4_localdict_inner(d):
                 elif tok_orig == tok_low.upper():       case = 2
                 else:                                   case = -1
                 if case >= 0:
-                    _emit_varint(out, ((i << 2) | case) + 1)
-                    done = True
+                    _emit_varint(out, ((i << 2) | case) + 1); done = True
             if not done:
                 out.append(0); _emit_varint(out, len(tok_orig)); out.extend(tok_orig)
             last = m.end()
@@ -1515,8 +1359,8 @@ def _xml_encode_v4_localdict_inner(d):
                 ai = _idx_or_add(attr_names, aname); vi = _idx_or_add(attr_vals, aval)
                 attr_pairs.append((ai, vi))
             if attr_pairs:
-                ci = _add_compound(ti, attr_pairs); struct.append(2 if selfclose else 1)
-                _emit_varint(struct, ci)
+                ci = _add_compound(ti, attr_pairs)
+                struct.append(2 if selfclose else 1); _emit_varint(struct, ci)
             else:
                 struct.append(4 if selfclose else 5); _emit_varint(struct, ti)
         elif kind == 2:
@@ -1571,8 +1415,8 @@ def _xml_encode_v5_nested_inner(d, ref_idx):
                 attr_pairs.append((ai, vi))
             start = len(struct_flat)
             if attr_pairs:
-                ci = _add_compound(ti, attr_pairs); struct_flat.append(2 if selfclose else 1)
-                _emit_varint(struct_flat, ci)
+                ci = _add_compound(ti, attr_pairs)
+                struct_flat.append(2 if selfclose else 1); _emit_varint(struct_flat, ci)
             else:
                 struct_flat.append(4 if selfclose else 5); _emit_varint(struct_flat, ti)
             if not selfclose: stack.append([ti, start, False])
@@ -1640,7 +1484,6 @@ def _xml_encode_v5_nested(d, ref_idx):
     p = _xml_encode_v5_nested_inner(d, ref_idx)
     return _xml_attach_sig(p) if p is not None else None
 
-# ── XML decoders (inner assumes sig already stripped) ────────────────────────
 def _xml_decode_bits_inner(payload):
     if len(payload) < 6 or payload[0] != 0x58 or payload[1] != 0x5A:
         raise TransformError("xml bits magic")
@@ -1950,7 +1793,6 @@ def _best_xml_encode(d, ref_idx=None):
             except Exception: pass
     return best
 
-# ── common helpers ───────────────────────────────────────────────────────────
 PRIMES = [p for p in range(2, 256) if all(p % d != 0 for d in range(2, int(p**0.5) + 1))]
 PI_DIGITS = [79, 17, 111]
 
@@ -2011,8 +1853,7 @@ def _ext_for(kind, ident):
 def _parse_ext(fname):
     m = _EXT_RE.search(fname)
     if not m: return None
-    hexs = m.group(1)
-    v = int(hexs, 16)
+    hexs = m.group(1); v = int(hexs, 16)
     if v < 0x100: return "a", v + 1
     return "b", v - 0xFF
 
@@ -2083,9 +1924,6 @@ def _find_deflate_params(raw, target):
         except Exception: pass
     return None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Compressor
-# ─────────────────────────────────────────────────────────────────────────────
 class Compressor:
     TIMEOUT = 300; VS = False; USE_MP = True
     TOP_K = 100; FAST = True; BLOCK = 4096
@@ -2152,13 +1990,11 @@ class Compressor:
         return A256_LIMIT == 0 and A256_MODE in ("exhaustive", "repeat32")
 
     def _verify_all_transforms(self):
-        """Verify each transform on 27 EDGE-CASE inputs (auto-disable broken ones)."""
         tests = [b"", b"\x00", b"\xff",
                  b"\x00"*2, b"\x00"*3, b"\x00"*7, b"\x00"*8,
                  b"\x00"*15, b"\x00"*16, b"\x00"*17,
                  b"\x00"*255, b"\x00"*256, b"\x00"*257,
-                 b"\xff"*100,
-                 bytes(range(256)),
+                 b"\xff"*100, bytes(range(256)),
                  b"the quick brown fox jumps over the lazy dog " * 3,
                  os.urandom(1), os.urandom(2), os.urandom(3),
                  os.urandom(7), os.urandom(8), os.urandom(15),
@@ -2283,7 +2119,6 @@ class Compressor:
         L = len(d); s = sum(d) % 256
         return max(1, min(256, ((L*13 + s*17) % 256) + 1))
 
-    # ── a84–a255 families (22 algorithms) ─────────────────────────────────────
     def _F_dstride(self, k):
         def f(d):
             n = len(d)
@@ -2538,10 +2373,16 @@ class Compressor:
             for i in range(n): o[n - 1 - i] = (d[i] - ((i * A + B) & 0xFF)) & 0xFF
             return bytes(o)
         return f, r
+
+    # ── FIXED: _F_delta_reverse — f and r must agree for n <= k ─────────────
+    # Correct identity: BOTH directions return reversed bytes.  Before the fix,
+    # f returned d unchanged while r returned d[::-1] → mismatch for any input
+    # of length <= k with non-palindromic content.  This broke a253 (k=2) for
+    # 2-byte inputs, a254 for 2-3 byte inputs, a255 for 2-4 byte inputs.
     def _F_delta_reverse(self, k):
         def f(d):
             n = len(d)
-            if n <= k: return bytes(d)
+            if n <= k: return bytes(d)[::-1]
             rd = d[::-1]; o = bytearray(rd)
             for i in range(n - 1, k - 1, -1): o[i] = (rd[i] - rd[i - k]) & 0xFF
             return bytes(o)
@@ -2552,6 +2393,7 @@ class Compressor:
             for i in range(k, n): o[i] = (d[i] + o[i - k]) & 0xFF
             return bytes(o)[::-1]
         return f, r
+
     def _dyn2(self, n):
         i = n - 84
         if i < 8:    return self._F_dstride(i + 1)
@@ -2577,7 +2419,6 @@ class Compressor:
         if i < 168:  return self._F_add_reverse(i - 160)
         return self._F_delta_reverse(i - 168 + 1)
 
-    # ── backends ─────────────────────────────────────────────────────────────
     def _leptonc(self, d):
         if not HAS_LEPTON: return None
         if len(d) < 2 or d[:2] != b'\xff\xd8': return None
@@ -2809,7 +2650,6 @@ class Compressor:
             except Exception: return None
         return None
 
-    # ── t_xml / r_xml (container-aware) ──────────────────────────────────────
     def t_xml(self, d):
         if not d: return b'\x00'
         if d[:8] == OLE_MAGIC: return b'\x03' + d
@@ -3106,7 +2946,6 @@ class Compressor:
         try: return lzma.decompress(lz)
         except Exception as e: raise TransformError(f"ultra lzma {e}")
 
-    # ── a1–a60 individual transforms ─────────────────────────────────────────
     def t00(self, d):
         if not d: return struct.pack('>I', 0)
         br, bl, bsh = None, float('inf'), []
@@ -3656,7 +3495,6 @@ class Compressor:
     r31 = t31
     def t32(self, d): return d
     r32 = t32
-
     def _t33(self, d):
         if not d: return b'\x00'
         bits = []
@@ -4172,7 +4010,6 @@ class Compressor:
                 t[b] ^= m; t[b+1] ^= m; t[b+2] ^= m; t[b+3] ^= m
         return bytes(t) + tail
 
-    # ── a77–a83 wide-base minus ──────────────────────────────────────────────
     _A77_PERIOD = 3 * 1024; _A78_PERIOD = 3 * 1024
     def _a77_k(self, i):
         base = (1 << 32) - 1; pos = i % self._A77_PERIOD
@@ -4528,35 +4365,21 @@ class Compressor:
         for w in words: o.extend(w.to_bytes(wbytes, 'big'))
         return bytes(o[:ol])
 
-    # ── a62 — SELF-CONTAINED quantum transform (100% LOSSLESS) ───────────────
     def t_quantum(self, d):
-        """a62 — deterministic XOR mask from structural circuit hash.
-
-        Output format:  >H(QUBITS) + XOR'd data
-        * No qiskit dependency (mask is hash-derived, version-stable)
-        * QUBITS stored in blob → decode reconstructs the same mask even
-          on a different machine / Python / qiskit version.
-        * Empty input:  QUBITS=0 marker → decode returns empty.
-        """
-        if not d:
-            return struct.pack('>H', 0)  # empty marker
+        if not d: return struct.pack('>H', 0)
         nq = self.QUBITS
         mask = quantum_bytes_mask(nq, len(d))
-        if len(mask) != len(d):
-            return struct.pack('>H', 0) + bytes(d)
+        if len(mask) != len(d): return struct.pack('>H', 0) + bytes(d)
         transformed = bytes(a ^ b for a, b in zip(d, mask))
         return struct.pack('>H', nq) + transformed
 
     def r_quantum(self, d):
-        if len(d) < 2:
-            raise TransformError("a62 too short")
+        if len(d) < 2: raise TransformError("a62 too short")
         nq = int.from_bytes(d[:2], 'big')
         body = d[2:]
-        if nq == 0:
-            return bytes(body)  # empty marker / fallback
+        if nq == 0: return bytes(body)
         mask = quantum_bytes_mask(nq, len(body))
-        if len(mask) != len(body):
-            raise TransformError("a62 mask length mismatch")
+        if len(mask) != len(body): raise TransformError("a62 mask length mismatch")
         return bytes(a ^ b for a, b in zip(body, mask))
 
     def t_fib_block(self, d):
@@ -4708,7 +4531,6 @@ class Compressor:
         return bytes(out)
     r_mirror_xor = t_mirror_xor
 
-    # ── a256 XOR64 search ────────────────────────────────────────────────────
     def _score_key(self, d, key):
         try:
             tr = d if key == 0 else self._xor64_apply(d, key)
@@ -4720,8 +4542,7 @@ class Compressor:
         try: fp = _circuit_fingerprint(4400)
         except Exception: fp = hashlib.sha256(b"PPMD_4400_FALLBACK").digest()
         out = bytearray()
-        for i in range(18):
-            out += hashlib.sha256(fp + struct.pack('<H', i)).digest()
+        for i in range(18): out += hashlib.sha256(fp + struct.pack('<H', i)).digest()
         self._fp4400_cache = bytes(out[:SMALL_FILE_LIMIT])
         return self._fp4400_cache
 
@@ -4982,9 +4803,10 @@ class Compressor:
         if A256_MODE == "exhaustive": mode = "EXHAUSTIVE 2^64"
         elif A256_MODE == "repeat32": mode = ("REPEAT-32" if A256_LIMIT == 0 else f"REPEAT-32 limited {A256_LIMIT:,}")
         elif A256_MODE == "repeat32_optimal": mode = "REPEAT-32 OPTIMAL (< 1 ms)"
-        else: mode = f"sampled64 base {N_Q64_CANDIDATES} → up to {N_Q64_SMALL_MAX} for ≤{SMALL_FILE_LIMIT}B (4400-qubit fp)"
+        else: mode = f"sampled64 base {N_Q64_CANDIDATES} → up to {N_Q64_SMALL_MAX} for ≤{SMALL_FILE_LIMIT}B"
         print(f"Transforms registered: 1-83 fixed + 84-255 (22 families × 8) + 256 XOR64 ({mode}).")
         print(f"  a62 self-contained (QUBITS in blob, structural hash) ✓")
+        print(f"  a252-a255 fixed (delta_reverse identity = reverse) ✓")
         print(f"  XML seed sig: {_get_xml_sig().hex()}")
 
     def _pairs(self):
@@ -5363,7 +5185,6 @@ class Compressor:
             if parsed != (kind, ident): print(f"  FAIL ext {ext} → {parsed}"); return False
         print(f"  Extension .aXXXX round-trips: PASS  (b cap: {MAX_PAIRS})")
 
-        # a62 100% losslessness across QUBITS settings
         print("  a62 quantum cross-QUBITS check:")
         original_qubits = self.QUBITS
         for test_qb in [16, 1024, 4400]:
@@ -5371,9 +5192,7 @@ class Compressor:
             for L in [0, 1, 2, 7, 100, 1000, 10000]:
                 d = os.urandom(L)
                 enc = self.t_quantum(d)
-                # simulate decode on a DIFFERENT machine: QUBITS=16 (default)
-                saved_qb = self.QUBITS
-                self.QUBITS = 16
+                saved_qb = self.QUBITS; self.QUBITS = 16
                 dec = self.r_quantum(enc)
                 self.QUBITS = saved_qb
                 if dec != d:
@@ -5381,7 +5200,6 @@ class Compressor:
         self.QUBITS = original_qubits
         print("    a62 lossless across QUBITS=16/1024/4400 ✓")
 
-        # XML seed signature check
         print("  XML seed signature check:")
         xml_test = b'<?xml version="1.0"?><root><item attr="val">hello</item></root>'
         for enc_fn, dec_fn, tag in [(_xml_encode_v2, _xml_decode_v2, "XY"),
@@ -5389,7 +5207,6 @@ class Compressor:
             p = enc_fn(xml_test)
             if p is None or dec_fn(p) != xml_test:
                 print(f"  FAIL {tag} round-trip"); return False
-            # Corrupt the signature → must raise
             corrupt = p[:2] + bytes([p[2] ^ 0xFF, p[3] ^ 0xFF, p[4] ^ 0xFF, p[5] ^ 0xFF]) + p[6:]
             try:
                 dec_fn(corrupt)
@@ -5398,8 +5215,15 @@ class Compressor:
                 pass
         print("    XML sig mismatch raises loud error ✓")
 
-        # a62 losslessness across edge cases
-        self.selftest_fixed()  # includes a62, a83, a256, a84-a255 families
+        print("  a252-a255 small-input check:")
+        for t in (252, 253, 254, 255):
+            for L in (0, 1, 2, 3, 4, 5, 8, 16):
+                d = os.urandom(L)
+                if self.rev[t](self.fwd[t](d)) != d:
+                    print(f"  FAIL a{t} len={L}"); return False
+        print("    a252-a255 lossless on small inputs ✓")
+
+        self.selftest_fixed()
 
         huff_sample = (b'<?xml version="1.0"?>' +
                        b'<w:p><w:r><w:t>Hello, World!</w:t></w:r></w:p>' * 200)
@@ -5414,11 +5238,9 @@ class Compressor:
             if d != p: print(f"  FAIL backend len={len(p)}"); return False
         print("  Backends: PASS")
 
-        # Full transform sweep
         if not self.selftest_all_transforms(): return False
         if not self.selftest_all_pairs(max_pairs=min(500, len(self.pairs))): return False
 
-        # 4400-qubit fp sanity
         try:
             fp4400 = self._get_4400_fp()
             assert len(fp4400) == SMALL_FILE_LIMIT
@@ -5426,7 +5248,6 @@ class Compressor:
         except Exception as e:
             print(f"  4400-qubit fp: FAIL {e}"); return False
 
-        # End-to-end
         import tempfile as _tf
         with _tf.TemporaryDirectory() as td:
             src = os.path.join(td, "sample.txt")
@@ -5454,6 +5275,7 @@ def main():
     print(f"    a62 quantum self-contained (QUBITS in blob, structural hash — no qiskit dependency)")
     print(f"    a61 XML seed-signed (mismatch raises TransformError, never silent corruption)")
     print(f"    27-case edge verify (broken transforms auto-disabled)")
+    print(f"    a252-a255 delta_reverse fixed (f/r agree on n<=k)")
     print(f"    In-memory + on-disk verify before writing")
     print(f"    Raw fallback in cback (raw codec always available)")
     print(f"* a84-a255  : 22 algorithm families (delta/transpose/swap/bitrev/…)")
