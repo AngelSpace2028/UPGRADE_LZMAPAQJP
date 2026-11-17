@@ -11,7 +11,7 @@
 #   + a62 quantum transform self-contained (structural hash, QUBITS in blob)
 #   + a61 XML transforms seed-signed (loud failure, never silent corruption)
 #   + 27-case edge-input verify sweep (auto-disable broken transforms)
-#   + a256 scaled pool (512 base → 16384 for ≤550-byte inputs, 2^4400 space)
+#   + a256 4400-bit block sweep (1..550 B key lengths × 512 samples, never enumerated)
 #   + FIX a252–a255 (_F_delta_reverse small-input identity: f = reverse)
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
@@ -35,6 +35,8 @@ try: import pyppmd; HAS_PPMD = True
 except ImportError: pyppmd = None; HAS_PPMD = False
 try: import lepton_jpeg_python; HAS_LEPTON = True
 except ImportError: lepton_jpeg_python = None; HAS_LEPTON = False
+try: import numpy as _np; HAS_NUMPY = True
+except ImportError: _np = None; HAS_NUMPY = False
 
 try:
     import qiskit
@@ -61,12 +63,20 @@ FULL_PAIRS      = os.environ.get("PPMD_FULL_PAIRS",   "1") != "0"
 SKIP_SLOW       = os.environ.get("PPMD_SKIP_SLOW",    "1") != "0"
 EARLY_EXIT_GAIN = float(os.environ.get("PPMD_EARLY_EXIT_GAIN", "0.55"))
 
-A256_MODE        = os.environ.get("PPMD_A256_MODE", "sampled64").lower()
+A256_MODE        = os.environ.get("PPMD_A256_MODE", "blocksweep4400").lower()
+A256_ALLOW_FULL  = os.environ.get("PPMD_A256_ALLOW_FULL", "0") == "1"
+if A256_MODE in ("exhaustive", "repeat32") and not A256_ALLOW_FULL:
+    A256_MODE = "blocksweep4400"      # never enumerate all 2^4400 variations
 A256_EXHAUSTIVE  = (A256_MODE == "exhaustive")
 A256_LIMIT       = int(os.environ.get("PPMD_A256_LIMIT", "0") or "0")
 A256_START       = int(os.environ.get("PPMD_A256_START", "0") or "0")
 A256_PROGRESS    = max(1, int(os.environ.get("PPMD_A256_PROGRESS", "1000000") or "1000000"))
 A256_CKPT        = max(1, int(os.environ.get("PPMD_A256_CKPT", "10000000") or "10000000"))
+A256_KEY_BITS    = 4400
+A256_KEY_BYTES   = A256_KEY_BITS // 8          # 550 bytes = the 4400-bit key space
+A256_BLOCK_MAX   = max(1, min(550, int(os.environ.get("PPMD_A256_BLOCK_MAX", "550") or "550")))
+A256_BLOCK_CANDIDATES = max(2, min(4096, int(os.environ.get("PPMD_A256_BLOCK_CANDIDATES", "512") or "512")))
+A256_VERIFY_FAST = False
 
 CPU_COUNT = mp.cpu_count() or 4
 N_CORES = max(1, int(os.environ.get("PPMD_CORES", str(CPU_COUNT)) or str(CPU_COUNT)))
@@ -149,6 +159,8 @@ print(f"full singles: {'ON (256 transforms)' if FULL_SINGLES else 'OFF'}")
 print(f"full pairs  : {'ON (up to 65280 pairs)' if FULL_PAIRS else 'OFF'}")
 print(f"skip slow   : {'ON' if SKIP_SLOW else 'OFF'}")
 print(f"a256 mode   : " + (
+    f"BLOCK-SWEEP 1..{A256_BLOCK_MAX}B × {A256_BLOCK_CANDIDATES} samples "
+    f"from 2^{A256_KEY_BITS} (never enumerated)" if A256_MODE == "blocksweep4400" else
     "EXHAUSTIVE 2^64 (never finishes)"    if A256_MODE == "exhaustive"       else
     "REPEAT-32 (all 2^32 seed||seed)"     if A256_MODE == "repeat32"         else
     "REPEAT-32 OPTIMAL (< 1 ms)"          if A256_MODE == "repeat32_optimal" else
@@ -2171,7 +2183,12 @@ class Compressor:
         _set_global_ref(self.ref_bytes, self.ref_bytes_cap, self.ref_bytes_up)
         self._maps(); self._pairs()
         self._pair_index = {p: i + 1 for i, p in enumerate(self.pairs)}
-        self._verify_all_transforms()
+        global A256_VERIFY_FAST
+        A256_VERIFY_FAST = True
+        try:
+            self._verify_all_transforms()
+        finally:
+            A256_VERIFY_FAST = False
 
     @staticmethod
     def _rev8(b):
@@ -4821,11 +4838,110 @@ class Compressor:
         mask = (kb * reps)[:n]
         return (int.from_bytes(d, 'little') ^ int.from_bytes(mask, 'little')).to_bytes(n, 'little')
 
+    @staticmethod
+    def _xor_repeat_key(d, key):
+        """XOR d with key repeated to len(d) — the a256 block-sweep primitive."""
+        n = len(d)
+        if n == 0 or not key: return bytes(d)
+        kb = bytes(key)
+        reps = (n + len(kb) - 1) // len(kb)
+        mask = (kb * reps)[:n]
+        return (int.from_bytes(d, 'little') ^ int.from_bytes(mask, 'little')).to_bytes(n, 'little')
+
+    def _a256_block_candidates(self, d, B, n):
+        """n candidate keys of exactly B bytes, sampled from the 2^4400 space.
+
+        Candidate 0 is the per-column modal byte (maximum zero count for this
+        block length); candidate 1 is d[:B] (zeroes the first block). The rest
+        are SHAKE-256 samples seeded by the 4400-qubit fingerprint + the data,
+        so every block length explores a different slice of the key space.
+        The winning key is stored in the blob, so the decoder never needs this
+        generator and never has to enumerate the space.
+        """
+        out = []
+        if B * 3 > len(d):
+            # every column has at most 2 bytes -> the modal byte is d[r]
+            modal = bytes(d[:B])
+        else:
+            mb = bytearray(B)
+            for r in range(B):
+                mb[r] = Counter(d[r::B]).most_common(1)[0][0]
+            modal = bytes(mb)
+        out.append(modal)
+        out.append(bytes(d[:B]))
+        if B <= 2:
+            # B=1/2: cheap constant keys guarantee the best constant key.
+            for v in range(256):
+                out.append(bytes([v]) * B)
+        else:
+            out.append(bytes(B))
+            out.append(b'\xff' * B)
+            out.append(bytes((x ^ 0xFF) for x in modal))
+        out = out[:n]
+        need = n - len(out)
+        if need > 0:
+            base = (b"PPMD_A256_BS4400|" + self._get_4400_fp() +
+                    hashlib.sha256(d).digest() + struct.pack('>HH', B, n))
+            stream = hashlib.shake_256(base).digest(need * B)
+            for i in range(need):
+                out.append(stream[i * B:(i + 1) * B])
+        return out
+
+    def _a256_zero_scores(self, d, cands):
+        """Zero-byte counts for every candidate key (numpy fast path + fallback)."""
+        if _np is not None and HAS_NUMPY:
+            try:
+                L = len(d); B = len(cands[0])
+                arr = _np.frombuffer(d, dtype=_np.uint8)
+                keys = _np.frombuffer(b''.join(cands), dtype=_np.uint8).reshape(len(cands), B)
+                reps = (L + B - 1) // B
+                mask = _np.tile(keys, (1, reps))[:, :L]
+                return _np.count_nonzero((mask ^ arr) == 0, axis=1).tolist()
+            except Exception:
+                pass
+        return [self._xor_repeat_key(d, k).count(0) for k in cands]
+
+    def _t256_blocksweep4400(self, d):
+        """a256: 512 sampled keys for every block length 1..550.
+
+        Key space is 2^4400 (550 bytes). It is never enumerated: for each block
+        length we draw 512 candidates, keep the best by zero count, then score
+        the top two with the zlib proxy. The winning key is stored in the blob
+        (mode 2), so decoding is a plain XOR and is environment-independent.
+        Inputs > 550 bytes keep the legacy 512-candidate 64-bit path.
+        """
+        L = len(d)
+        if L > SMALL_FILE_LIMIT:
+            return self._t256_sampled(d)
+        if L < 4:
+            return b'\x00' + d
+        maxB = min(A256_BLOCK_MAX, L, SMALL_FILE_LIMIT)
+        nC = A256_BLOCK_CANDIDATES
+        if A256_VERIFY_FAST:
+            maxB = min(maxB, 24); nC = min(nC, 8)
+        raw_score = len(zlib.compress(d, 1)) + 1
+        best = None
+        for B in range(1, maxB + 1):
+            cands = self._a256_block_candidates(d, B, nC)
+            zeros = self._a256_zero_scores(d, cands)
+            for i in heapq.nlargest(2, range(len(cands)), key=zeros.__getitem__):
+                key = cands[i]
+                cipher = self._xor_repeat_key(d, key)
+                sc = len(zlib.compress(cipher, 1)) + 3 + B
+                if best is None or sc < best[0]:
+                    best = (sc, B, key, cipher)
+        if best is None or best[0] >= raw_score:
+            return b'\x00' + d
+        _, B, key, cipher = best
+        return b'\x02' + struct.pack('>H', B) + key + cipher
+
     def t256(self, d):
         if not d: return b'\x00'
-        if len(d) < 16: return b'\x00' + d
+        if len(d) < 4: return b'\x00' + d
+        if len(d) < 16 and A256_MODE != "blocksweep4400": return b'\x00' + d
         try:
-            if   A256_MODE == "exhaustive":       return self._t256_exhaustive(d)
+            if   A256_MODE == "blocksweep4400":   return self._t256_blocksweep4400(d)
+            elif A256_MODE == "exhaustive":       return self._t256_exhaustive(d)
             elif A256_MODE == "repeat32":         return self._t256_repeat32(d)
             elif A256_MODE == "repeat32_optimal": return self._t256_repeat32_optimal(d)
             else:                                 return self._t256_sampled(d)
@@ -4963,6 +5079,12 @@ class Compressor:
         if not d: return b''
         mode = d[0]
         if mode == 0: return d[1:]
+        if mode == 2:
+            if len(d) < 3: raise TransformError("a256 block header short")
+            B = int.from_bytes(d[1:3], 'big')
+            if not (1 <= B <= A256_KEY_BYTES): raise TransformError(f"a256 block size {B}")
+            if len(d) < 3 + B: raise TransformError("a256 block key short")
+            return self._xor_repeat_key(d[3+B:], d[3:3+B])
         if mode != 1: raise TransformError(f"a256 mode {mode}")
         if len(d) < 1 + KEY_BYTES: raise TransformError("a256 short")
         key = int.from_bytes(d[1:1+KEY_BYTES], 'big')
@@ -5015,7 +5137,9 @@ class Compressor:
             f, r = self._dyn2(i); eager_f[i] = f; eager_r[i] = r
         eager_f[256] = self.t256; eager_r[256] = self.r256
         self.fwd = eager_f; self.rev = eager_r
-        if A256_MODE == "exhaustive": mode = "EXHAUSTIVE 2^64"
+        if A256_MODE == "blocksweep4400": mode = (f"BLOCK-SWEEP 1..{A256_BLOCK_MAX}B × {A256_BLOCK_CANDIDATES} "
+                                                   f"samples from 2^{A256_KEY_BITS}, never enumerated")
+        elif A256_MODE == "exhaustive": mode = "EXHAUSTIVE 2^64"
         elif A256_MODE == "repeat32": mode = ("REPEAT-32" if A256_LIMIT == 0 else f"REPEAT-32 limited {A256_LIMIT:,}")
         elif A256_MODE == "repeat32_optimal": mode = "REPEAT-32 OPTIMAL (< 1 ms)"
         else: mode = f"sampled64 base {N_Q64_CANDIDATES} → up to {N_Q64_SMALL_MAX} for ≤{SMALL_FILE_LIMIT}B (4400-qubit fp)"
@@ -5531,7 +5655,7 @@ def main():
     print(f"    Raw fallback in cback (raw codec always available)")
     print(f"* a84-a255  : 22 algorithm families (delta/transpose/swap/bitrev/…)")
     print(f"* Qubits    : up to {QUBIT_LIMIT}")
-    print(f"* a256      : sampled64 — {N_Q64_CANDIDATES} base → {N_Q64_SMALL_MAX} for ≤{SMALL_FILE_LIMIT}B")
+    print(f"* a256      : block-sweep 1..{A256_BLOCK_MAX}B × {A256_BLOCK_CANDIDATES} samples, 2^{A256_KEY_BITS} key space (never enumerated)")
     try:
         mp.set_start_method('fork', force=True)
         print(f"mp: fork, {N_CORES} workers (cpu_count={CPU_COUNT})")
