@@ -13,6 +13,8 @@
 #   + 27-case edge-input verify sweep (auto-disable broken transforms)
 #   + a256 4400-bit block sweep (1..550 B key lengths × 512 samples, never enumerated)
 #   + FIX a252–a255 (_F_delta_reverse small-input identity: f = reverse)
+#   + a300 minus-3 sweep (.m3): subtract 1 per 3-byte group, retry zstd-22 /
+#     cmix-9 after every pass, with one user-set time budget
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -22,6 +24,14 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import xml, xml.etree.ElementTree as ET, xml.sax.saxutils as saxutils
 import zipfile, io, zlib
+
+# Windows consoles and pipes often default to cp1252; status output contains
+# check marks/arrows.  Keep a redirected run from dying with UnicodeEncodeError.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 try: import lxml.etree as _lxml_etree; HAS_LXML = True
 except ImportError: _lxml_etree = None; HAS_LXML = False
@@ -78,6 +88,13 @@ A256_BLOCK_MAX   = max(1, min(550, int(os.environ.get("PPMD_A256_BLOCK_MAX", "55
 A256_BLOCK_CANDIDATES = max(2, min(4096, int(os.environ.get("PPMD_A256_BLOCK_CANDIDATES", "512") or "512")))
 A256_VERIFY_FAST = False
 
+# ── minus-3 sweep container (.m3) ────────────────────────────────────────────
+M3_MAGIC  = b"JPQ5M3\x01\x00"                  # 8 bytes
+M3_STRUCT = struct.Struct(">8sBIQQ32s")           # magic, codec, passes, orig_len, comp_len, sha256
+M3_CODEC_RAW  = 0
+M3_CODEC_ZSTD = 1
+M3_CODEC_CMIX = 2
+
 CPU_COUNT = mp.cpu_count() or 4
 N_CORES = max(1, int(os.environ.get("PPMD_CORES", str(CPU_COUNT)) or str(CPU_COUNT)))
 REPEATS = max(1, int(os.environ.get("PPMD_REPEATS", "1") or "1"))
@@ -104,6 +121,36 @@ _IN_WORKER = False
 def _set_global_ref(rb, rcap, rup):
     global _GLOBAL_REF_BYTES, _GLOBAL_REF_CAP, _GLOBAL_REF_UP
     _GLOBAL_REF_BYTES = rb; _GLOBAL_REF_CAP = rcap; _GLOBAL_REF_UP = rup
+
+def _m3_shift(d, delta):
+    """Add delta (mod 2^24) to each complete 3-byte big-endian block.
+
+    delta < 0 is the minus-1 pass; delta > 0 is its exact inverse. A trailing
+    1- or 2-byte tail is left untouched (so the mapping is always lossless).
+    """
+    n = len(d)
+    if n < 3 or delta == 0: return bytes(d)
+    m = n - (n % 3)
+    if _np is not None and HAS_NUMPY:
+        try:
+            a = _np.frombuffer(d[:m], dtype=_np.uint8).reshape(-1, 3).astype(_np.int64)
+            v = (a[:, 0] << 16) | (a[:, 1] << 8) | a[:, 2]
+            v = (v + int(delta)) & 0xFFFFFF
+            out = _np.empty((v.size, 3), dtype=_np.uint8)
+            out[:, 0] = (v >> 16) & 0xFF
+            out[:, 1] = (v >> 8) & 0xFF
+            out[:, 2] = v & 0xFF
+            return out.tobytes() + bytes(d[m:])
+        except Exception:
+            pass
+    b = bytearray(d)
+    for i in range(0, m, 3):
+        v = (b[i] << 16) | (b[i+1] << 8) | b[i+2]
+        v = (v + delta) & 0xFFFFFF
+        b[i] = v >> 16
+        b[i+1] = (v >> 8) & 0xFF
+        b[i+2] = v & 0xFF
+    return bytes(b)
 
 def _worker_single(t):
     global _IN_WORKER
@@ -132,14 +179,31 @@ def _worker_pair(args):
         return (idx, a, b, None, repr(e))
 
 def _imp_zstd():
+    """Import the real zstandard package, never a local zstandard.py shim."""
+    cached = sys.modules.get("zstandard")
+    if cached is not None and hasattr(cached, "__version__"):
+        return cached
+    saved = sys.path[:]
     try:
         importlib.invalidate_caches()
         us = site.getusersitepackages()
-        if us and us not in sys.path: sys.path.insert(0, us)
-    except Exception: pass
-    try:
-        import zstandard as zstd; return zstd
-    except ImportError: return None
+        if us:
+            try: sys.path.remove(us)
+            except ValueError: pass
+            sys.path.insert(0, us)
+        # A file named zstandard.py in the script directory would shadow the
+        # real package and silently turn zstd-22 into zlib-9.  Drop it for
+        # this import, then restore the normal search path.
+        here = os.path.dirname(os.path.abspath(__file__))
+        sys.path[:] = [p for p in sys.path
+                       if os.path.abspath(p or os.getcwd()) != here]
+        sys.modules.pop("zstandard", None)
+        import zstandard as zstd
+        return zstd if hasattr(zstd, "__version__") else None
+    except Exception:
+        return None
+    finally:
+        sys.path[:] = saved
 
 def _ins_zstd():
     for c in [[sys.executable,'-m','pip','install','--no-input','--disable-pip-version-check','zstandard'],
@@ -2640,7 +2704,7 @@ class Compressor:
         if not HAS_LEPTON: return None
         try: return lepton_jpeg_python.decompress_bytes(d) or None
         except Exception: return None
-    def _cmixc(self, d, force=False):
+    def _cmixc(self, d, force=False, timeout=3600):
         if not HAS_CMIX: return None
         if not force and SKIP_SLOW: return None
         cmix = shutil.which('cmix')
@@ -2650,7 +2714,7 @@ class Compressor:
             with open(inp, 'wb') as f: f.write(d)
             for args in ([cmix, '-c', inp, out], [cmix, inp, out]):
                 try:
-                    r = subprocess.run(args, capture_output=True, timeout=3600)
+                    r = subprocess.run(args, capture_output=True, timeout=timeout)
                     if r.returncode == 0 and os.path.exists(out):
                         with open(out, 'rb') as f: return f.read()
                 except Exception: pass
@@ -5214,6 +5278,137 @@ class Compressor:
         if new_sz < sz: return (new_sz, kind, ident, lbl + "+cmix", new_blob)
         return chosen
 
+    # ── minus-3 sweep (.m3 container) ───────────────────────────────────────
+    def _m3_zstd22(self, d):
+        if not HAS_ZSTD: return None
+        try: return zc.compress(d)
+        except Exception: return None
+
+    def _m3_cmix9(self, d):
+        if not HAS_CMIX: return None
+        try: return self._cmixc(d, force=True)
+        except Exception: return None
+
+    def _m3_pack(self, data, passes, codec, payload):
+        return M3_STRUCT.pack(M3_MAGIC, codec, passes, len(data), len(payload),
+                              hashlib.sha256(data).digest()) + payload
+
+    def _m3_unpack(self, blob):
+        if len(blob) < M3_STRUCT.size: raise TransformError("m3 short header")
+        magic, codec, passes, olen, clen, sha = M3_STRUCT.unpack(blob[:M3_STRUCT.size])
+        if magic != M3_MAGIC: raise TransformError("m3 magic")
+        if len(blob) != M3_STRUCT.size + clen: raise TransformError("m3 length")
+        return codec, passes, olen, sha, blob[M3_STRUCT.size:]
+
+    def _m3_decode_blob(self, blob):
+        codec, passes, olen, sha, payload = self._m3_unpack(blob)
+        if codec == M3_CODEC_RAW:
+            cur = payload
+        elif codec == M3_CODEC_ZSTD:
+            if not HAS_ZSTD: raise TransformError("zstd not available")
+            cur = zd.decompress(payload)
+        elif codec == M3_CODEC_CMIX:
+            if not HAS_CMIX: raise TransformError("cmix not available")
+            cur = self._cmixd(payload, force=True)
+            if cur is None: raise TransformError("cmix decode failed")
+        else:
+            raise TransformError(f"m3 codec {codec}")
+        if len(cur) != olen: raise TransformError("m3 original length")
+        plain = _m3_shift(cur, passes)
+        if hashlib.sha256(plain).digest() != sha: raise TransformError("m3 checksum")
+        return plain
+
+    def _m3_search_best(self, data, time_limit, max_passes, use_cmix=True, tag="a300"):
+        """Run the minus-3 sweep and return (container_blob, info), or None.
+
+        Pass p subtracts 1 from every complete 3-byte big-endian block p times.
+        Each pass is tried with zstd 22 and (if available) cmix 9; the smallest
+        payload wins.  The search is bounded by time_limit (and optionally by
+        max_passes=0 meaning "keep going until the time budget expires"), so it
+        never enumerates all variations.  The returned blob is verified by
+        decoding it back before it is handed to the caller.
+        """
+        if not data or time_limit <= 0: return None
+        t0 = time.time()
+        deadline = t0 + time_limit
+
+        def cmix9(cur):
+            if not HAS_CMIX: return None
+            remaining = deadline - time.time()
+            if remaining <= 0: return None
+            return self._cmixc(cur, force=True, timeout=max(1.0, remaining))
+
+        codecs = [(M3_CODEC_ZSTD, "zstd22", self._m3_zstd22)]
+        if use_cmix and HAS_CMIX:
+            codecs.append((M3_CODEC_CMIX, "cmix9", cmix9))
+        if not HAS_ZSTD and len(codecs) == 1:
+            print("  [a300] zstd and cmix are both unavailable; skipped")
+            return None
+
+        best = None  # (payload_len, passes, codec_id, codec_name, payload)
+
+        def consider(p, cur):
+            nonlocal best
+            for cid, name, fn in codecs:
+                if time.time() - t0 >= time_limit:
+                    return
+                try:
+                    comp = fn(cur)
+                except Exception as e:
+                    print(f"  [a300] pass {p} {name}: {e}"); continue
+                if comp is None: continue
+                if best is None or len(comp) < best[0]:
+                    best = (len(comp), p, cid, name, comp)
+                    print(f"  a300 pass {p:>6}: {name:8s} {len(comp):,} bytes  <-- best")
+
+        print(f"\n  Algorithm 300 (minus-3): pass 0 baseline ...")
+        consider(0, data)
+        p = 0
+        last_report = t0
+        while max_passes <= 0 or p < max_passes:
+            if time.time() - t0 >= time_limit:
+                print(f"  [a300] time budget reached at pass {p}"); break
+            p += 1
+            consider(p, _m3_shift(data, -p))
+            now = time.time()
+            if now - last_report >= 2.0:
+                total = str(max_passes) if max_passes > 0 else "time"
+                best_txt = f"{best[0]:,}" if best is not None else "n/a"
+                print(f"  [a300] pass {p}/{total}  {now-t0:.1f}s  best={best_txt} bytes")
+                last_report = now
+        if best is None: return None
+
+        sz, bp, cid, name, payload = best
+        blob = self._m3_pack(data, bp, cid, payload)
+        try:
+            if self._m3_decode_blob(blob) != data:
+                print("  [a300] internal round-trip failed; discarding"); return None
+        except Exception as e:
+            print(f"  [a300] internal verify failed: {e}"); return None
+        print(f"  [a300] best: pass {bp}, {name}, {len(blob):,} container bytes")
+        return blob, (bp, cid, name, len(payload))
+
+    def decompress_minus3(self, infile, outfile="", blob=None):
+        if blob is None:
+            if not self._require_file(infile): return False
+            try:
+                with open(infile, 'rb') as f: blob = f.read()
+            except (PermissionError, OSError) as e:
+                print(f"Error reading {infile!r}: {e}"); return False
+        t0 = time.time()
+        try:
+            orig = self._m3_decode_blob(blob)
+        except Exception as e:
+            print(f"Error: .m3 decode failed: {e}"); return False
+        if not outfile:
+            outfile = infile[:-3] if infile.lower().endswith(".m3") else infile + ".out"
+        self._write(outfile, orig)
+        el = time.time() - t0
+        print(f"-> {outfile} ({len(orig)} bytes)")
+        print(f"  Decompressed in : {el:.4f} s")
+        print(f"  Container       : {len(blob):,} bytes")
+        return True
+
     def compress(self, infile, pairs=True, multi=False, timeout=None, selftest=False):
         if not self._require_file(infile): return
         try:
@@ -5226,6 +5421,24 @@ class Compressor:
         print(f"Mode: FAST ({'ON' if FAST_MODE else 'OFF'}) full-singles={'ON' if FULL_SINGLES else 'OFF'} "
               f"full-pairs={'ON' if FULL_PAIRS else 'OFF'} skip-slow={'ON' if SKIP_SLOW else 'OFF'} a256={A256_MODE}")
         print(f"Header: extension only  <orig>.aXXXX  (XXXX = 4 hex digits)")
+
+        m3_time = 0.0; m3_passes = 0; m3_use_cmix = HAS_CMIX; m3_on = False
+        if not selftest:
+            print("\nAlgorithm 300 (minus-3) budget for this compression:")
+            print("  pass p = subtract 1 from every complete 3-byte block p times;")
+            print("  each pass is compressed with zstd 22 and cmix 9; smallest wins.")
+            raw = input("How long to compress with this algorithm, seconds (0 = skip) [30]: ").strip()
+            try:
+                m3_time = max(0.0, float(raw)) if raw else 30.0
+                if not math.isfinite(m3_time): m3_time = 30.0
+            except ValueError: m3_time = 30.0
+            m3_on = m3_time > 0
+            m3_passes = 0          # 0 = keep subtracting/compressing until time is up
+            if not m3_on:
+                print("  a300: skipped for this run.")
+            elif not HAS_CMIX:
+                print("  a300: cmix 9 not available; using zstd 22 only.")
+
         t_start = time.time()
 
         xml_enc = None
@@ -5350,17 +5563,37 @@ class Compressor:
             marker = " <<< BEST" if (lbl_ == label and k_ == kind and id_ == ident) else ""
             print(f"  [{lbl_}] size={sz}{marker}")
 
-        ext = _ext_for(kind, ident); out = infile + ext
-        self._write(out, best_blob)
+        ext = _ext_for(kind, ident)
+        out = infile + ext
+        final_blob = best_blob
+        final_label = label
+        final_kind = kind
+        final_ident = ident
+
+        if m3_on:
+            print(f"\n  Algorithm 300 (minus-3) starts after normal JPQ5 ...")
+            res = self._m3_search_best(data, m3_time, m3_passes, m3_use_cmix, tag="a300")
+            if res is not None:
+                m3_blob, m3_info = res
+                if len(m3_blob) < len(final_blob):
+                    out = infile + ".m3"
+                    final_blob = m3_blob
+                    final_label = "a300 (minus-3 sweep)"
+                    final_kind = "m3"
+                    print(f"  [a300] WINS: {len(m3_blob):,} < {len(best_blob):,} bytes")
+                else:
+                    print(f"  [a300] loses: {len(m3_blob):,} >= {len(best_blob):,} bytes")
+
+        self._write(out, final_blob)
 
         elapsed = time.time() - t_start
         bps = len(data) / elapsed if elapsed > 0 else 0.0
         kbps = bps / 1024.0; mbps = kbps / 1024.0
-        out_bps = len(best_blob) / elapsed if elapsed > 0 else 0.0
+        out_bps = len(final_blob) / elapsed if elapsed > 0 else 0.0
         out_kbps = out_bps / 1024.0; out_mbps = out_kbps / 1024.0
         ms_per_kb = (elapsed / (len(data) / 1024.0)) * 1000.0 if len(data) else 0.0
-        out_ms_per_kb = (elapsed / (len(best_blob) / 1024.0)) * 1000.0 if len(best_blob) else 0.0
-        ratio = (len(best_blob) / len(data) * 100.0) if len(data) else 0.0
+        out_ms_per_kb = (elapsed / (len(final_blob) / 1024.0)) * 1000.0 if len(final_blob) else 0.0
+        ratio = (len(final_blob) / len(data) * 100.0) if len(data) else 0.0
         file_kb = len(data) / 1024.0
         total_var = variations_evaluated + 1
         var_per_sec = total_var / elapsed if elapsed > 0 else 0.0
@@ -5370,10 +5603,10 @@ class Compressor:
 
         print("\n" + "="*64)
         print(f"WINNER: {out}")
-        print(f"  Method   : {label}")
-        print(f"  Size     : {len(best_blob):,} bytes  ({ratio:.2f}% of original)")
+        print(f"  Method   : {final_label}")
+        print(f"  Size     : {len(final_blob):,} bytes  ({ratio:.2f}% of original)")
         print(f"  Original : {len(data):,} bytes")
-        print(f"  Saved    : {len(data)-len(best_blob):,} bytes  ({(100-ratio):.2f}%)")
+        print(f"  Saved    : {len(data)-len(final_blob):,} bytes  ({(100-ratio):.2f}%)")
         print(f"  Time     : {elapsed:.4f} s")
         print(f"  Speed    : {bps:,.0f} bytes/s")
         print(f"  Speed    : {kbps:,.3f} KB/s  (input)")
@@ -5386,14 +5619,20 @@ class Compressor:
         print(f"  Variations / KB       : {var_per_kb:,.2f}")
         print(f"  Variations / KB / s   : {var_per_kb_per_s:.2f}")
         print(f"  Seconds / variation·KB: {sec_per_var_kb:.6f}")
-        print(f"  Header   : (in extension) {ext}")
-        print(f"  Note     : Do NOT rename the file — the extension IS the header.")
+        if final_kind == "m3":
+            print(f"  Header   : .m3 container (magic + pass count + SHA-256)")
+        else:
+            print(f"  Header   : (in extension) {ext}")
+        print(f"  Note     : Do NOT rename the file — the extension/container IS the header.")
 
         try:
             with open(out, 'rb') as f: readback = f.read()
-            if readback != best_blob:
+            if readback != final_blob:
                 print("  [VERIFICATION FAILED: readback bytes mismatch]"); return
-            orig = self._decode_blob(readback, kind, ident)
+            if final_kind == "m3":
+                orig = self._m3_decode_blob(readback)
+            else:
+                orig = self._decode_blob(readback, final_kind, final_ident)
             if orig == data: print("  [VERIFIED LOSSLESS: decode(readback) == original]")
             else: print("  [VERIFICATION FAILED: content mismatch]")
         except Exception as e:
@@ -5408,6 +5647,8 @@ class Compressor:
             print(f"Error reading {infile!r}: {e}"); return False
         if len(blob) == 0:
             print(f"Error: empty."); return False
+        if blob[:8] == M3_MAGIC:
+            return self.decompress_minus3(infile, outfile, blob)
         base = os.path.basename(infile)
         parsed = _parse_ext(infile)
         if parsed is None:
@@ -5473,12 +5714,14 @@ class Compressor:
         if sample is None: sample = b"the quick brown fox " * 4
         limit = max_pairs if max_pairs is not None else len(self.pairs)
         limit = min(limit, len(self.pairs))
-        print("="*60); print(f"Sweep: {limit} of {len(self.pairs)} pairs"); print("="*60)
+        print("="*60); print(f"Sweep: {limit:,} pairs (lossless composition)"); print("="*60)
         bad = 0; tested = 0; errors = []
+        first = {}; t0 = time.time()
         for i, (a, b) in enumerate(self.pairs[:limit]):
             if self._is_huge_a256() and (a == 256 or b == 256): continue
             try:
-                tr = self.fwd[b](self.fwd[a](sample))
+                if a not in first: first[a] = self.fwd[a](sample)
+                tr = self.fwd[b](first[a])
                 back = self.rev[a](self.rev[b](tr))
                 if back != sample:
                     bad += 1
@@ -5487,6 +5730,8 @@ class Compressor:
                 bad += 1
                 if len(errors) < 10: errors.append(f"b{i+1} (a{a}→a{b}): {e}")
             tested += 1
+            if tested % 5000 == 0:
+                print(f"  ... {tested:,}/{limit:,} pairs  {time.time()-t0:.1f}s  bad={bad}")
         for e in errors: print(f"    {e}")
         if bad:
             print(f"  FAIL: {bad}/{tested} pairs are NOT lossless"); return False
@@ -5603,9 +5848,21 @@ class Compressor:
             if d != p: print(f"  FAIL backend len={len(p)}"); return False
         print("  Backends: PASS")
 
+        print("  minus-3 sweep check:")
+        for L in (0, 1, 2, 3, 4, 5, 17, 256, 1000, 4096):
+            d = os.urandom(L)
+            for p in (1, 2, 7, 255, 4096):
+                if _m3_shift(_m3_shift(d, -p), p) != d:
+                    print(f"  FAIL minus-3 shift len={L} p={p}"); return False
+            for p in (1, 3):
+                blob = self._m3_pack(d, p, M3_CODEC_RAW, _m3_shift(d, -p))
+                if self._m3_decode_blob(blob) != d:
+                    print(f"  FAIL minus-3 container len={L} p={p}"); return False
+        print("    minus-3 24-bit shift + .m3 container LOSSLESS ✓")
+
         # Full transform sweep
         if not self.selftest_all_transforms(): return False
-        if not self.selftest_all_pairs(max_pairs=min(500, len(self.pairs))): return False
+        if not self.selftest_all_pairs(max_pairs=MAX_PAIRS): return False
 
         # 4400-qubit fp sanity
         try:
@@ -5642,7 +5899,7 @@ class Compressor:
 
 def main():
     print(f"{PROGNAME}")
-    print("* Extension-as-header — no header bytes inside file")
+    print("* .aXXXX extension is the header; .m3 has a self-contained header")
     print(f"* 0x0000..0x00FF → single a1..a256")
     print(f"* 0x0100..0xFFFF → pair   b1..b{MAX_PAIRS}")
     print("* Extension: <original>.aXXXX  (XXXX = 4 hex digits)")
@@ -5656,6 +5913,7 @@ def main():
     print(f"* a84-a255  : 22 algorithm families (delta/transpose/swap/bitrev/…)")
     print(f"* Qubits    : up to {QUBIT_LIMIT}")
     print(f"* a256      : block-sweep 1..{A256_BLOCK_MAX}B × {A256_BLOCK_CANDIDATES} samples, 2^{A256_KEY_BITS} key space (never enumerated)")
+    print("* a300      : minus-3 sweep inside option 1 (1 per 3-byte block) + zstd 22 / cmix 9")
     try:
         mp.set_start_method('fork', force=True)
         print(f"mp: fork, {N_CORES} workers (cpu_count={CPU_COUNT})")
@@ -5665,10 +5923,9 @@ def main():
     c = Compressor(try_dl=(dl == 'y'), pairs=PAIRS, qubits=QUBITS)
     while True:
         print("\nMenu:")
-        print("1) Compress (fast)")
-        print("2) Decompress")
-        print("3) Self-test (100% losslessness)")
-        print("4) Inspect file")
+        print("1) Compress (JPQ5 + Algorithm 300)")
+        print("2) Extract")
+        print("3) Self-test (256 transformations, 65,280 pairs)")
         ch = input("> ").strip()
         if ch == "1":
             f = input("Input file: ").strip()
@@ -5681,36 +5938,6 @@ def main():
             c.decompress(f, o)
         elif ch == "3":
             c.selftest()
-        elif ch == "4":
-            f = input("File to inspect: ").strip()
-            if not f or not os.path.exists(f): print("No file."); continue
-            with open(f, "rb") as fh: data = fh.read()
-            if data[:4] == b"PK\x03\x04":
-                entries, _, _ = _parse_zip_entries(data)
-                for e in entries:
-                    lh = e['local_header']
-                    fn = lh[30:30+struct.unpack('<H', lh[26:28])[0]].decode('utf-8', 'replace')
-                    if not fn.lower().endswith(('.xml', '.rels')): continue
-                    try: raw = zlib.decompress(e['compressed'], -15)
-                    except Exception: continue
-                    cands = {"XY": _xml_encode_v2(raw), "XZ": _xml_encode_bits(raw),
-                             "XW": _xml_encode_v2_words(raw, c.ref_idx),
-                             "XC": _xml_encode_v3_compound(raw, c.ref_idx),
-                             "XD": _xml_encode_v4_localdict(raw),
-                             "XE": _xml_encode_v5_nested(raw, c.ref_idx)}
-                    print(f"\n{fn}  raw={len(raw):,}  word-deflate={len(e['compressed']):,}")
-                    for name, enc in cands.items():
-                        if enc is None: print(f"  {name}: None"); continue
-                        rt = 'OK' if _xml_decode_v2(enc) == raw else 'FAIL'
-                        print(f"  {name}: raw={len(enc):>7,}  cback={len(c.cback(enc)):>7,}  rt={rt}")
-            else:
-                for name, fn in [("XY", _xml_encode_v2), ("XZ", _xml_encode_bits),
-                                 ("XW", lambda x: _xml_encode_v2_words(x, c.ref_idx)),
-                                 ("XC", lambda x: _xml_encode_v3_compound(x, c.ref_idx)),
-                                 ("XD", _xml_encode_v4_localdict),
-                                 ("XE", lambda x: _xml_encode_v5_nested(x, c.ref_idx))]:
-                    enc = fn(data)
-                    print(f"  {name}: raw={len(enc) if enc else 0:,}  cback={len(c.cback(enc)) if enc else 0:,}")
         else: print("Invalid")
 
 if __name__ == "__main__":
