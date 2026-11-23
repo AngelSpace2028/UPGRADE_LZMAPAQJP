@@ -5370,6 +5370,7 @@ class Compressor:
         for i in range(84, 256):
             f, r = self._dyn2(i); eager_f[i] = f; eager_r[i] = r
         eager_f[256] = self.t256; eager_r[256] = self.r256
+        eager_f[257] = self.t257; eager_r[257] = self.r257
         self.fwd = eager_f; self.rev = eager_r
         if A256_MODE == "blocksweep4400": mode = (f"BLOCK-SWEEP 1..{A256_BLOCK_MAX}B × {A256_BLOCK_CANDIDATES} "
                                                    f"samples from 2^{A256_KEY_BITS}, never enumerated")
@@ -5380,6 +5381,7 @@ class Compressor:
         print(f"Transforms registered: 1-83 fixed + 84-255 (22 families × 8) + 256 XOR64 ({mode}) + 257 spring.")
         print(f"  a62 self-contained (QUBITS in blob, structural hash) ✓")
         print(f"  a252-a255 fixed (delta_reverse identity = reverse) ✓")
+        print(f"  a257 spring (radix-255) registered ✓")
         print(f"  XML seed sig: {_get_xml_sig().hex()}")
 
     def _pairs(self):
