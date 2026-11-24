@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # written by Jurijus Pacalovas
-# JPQ7-SPEED: ~1e9× fewer candidates than full mode — first 1 full, always-list, fixed pairs only, size protected
+# JPQ6 FAST10: ~10× faster — always-list ALWAYS runs + best size always checked & saved
 # JPQ7: A-Z dictionaries targeting ~260000 total words (10k/letter)
 # -*- coding: utf-8 -*-
-# JPQ7-SPEED — MERGED (~1e9× fewer candidates; first-1 full + always-list; fixed pairs only)
-#   Base: PPMD_1.8 / JPQ5 (100% lossless transforms, pairs, a300 minus-3, images)
+# JPQ6 FAST10 — MERGED (prefix 8 + always-list + 128 pairs; ~10× faster, size protected)
+#   Base: PPMD_1.8 / JPQ5 (100% lossless transforms, pairs, images)
 #   New:  spring radix-255 block encoder (backend id 15 + transform a257)
 #   Spring never expands a block; encode then decode is identity for all inputs.
 #   Build A (100% LOSSLESS): a62 QUBITS-in-blob, a61 seed signature,
@@ -18,8 +18,6 @@
 #   + 27-case edge-input verify sweep (auto-disable broken transforms)
 #   + a256 4400-bit block sweep (1..550 B key lengths × 512 samples, never enumerated)
 #   + FIX a252–a255 (_F_delta_reverse small-input identity: f = reverse)
-#   + a300 minus-3 sweep (.m3): subtract 1 per 3-byte group, retry zstd-22 /
-#     cmix-9 after every pass, with one user-set time budget
 
 import math, random, decimal, hashlib, base64, heapq, struct, os
 import tempfile, re, sys, subprocess, importlib, time, site, shutil
@@ -75,17 +73,17 @@ HAS_CMIX = shutil.which('cmix') is not None
 FAST_MODE       = os.environ.get("PPMD_FAST", "1") != "0"
 # JPQ7-SPEED defaults: only the first 14 transforms are always fully evaluated.
 # Minimal sample for ~1e9× fewer candidates vs full 256+65280 (size protected by always-list).
-FULL_SINGLES    = os.environ.get("PPMD_FULL_SINGLES", "0") != "0"   # default OFF
-FULL_PAIRS      = os.environ.get("PPMD_FULL_PAIRS",   "0") != "0"   # default OFF
+FULL_SINGLES    = os.environ.get("PPMD_FULL_SINGLES", "0") != "0"   # default OFF (keep off for speed)
+FULL_PAIRS      = os.environ.get("PPMD_FULL_PAIRS",   "0") != "0"   # default OFF (keep off for speed)
 SKIP_SLOW       = os.environ.get("PPMD_SKIP_SLOW",    "1") != "0"
-EARLY_EXIT_GAIN = float(os.environ.get("PPMD_EARLY_EXIT_GAIN", "0.55"))
-EARLY_EXIT_RATIO = float(os.environ.get("PPMD_EARLY_EXIT_RATIO", "0.92"))  # stop search if best <= this fraction of input
+EARLY_EXIT_GAIN = float(os.environ.get("PPMD_EARLY_EXIT_GAIN", "0.50"))
+EARLY_EXIT_RATIO = float(os.environ.get("PPMD_EARLY_EXIT_RATIO", "0.90"))  # stop search if best <= this fraction of input
 # How many transforms are always run fully (the "first 14 algorithms")
-FAST_PREFIX     = max(1, min(256, int(os.environ.get("PPMD_FAST_PREFIX", "1") or "1")))
+FAST_PREFIX     = max(1, min(256, int(os.environ.get("PPMD_FAST_PREFIX", "8") or "8")))
 # After the prefix: sample this many extra single transforms (from 15..256)
-FAST_EXTRA_SINGLES = max(0, min(242, int(os.environ.get("PPMD_FAST_EXTRA_SINGLES", "0") or "0")))
+FAST_EXTRA_SINGLES = max(0, min(242, int(os.environ.get("PPMD_FAST_EXTRA_SINGLES", "12") or "12")))
 # After the prefix: sample this many pairs (instead of up to 65280)
-FAST_PAIR_SAMPLE   = max(0, min(65280, int(os.environ.get("PPMD_FAST_PAIR_SAMPLE", "0") or "0")))
+FAST_PAIR_SAMPLE   = max(0, min(65280, int(os.environ.get("PPMD_FAST_PAIR_SAMPLE", "128") or "128")))
 # Keep only this many best candidates for final verify (already existed as TOP_VERIFY)
 
 A256_MODE        = os.environ.get("PPMD_A256_MODE", "blocksweep4400").lower()
@@ -100,15 +98,8 @@ A256_CKPT        = max(1, int(os.environ.get("PPMD_A256_CKPT", "10000000") or "1
 A256_KEY_BITS    = 4400
 A256_KEY_BYTES   = A256_KEY_BITS // 8          # 550 bytes = the 4400-bit key space
 A256_BLOCK_MAX   = max(1, min(550, int(os.environ.get("PPMD_A256_BLOCK_MAX", "550") or "550")))
-A256_BLOCK_CANDIDATES = max(2, min(4096, int(os.environ.get("PPMD_A256_BLOCK_CANDIDATES", "512") or "512")))
+A256_BLOCK_CANDIDATES = max(2, min(4096, int(os.environ.get("PPMD_A256_BLOCK_CANDIDATES", "256") or "256")))
 A256_VERIFY_FAST = False
-
-# ── minus-3 sweep container (.m3) ────────────────────────────────────────────
-M3_MAGIC  = b"JPQ6M3\x01\x00"                  # 8 bytes
-M3_STRUCT = struct.Struct(">8sBIQQ32s")           # magic, codec, passes, orig_len, comp_len, sha256
-M3_CODEC_RAW  = 0
-M3_CODEC_ZSTD = 1
-M3_CODEC_CMIX = 2
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -268,7 +259,7 @@ REPEATS = max(1, int(os.environ.get("PPMD_REPEATS", "1") or "1"))
 CBACK_WORKERS = max(2, int(os.environ.get("PPMD_CBACK_WORKERS", str(max(4, CPU_COUNT))) or "8"))
 CBACK_WORKERS_EFF = max(1, CPU_COUNT // max(1, N_CORES))
 CHUNK = max(1, int(os.environ.get("PPMD_CHUNK", "256") or "256"))
-TOP_VERIFY = max(1, int(os.environ.get("PPMD_TOP_VERIFY", "1") or "1"))
+TOP_VERIFY = max(1, int(os.environ.get("PPMD_TOP_VERIFY", "2") or "2"))
 try:
     _MP_CTX = mp.get_context("fork"); _HAS_FORK = True
 except (ValueError, AttributeError):
@@ -288,36 +279,6 @@ _IN_WORKER = False
 def _set_global_ref(rb, rcap, rup):
     global _GLOBAL_REF_BYTES, _GLOBAL_REF_CAP, _GLOBAL_REF_UP
     _GLOBAL_REF_BYTES = rb; _GLOBAL_REF_CAP = rcap; _GLOBAL_REF_UP = rup
-
-def _m3_shift(d, delta):
-    """Add delta (mod 2^24) to each complete 3-byte big-endian block.
-
-    delta < 0 is the minus-1 pass; delta > 0 is its exact inverse. A trailing
-    1- or 2-byte tail is left untouched (so the mapping is always lossless).
-    """
-    n = len(d)
-    if n < 3 or delta == 0: return bytes(d)
-    m = n - (n % 3)
-    if _np is not None and HAS_NUMPY:
-        try:
-            a = _np.frombuffer(d[:m], dtype=_np.uint8).reshape(-1, 3).astype(_np.int64)
-            v = (a[:, 0] << 16) | (a[:, 1] << 8) | a[:, 2]
-            v = (v + int(delta)) & 0xFFFFFF
-            out = _np.empty((v.size, 3), dtype=_np.uint8)
-            out[:, 0] = (v >> 16) & 0xFF
-            out[:, 1] = (v >> 8) & 0xFF
-            out[:, 2] = v & 0xFF
-            return out.tobytes() + bytes(d[m:])
-        except Exception:
-            pass
-    b = bytearray(d)
-    for i in range(0, m, 3):
-        v = (b[i] << 16) | (b[i+1] << 8) | b[i+2]
-        v = (v + delta) & 0xFFFFFF
-        b[i] = v >> 16
-        b[i+1] = (v >> 8) & 0xFF
-        b[i+2] = v & 0xFF
-    return bytes(b)
 
 def _worker_single(t):
     global _IN_WORKER
@@ -382,14 +343,14 @@ def _ins_zstd():
         except Exception: pass
     return False
 
-print("="*70); print("JPQ7-SPEED — ~1e9× leaner tournament (1 full + always-list); 100% lossless"); print("="*70)
+print("="*70); print("JPQ6 FAST10 — always-list size protected; best size always saved; 100% lossless"); print("="*70)
 print(f"parallelism : {N_CORES} cores" + (" (fork)" if _HAS_FORK else " (spawn)"))
 print(f"cpu count   : {CPU_COUNT}")
 print(f"fast mode   : {'ON' if FAST_MODE else 'OFF'}")
 print(f"full singles: {'ON (256 transforms)' if FULL_SINGLES else f'OFF (prefix {FAST_PREFIX} + {FAST_EXTRA_SINGLES} sampled)'}")
 print(f"full pairs  : {'ON (up to 65280 pairs)' if FULL_PAIRS else f'OFF (sample {FAST_PAIR_SAMPLE} pairs)'}")
 print(f"skip slow   : {'ON' if SKIP_SLOW else 'OFF'}")
-print(f"JPQ7-SPEED   : first {FAST_PREFIX} full + {FAST_EXTRA_SINGLES} extra + {FAST_PAIR_SAMPLE} pairs  (~1e9× fewer candidates)")
+print(f"JPQ6 FAST10  : first {FAST_PREFIX} full + {FAST_EXTRA_SINGLES} extra + {FAST_PAIR_SAMPLE} pairs  (~10× faster)")
 print(f"a256 mode   : " + (
     f"BLOCK-SWEEP 1..{A256_BLOCK_MAX}B × {A256_BLOCK_CANDIDATES} samples "
     f"from 2^{A256_KEY_BITS} (never enumerated)" if A256_MODE == "blocksweep4400" else
@@ -664,7 +625,7 @@ print(f"\nBackends: zstd={'Y' if HAS_ZSTD else 'N'} lzma={'Y' if HAS_LZMA else '
       f"pyppmd={'Y' if HAS_PPMD else 'N'} zpaq={'Y' if HAS_ZPAQ else 'N'} "
       f"ccmx={'Y' if HAS_CCMX else 'N'} cmix={'Y' if HAS_CMIX else 'N'} "
       f"lepton={'Y' if HAS_LEPTON else 'N'} qiskit={'Y' if HAS_QISKIT else 'N'}")
-PROGNAME = "JPQ7-SPEED"
+PROGNAME = "JPQ6-FAST10"
 
 REF_TEXT = (
     "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. "
@@ -5463,174 +5424,6 @@ class Compressor:
         if new_sz < sz: return (new_sz, kind, ident, lbl + "+cmix", new_blob)
         return chosen
 
-    # ── minus-3 sweep (.m3 container) ───────────────────────────────────────
-    def _m3_zstd22(self, d):
-        if not HAS_ZSTD: return None
-        try: return zc.compress(d)
-        except Exception: return None
-
-    def _m3_cmix9(self, d):
-        if not HAS_CMIX: return None
-        try: return self._cmixc(d, force=True)
-        except Exception: return None
-
-    def _m3_pack(self, data, passes, codec, payload):
-        return M3_STRUCT.pack(M3_MAGIC, codec, passes, len(data), len(payload),
-                              hashlib.sha256(data).digest()) + payload
-
-    def _m3_unpack(self, blob):
-        if len(blob) < M3_STRUCT.size: raise TransformError("m3 short header")
-        magic, codec, passes, olen, clen, sha = M3_STRUCT.unpack(blob[:M3_STRUCT.size])
-        if magic != M3_MAGIC: raise TransformError("m3 magic")
-        if len(blob) != M3_STRUCT.size + clen: raise TransformError("m3 length")
-        return codec, passes, olen, sha, blob[M3_STRUCT.size:]
-
-    def _m3_decode_blob(self, blob):
-        codec, passes, olen, sha, payload = self._m3_unpack(blob)
-        if codec == M3_CODEC_RAW:
-            cur = payload
-        elif codec == M3_CODEC_ZSTD:
-            if not HAS_ZSTD: raise TransformError("zstd not available")
-            cur = zd.decompress(payload)
-        elif codec == M3_CODEC_CMIX:
-            if not HAS_CMIX: raise TransformError("cmix not available")
-            cur = self._cmixd(payload, force=True)
-            if cur is None: raise TransformError("cmix decode failed")
-        else:
-            raise TransformError(f"m3 codec {codec}")
-        if len(cur) != olen: raise TransformError("m3 original length")
-        plain = _m3_shift(cur, passes)
-        if hashlib.sha256(plain).digest() != sha: raise TransformError("m3 checksum")
-        return plain
-
-    def _m3_search_best(self, data, time_limit, max_passes, use_cmix=True, tag="a300"):
-        """Run the minus-3 sweep and return (container_blob, info), or None.
-
-        JPQ7-SPEED a300: by default evaluates 4 passes (0..3) in parallel across
-        cores. Each pass still tries zstd-22 and (if available) cmix-9; the
-        smallest payload wins (same size quality as before). Passes are
-        independent after the shift, so they can run concurrently.
-        max_passes<=0 still means "keep going until time budget" but in
-        parallel batches of N_CORES passes.
-        """
-        if not data or time_limit <= 0: return None
-        t0 = time.time()
-        deadline = t0 + time_limit
-
-        # Default to 4 steps when caller passes 0 (unlimited) — faster path
-        # while still covering baseline + 3 minus-3 passes.
-        if max_passes <= 0:
-            max_passes = 4
-
-        has_zstd = HAS_ZSTD
-        has_cmix = bool(use_cmix and HAS_CMIX)
-        if not has_zstd and not has_cmix:
-            print("  [a300] zstd and cmix are both unavailable; skipped")
-            return None
-
-        def _eval_one(p):
-            """Return best (payload_len, p, codec_id, name, payload) for one pass, or None."""
-            if time.time() >= deadline:
-                return None
-            cur = data if p == 0 else _m3_shift(data, -p)
-            results = []
-
-            def run_zstd():
-                if not has_zstd: return None
-                try:
-                    comp = self._m3_zstd22(cur)
-                    if comp is None: return None
-                    return (len(comp), p, M3_CODEC_ZSTD, "zstd22", comp)
-                except Exception as e:
-                    print(f"  [a300] pass {p} zstd22: {e}")
-                    return None
-
-            def run_cmix():
-                if not has_cmix: return None
-                remaining = deadline - time.time()
-                if remaining <= 0: return None
-                try:
-                    comp = self._cmixc(cur, force=True, timeout=max(1.0, remaining))
-                    if comp is None: return None
-                    return (len(comp), p, M3_CODEC_CMIX, "cmix9", comp)
-                except Exception as e:
-                    print(f"  [a300] pass {p} cmix9: {e}")
-                    return None
-
-            # zstd + cmix in parallel for this pass
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                futs = []
-                if has_zstd: futs.append(ex.submit(run_zstd))
-                if has_cmix: futs.append(ex.submit(run_cmix))
-                for fut in as_completed(futs):
-                    r = fut.result()
-                    if r is not None:
-                        results.append(r)
-            if not results:
-                return None
-            return min(results, key=lambda x: x[0])
-
-        print(f"\n  Algorithm 300 (minus-3) FAST: {max_passes} passes, parallel on {N_CORES} cores ...")
-        best = None  # (payload_len, passes, codec_id, codec_name, payload)
-
-        # Evaluate passes in parallel batches
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        passes = list(range(0, max_passes))
-        batch = max(1, min(N_CORES, len(passes)))
-        done = 0
-        with ThreadPoolExecutor(max_workers=batch) as ex:
-            # Submit all passes; workers limited to batch size
-            futs = {ex.submit(_eval_one, p): p for p in passes}
-            for fut in as_completed(futs):
-                if time.time() >= deadline:
-                    print(f"  [a300] time budget reached")
-                    for f in futs:
-                        f.cancel()
-                    break
-                r = fut.result()
-                done += 1
-                if r is None:
-                    continue
-                if best is None or r[0] < best[0]:
-                    best = r
-                    print(f"  a300 pass {r[1]:>6}: {r[3]:8s} {r[0]:,} bytes  <-- best")
-                else:
-                    print(f"  a300 pass {r[1]:>6}: {r[3]:8s} {r[0]:,} bytes")
-        if best is None:
-            return None
-
-        sz, bp, cid, name, payload = best
-        blob = self._m3_pack(data, bp, cid, payload)
-        try:
-            if self._m3_decode_blob(blob) != data:
-                print("  [a300] internal round-trip failed; discarding"); return None
-        except Exception as e:
-            print(f"  [a300] internal verify failed: {e}"); return None
-        print(f"  [a300] best: pass {bp}, {name}, {len(blob):,} container bytes  ({time.time()-t0:.2f}s)")
-        return blob, (bp, cid, name, len(payload))
-
-    def decompress_minus3(self, infile, outfile="", blob=None):
-        if blob is None:
-            if not self._require_file(infile): return False
-            try:
-                with open(infile, 'rb') as f: blob = f.read()
-            except (PermissionError, OSError) as e:
-                print(f"Error reading {infile!r}: {e}"); return False
-        t0 = time.time()
-        try:
-            orig = self._m3_decode_blob(blob)
-        except Exception as e:
-            print(f"Error: .m3 decode failed: {e}"); return False
-        if not outfile:
-            outfile = infile[:-3] if infile.lower().endswith(".m3") else infile + ".out"
-        self._write(outfile, orig)
-        el = time.time() - t0
-        print(f"-> {outfile} ({len(orig)} bytes)")
-        print(f"  Decompressed in : {el:.4f} s")
-        print(f"  Container       : {len(blob):,} bytes")
-        return True
-
     def compress(self, infile, pairs=True, multi=False, timeout=None, selftest=False):
         if not self._require_file(infile): return
         try:
@@ -5643,23 +5436,6 @@ class Compressor:
         print(f"Mode: FAST ({'ON' if FAST_MODE else 'OFF'}) full-singles={'ON' if FULL_SINGLES else 'OFF'} "
               f"full-pairs={'ON' if FULL_PAIRS else 'OFF'} skip-slow={'ON' if SKIP_SLOW else 'OFF'} a256={A256_MODE}")
         print(f"Header: extension only  <orig>.aXXXX  (XXXX = 4 hex digits)")
-
-        m3_time = 0.0; m3_passes = 0; m3_use_cmix = HAS_CMIX; m3_on = False
-        if not selftest:
-            print("\nAlgorithm 300 (minus-3) budget for this compression:")
-            print("  pass p = subtract 1 from every complete 3-byte block p times;")
-            print("  each pass is compressed with zstd 22 and cmix 9; smallest wins.")
-            raw = input("How long to compress with this algorithm, seconds (0 = skip) [30]: ").strip()
-            try:
-                m3_time = max(0.0, float(raw)) if raw else 30.0
-                if not math.isfinite(m3_time): m3_time = 30.0
-            except ValueError: m3_time = 30.0
-            m3_on = m3_time > 0
-            m3_passes = 4          # 4 parallel steps (0..3); set 0 for time-only unlimited
-            if not m3_on:
-                print("  a300: skipped for this run.")
-            elif not HAS_CMIX:
-                print("  a300: cmix 9 not available; using zstd 22 only.")
 
         t_start = time.time()
 
@@ -5699,21 +5475,14 @@ class Compressor:
                 if t == 61 and xml_enc is not None: continue
                 _add_single(t, f"a{t}")
         else:
-            # JPQ7-SPEED: prefix + always-list (size-first), parallel where useful, early-exit
-            print(f"\n  Phase 1 (speed): first {FAST_PREFIX} full + always-list (parallel) ...")
+            # FAST10: prefix + ALWAYS-LIST first (size protected — always fully evaluated)
+            # Extra samples only after always-list; early-exit never cancels always-list.
+            print(f"\n  Phase 1 (FAST10): first {FAST_PREFIX} + always-list (size always checked) ...")
             for t in range(1, FAST_PREFIX + 1):
                 if t == 61 and xml_enc is not None: continue
                 _add_single(t, f"a{t}")
             always = [22, 33, 35, 36, 57, 58, 60, 62, 63, 66, 70, 72, 75, 77, 78, 83, 256, 257]
-            todo = [t for t in always if t > FAST_PREFIX and t <= 257 and not (t == 61 and xml_enc is not None)]
-            if FAST_EXTRA_SINGLES > 0:
-                import random as _rnd
-                pool = [t for t in range(FAST_PREFIX + 1, 257)
-                        if t not in always and not (t == 61 and xml_enc is not None)]
-                rng = _rnd.Random(0x4A7C15 ^ len(data))
-                todo += (pool[:FAST_EXTRA_SINGLES] if len(pool) <= FAST_EXTRA_SINGLES
-                         else rng.sample(pool, FAST_EXTRA_SINGLES))
-            # Parallel evaluate remaining singles (same size-first set)
+            always_todo = [t for t in always if t > FAST_PREFIX and t <= 257 and not (t == 61 and xml_enc is not None)]
             def _one(t):
                 try:
                     if not self.verify_single(data, t):
@@ -5725,23 +5494,40 @@ class Compressor:
                     return None
             from concurrent.futures import ThreadPoolExecutor, as_completed
             workers = min(8, max(2, N_CORES))
-            best_so_far = min((c[0] for c in candidates), default=len(data))
+            # 1) Always-list — NEVER early-exited (size protected)
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(_one, t): t for t in todo}
+                futs = {ex.submit(_one, t): t for t in always_todo}
                 for fut in as_completed(futs):
                     r = fut.result()
                     if r is None:
                         continue
                     candidates.append(r)
                     variations_evaluated += 1
-                    if r[0] < best_so_far:
-                        best_so_far = r[0]
-                    # Early exit: already very small vs original
-                    if len(data) > 0 and best_so_far / len(data) <= EARLY_EXIT_RATIO:
-                        print(f"  early-exit: best {best_so_far:,} <= {EARLY_EXIT_RATIO:.0%} of input")
-                        for f in futs:
-                            f.cancel()
-                        break
+            best_so_far = min((c[0] for c in candidates), default=len(data))
+            print(f"  always-list done: best so far {best_so_far:,} bytes (size protected)")
+            # 2) Optional extra samples — may early-exit
+            if FAST_EXTRA_SINGLES > 0:
+                import random as _rnd
+                pool = [t for t in range(FAST_PREFIX + 1, 257)
+                        if t not in always and not (t == 61 and xml_enc is not None)]
+                rng = _rnd.Random(0x4A7C15 ^ len(data))
+                extra = (pool[:FAST_EXTRA_SINGLES] if len(pool) <= FAST_EXTRA_SINGLES
+                         else rng.sample(pool, FAST_EXTRA_SINGLES))
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futs = {ex.submit(_one, t): t for t in extra}
+                    for fut in as_completed(futs):
+                        r = fut.result()
+                        if r is None:
+                            continue
+                        candidates.append(r)
+                        variations_evaluated += 1
+                        if r[0] < best_so_far:
+                            best_so_far = r[0]
+                        if len(data) > 0 and best_so_far / len(data) <= EARLY_EXIT_RATIO:
+                            print(f"  early-exit (extras only): best {best_so_far:,} <= {EARLY_EXIT_RATIO:.0%} of input")
+                            for f in futs:
+                                f.cancel()
+                            break
 
         if xml_enc is not None:
             try:
@@ -5834,8 +5620,9 @@ class Compressor:
             chosen = (len(c), "a", 1, "a1", c)
 
         best_size, kind, ident, label, best_blob = chosen
-        print(f"\n  winner before cmix: {label}  ({best_size:,} bytes)")
+        print(f"\n  winner before cmix: {label}  ({best_size:,} bytes)  [BEST SIZE so far]")
         print(f"  round-trip before cmix: OK")
+        print(f"  size check: original={len(data):,}  best={best_size:,}  saved={len(data)-best_size:,}")
 
         if not selftest:
             chosen2 = self._final_cmix_pass(data, chosen, candidates)
@@ -5855,21 +5642,8 @@ class Compressor:
         final_kind = kind
         final_ident = ident
 
-        if m3_on:
-            print(f"\n  Algorithm 300 (minus-3) starts after normal JPQ5 ...")
-            res = self._m3_search_best(data, m3_time, m3_passes, m3_use_cmix, tag="a300")
-            if res is not None:
-                m3_blob, m3_info = res
-                if len(m3_blob) < len(final_blob):
-                    out = infile + ".m3"
-                    final_blob = m3_blob
-                    final_label = "a300 (minus-3 sweep)"
-                    final_kind = "m3"
-                    print(f"  [a300] WINS: {len(m3_blob):,} < {len(best_blob):,} bytes")
-                else:
-                    print(f"  [a300] loses: {len(m3_blob):,} >= {len(best_blob):,} bytes")
-
         self._write(out, final_blob)
+        print(f"\n  >>> BEST SIZE SAVED: {out}  ({len(final_blob):,} bytes) <<<")
 
         elapsed = time.time() - t_start
         bps = len(data) / elapsed if elapsed > 0 else 0.0
@@ -5904,20 +5678,14 @@ class Compressor:
         print(f"  Variations / KB       : {var_per_kb:,.2f}")
         print(f"  Variations / KB / s   : {var_per_kb_per_s:.2f}")
         print(f"  Seconds / variation·KB: {sec_per_var_kb:.6f}")
-        if final_kind == "m3":
-            print(f"  Header   : .m3 container (magic + pass count + SHA-256)")
-        else:
-            print(f"  Header   : (in extension) {ext}")
-        print(f"  Note     : Do NOT rename the file — the extension/container IS the header.")
+        print(f"  Header   : (in extension) {ext}")
+        print(f"  Note     : Do NOT rename the file — the extension IS the header.")
 
         try:
             with open(out, 'rb') as f: readback = f.read()
             if readback != final_blob:
                 print("  [VERIFICATION FAILED: readback bytes mismatch]"); return
-            if final_kind == "m3":
-                orig = self._m3_decode_blob(readback)
-            else:
-                orig = self._decode_blob(readback, final_kind, final_ident)
+            orig = self._decode_blob(readback, final_kind, final_ident)
             if orig == data: print("  [VERIFIED LOSSLESS: decode(readback) == original]")
             else: print("  [VERIFICATION FAILED: content mismatch]")
         except Exception as e:
@@ -5932,8 +5700,6 @@ class Compressor:
             print(f"Error reading {infile!r}: {e}"); return False
         if len(blob) == 0:
             print(f"Error: empty."); return False
-        if blob[:8] == M3_MAGIC:
-            return self.decompress_minus3(infile, outfile, blob)
         base = os.path.basename(infile)
         parsed = _parse_ext(infile)
         if parsed is None:
@@ -6133,18 +5899,6 @@ class Compressor:
             if d != p: print(f"  FAIL backend len={len(p)}"); return False
         print("  Backends: PASS")
 
-        print("  minus-3 sweep check:")
-        for L in (0, 1, 2, 3, 4, 5, 17, 256, 1000, 4096):
-            d = os.urandom(L)
-            for p in (1, 2, 7, 255, 4096):
-                if _m3_shift(_m3_shift(d, -p), p) != d:
-                    print(f"  FAIL minus-3 shift len={L} p={p}"); return False
-            for p in (1, 3):
-                blob = self._m3_pack(d, p, M3_CODEC_RAW, _m3_shift(d, -p))
-                if self._m3_decode_blob(blob) != d:
-                    print(f"  FAIL minus-3 container len={L} p={p}"); return False
-        print("    minus-3 24-bit shift + .m3 container LOSSLESS ✓")
-
         # Full transform sweep
         if not self.selftest_all_transforms(): return False
         if not self.selftest_all_pairs(max_pairs=MAX_PAIRS): return False
@@ -6184,7 +5938,7 @@ class Compressor:
 
 def main():
     print(f"{PROGNAME}")
-    print("* .aXXXX extension is the header; .m3 has a self-contained header")
+    print("* .aXXXX extension is the header")
     print(f"* 0x0000..0x00FF → single a1..a256  (+ a257 spring via internal path)")
     print(f"* 0x0100..0xFFFF → pair   b1..b{MAX_PAIRS}")
     print("* Extension: <original>.aXXXX  (XXXX = 4 hex digits)")
@@ -6199,8 +5953,7 @@ def main():
     print(f"* a84-a255  : 22 algorithm families (delta/transpose/swap/bitrev/…)")
     print(f"* Qubits    : up to {QUBIT_LIMIT}")
     print(f"* a256      : block-sweep 1..{A256_BLOCK_MAX}B × {A256_BLOCK_CANDIDATES} samples, 2^{A256_KEY_BITS} key space (never enumerated)")
-    print("* a300      : minus-3 sweep inside option 1 (1 per 3-byte block) + zstd 22 / cmix 9")
-    print("* Dictionaries: A-Z batches ~260000 total words (_TARGET=10000/letter)\n    * JPQ7-SPEED: ~1e9× leaner (1 full + always-list + fixed pairs only); size-first")
+    print("* Dictionaries: A-Z batches ~260000 total words (_TARGET=10000/letter)\n    * JPQ6 FAST10: prefix 8 + always-list + 128 pairs; ~10× faster, size protected")
     try:
         mp.set_start_method('fork', force=True)
         print(f"mp: fork, {N_CORES} workers (cpu_count={CPU_COUNT})")
@@ -6210,7 +5963,7 @@ def main():
     c = Compressor(try_dl=(dl == 'y'), pairs=PAIRS, qubits=QUBITS)
     while True:
         print("\nMenu:")
-        print("1) Compress (JPQ5 + Algorithm 300)")
+        print("1) Compress (JPQ5 / JPQ6 FAST10)")
         print("2) Extract")
         print("3) Self-test (256 transformations, 65,280 pairs)")
         ch = input("> ").strip()
