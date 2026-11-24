@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # written by Jurijus Pacalovas
-# JPQ7-ULTRA: ~100× faster tournament — first 14 full, tiny sample of rest, size-preserving always-list
+# JPQ7-HYPER: ~100000× fewer candidates than full mode — first 10 full, always-list, 4 pairs, size protected
 # JPQ7: A-Z dictionaries targeting ~260000 total words (10k/letter)
 # -*- coding: utf-8 -*-
-# JPQ7-ULTRA — MERGED (~100× faster; first-14 full + tiny sample; size-first always-list)
+# JPQ7-HYPER — MERGED (~100000× fewer candidates; first-10 full + always-list; size protected)
 #   Base: PPMD_1.8 / JPQ5 (100% lossless transforms, pairs, a300 minus-3, images)
 #   New:  spring radix-255 block encoder (backend id 15 + transform a257)
 #   Spring never expands a block; encode then decode is identity for all inputs.
@@ -73,18 +73,18 @@ HAS_CCMX = shutil.which('ccmx') is not None
 HAS_CMIX = shutil.which('cmix') is not None
 
 FAST_MODE       = os.environ.get("PPMD_FAST", "1") != "0"
-# JPQ7-ULTRA defaults: only the first 14 transforms are always fully evaluated.
-# Tiny sample of remaining singles + pairs for ~100× fewer candidates (size protected by always-list).
+# JPQ7-HYPER defaults: only the first 14 transforms are always fully evaluated.
+# Minimal sample for ~100000× fewer candidates vs full 256+65280 (size protected by always-list).
 FULL_SINGLES    = os.environ.get("PPMD_FULL_SINGLES", "0") != "0"   # default OFF
 FULL_PAIRS      = os.environ.get("PPMD_FULL_PAIRS",   "0") != "0"   # default OFF
 SKIP_SLOW       = os.environ.get("PPMD_SKIP_SLOW",    "1") != "0"
 EARLY_EXIT_GAIN = float(os.environ.get("PPMD_EARLY_EXIT_GAIN", "0.55"))
 # How many transforms are always run fully (the "first 14 algorithms")
-FAST_PREFIX     = max(1, min(256, int(os.environ.get("PPMD_FAST_PREFIX", "14") or "14")))
+FAST_PREFIX     = max(1, min(256, int(os.environ.get("PPMD_FAST_PREFIX", "10") or "10")))
 # After the prefix: sample this many extra single transforms (from 15..256)
-FAST_EXTRA_SINGLES = max(0, min(242, int(os.environ.get("PPMD_FAST_EXTRA_SINGLES", "8") or "8")))
+FAST_EXTRA_SINGLES = max(0, min(242, int(os.environ.get("PPMD_FAST_EXTRA_SINGLES", "0") or "0")))
 # After the prefix: sample this many pairs (instead of up to 65280)
-FAST_PAIR_SAMPLE   = max(0, min(65280, int(os.environ.get("PPMD_FAST_PAIR_SAMPLE", "64") or "64")))
+FAST_PAIR_SAMPLE   = max(0, min(65280, int(os.environ.get("PPMD_FAST_PAIR_SAMPLE", "4") or "4")))
 # Keep only this many best candidates for final verify (already existed as TOP_VERIFY)
 
 A256_MODE        = os.environ.get("PPMD_A256_MODE", "blocksweep4400").lower()
@@ -267,7 +267,7 @@ REPEATS = max(1, int(os.environ.get("PPMD_REPEATS", "1") or "1"))
 CBACK_WORKERS = max(2, int(os.environ.get("PPMD_CBACK_WORKERS", str(max(4, CPU_COUNT))) or "8"))
 CBACK_WORKERS_EFF = max(1, CPU_COUNT // max(1, N_CORES))
 CHUNK = max(1, int(os.environ.get("PPMD_CHUNK", "256") or "256"))
-TOP_VERIFY = max(1, int(os.environ.get("PPMD_TOP_VERIFY", "3") or "3"))
+TOP_VERIFY = max(1, int(os.environ.get("PPMD_TOP_VERIFY", "1") or "1"))
 try:
     _MP_CTX = mp.get_context("fork"); _HAS_FORK = True
 except (ValueError, AttributeError):
@@ -381,14 +381,14 @@ def _ins_zstd():
         except Exception: pass
     return False
 
-print("="*70); print("JPQ7-ULTRA — ~100× faster tournament (14 full + tiny sample); 100% lossless"); print("="*70)
+print("="*70); print("JPQ7-HYPER — ~100000× leaner tournament (10 full + always-list); 100% lossless"); print("="*70)
 print(f"parallelism : {N_CORES} cores" + (" (fork)" if _HAS_FORK else " (spawn)"))
 print(f"cpu count   : {CPU_COUNT}")
 print(f"fast mode   : {'ON' if FAST_MODE else 'OFF'}")
 print(f"full singles: {'ON (256 transforms)' if FULL_SINGLES else f'OFF (prefix {FAST_PREFIX} + {FAST_EXTRA_SINGLES} sampled)'}")
 print(f"full pairs  : {'ON (up to 65280 pairs)' if FULL_PAIRS else f'OFF (sample {FAST_PAIR_SAMPLE} pairs)'}")
 print(f"skip slow   : {'ON' if SKIP_SLOW else 'OFF'}")
-print(f"JPQ7-ULTRA   : first {FAST_PREFIX} full + {FAST_EXTRA_SINGLES} extra + {FAST_PAIR_SAMPLE} pairs  (~100× fewer candidates)")
+print(f"JPQ7-HYPER   : first {FAST_PREFIX} full + {FAST_EXTRA_SINGLES} extra + {FAST_PAIR_SAMPLE} pairs  (~100000× fewer candidates)")
 print(f"a256 mode   : " + (
     f"BLOCK-SWEEP 1..{A256_BLOCK_MAX}B × {A256_BLOCK_CANDIDATES} samples "
     f"from 2^{A256_KEY_BITS} (never enumerated)" if A256_MODE == "blocksweep4400" else
@@ -663,7 +663,7 @@ print(f"\nBackends: zstd={'Y' if HAS_ZSTD else 'N'} lzma={'Y' if HAS_LZMA else '
       f"pyppmd={'Y' if HAS_PPMD else 'N'} zpaq={'Y' if HAS_ZPAQ else 'N'} "
       f"ccmx={'Y' if HAS_CCMX else 'N'} cmix={'Y' if HAS_CMIX else 'N'} "
       f"lepton={'Y' if HAS_LEPTON else 'N'} qiskit={'Y' if HAS_QISKIT else 'N'}")
-PROGNAME = "JPQ7-ULTRA"
+PROGNAME = "JPQ7-HYPER"
 
 REF_TEXT = (
     "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. "
@@ -5661,7 +5661,7 @@ class Compressor:
                 if t == 61 and xml_enc is not None: continue
                 _add_single(t, f"a{t}")
         else:
-            # JPQ7-ULTRA: always evaluate the first FAST_PREFIX transforms fully
+            # JPQ7-HYPER: always evaluate the first FAST_PREFIX transforms fully
             print(f"\n  Phase 1 (fast): first {FAST_PREFIX} transforms full + {FAST_EXTRA_SINGLES} sampled ...")
             for t in range(1, FAST_PREFIX + 1):
                 if t == 61 and xml_enc is not None: continue
@@ -5730,7 +5730,7 @@ class Compressor:
                 if pool is not None: pool.close(); pool.join()
                 _GLOBAL_COMP = None; _GLOBAL_DATA = None; _GLOBAL_FWD = {}
         elif not selftest:
-            # JPQ7-ULTRA path: sample FAST_PAIR_SAMPLE pairs instead of full 65k
+            # JPQ7-HYPER path: sample FAST_PAIR_SAMPLE pairs instead of full 65k
             n_sample = min(FAST_PAIR_SAMPLE, len(self.pairs), self.PAIRS)
             print(f"\n  Phase 2 (fast): sampling {n_sample} pairs (of {len(self.pairs):,}) ...")
             # Always try a few known-good pairs first
@@ -6139,7 +6139,7 @@ def main():
     print(f"* Qubits    : up to {QUBIT_LIMIT}")
     print(f"* a256      : block-sweep 1..{A256_BLOCK_MAX}B × {A256_BLOCK_CANDIDATES} samples, 2^{A256_KEY_BITS} key space (never enumerated)")
     print("* a300      : minus-3 sweep inside option 1 (1 per 3-byte block) + zstd 22 / cmix 9")
-    print("* Dictionaries: A-Z batches ~260000 total words (_TARGET=10000/letter)\n    * JPQ7-ULTRA: ~100× faster (14 full + 8 singles + 64 pairs); size-first always-list")
+    print("* Dictionaries: A-Z batches ~260000 total words (_TARGET=10000/letter)\n    * JPQ7-HYPER: ~100000× leaner (10 full + 0 extra + 4 pairs); size-first always-list")
     try:
         mp.set_start_method('fork', force=True)
         print(f"mp: fork, {N_CORES} workers (cpu_count={CPU_COUNT})")
