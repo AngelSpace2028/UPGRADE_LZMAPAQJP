@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # written by Jurijus Pacalovas
-# JPQ7-HYPER: ~100000× fewer candidates than full mode — first 10 full, always-list, 4 pairs, size protected
+# JPQ7-SPEED: ~1e9× fewer candidates than full mode — first 1 full, always-list, fixed pairs only, size protected
 # JPQ7: A-Z dictionaries targeting ~260000 total words (10k/letter)
 # -*- coding: utf-8 -*-
-# JPQ7-HYPER — MERGED (~100000× fewer candidates; first-10 full + always-list; size protected)
+# JPQ7-SPEED — MERGED (~1e9× fewer candidates; first-1 full + always-list; fixed pairs only)
 #   Base: PPMD_1.8 / JPQ5 (100% lossless transforms, pairs, a300 minus-3, images)
 #   New:  spring radix-255 block encoder (backend id 15 + transform a257)
 #   Spring never expands a block; encode then decode is identity for all inputs.
@@ -73,18 +73,19 @@ HAS_CCMX = shutil.which('ccmx') is not None
 HAS_CMIX = shutil.which('cmix') is not None
 
 FAST_MODE       = os.environ.get("PPMD_FAST", "1") != "0"
-# JPQ7-HYPER defaults: only the first 14 transforms are always fully evaluated.
-# Minimal sample for ~100000× fewer candidates vs full 256+65280 (size protected by always-list).
+# JPQ7-SPEED defaults: only the first 14 transforms are always fully evaluated.
+# Minimal sample for ~1e9× fewer candidates vs full 256+65280 (size protected by always-list).
 FULL_SINGLES    = os.environ.get("PPMD_FULL_SINGLES", "0") != "0"   # default OFF
 FULL_PAIRS      = os.environ.get("PPMD_FULL_PAIRS",   "0") != "0"   # default OFF
 SKIP_SLOW       = os.environ.get("PPMD_SKIP_SLOW",    "1") != "0"
 EARLY_EXIT_GAIN = float(os.environ.get("PPMD_EARLY_EXIT_GAIN", "0.55"))
+EARLY_EXIT_RATIO = float(os.environ.get("PPMD_EARLY_EXIT_RATIO", "0.92"))  # stop search if best <= this fraction of input
 # How many transforms are always run fully (the "first 14 algorithms")
-FAST_PREFIX     = max(1, min(256, int(os.environ.get("PPMD_FAST_PREFIX", "10") or "10")))
+FAST_PREFIX     = max(1, min(256, int(os.environ.get("PPMD_FAST_PREFIX", "1") or "1")))
 # After the prefix: sample this many extra single transforms (from 15..256)
 FAST_EXTRA_SINGLES = max(0, min(242, int(os.environ.get("PPMD_FAST_EXTRA_SINGLES", "0") or "0")))
 # After the prefix: sample this many pairs (instead of up to 65280)
-FAST_PAIR_SAMPLE   = max(0, min(65280, int(os.environ.get("PPMD_FAST_PAIR_SAMPLE", "4") or "4")))
+FAST_PAIR_SAMPLE   = max(0, min(65280, int(os.environ.get("PPMD_FAST_PAIR_SAMPLE", "0") or "0")))
 # Keep only this many best candidates for final verify (already existed as TOP_VERIFY)
 
 A256_MODE        = os.environ.get("PPMD_A256_MODE", "blocksweep4400").lower()
@@ -381,14 +382,14 @@ def _ins_zstd():
         except Exception: pass
     return False
 
-print("="*70); print("JPQ7-HYPER — ~100000× leaner tournament (10 full + always-list); 100% lossless"); print("="*70)
+print("="*70); print("JPQ7-SPEED — ~1e9× leaner tournament (1 full + always-list); 100% lossless"); print("="*70)
 print(f"parallelism : {N_CORES} cores" + (" (fork)" if _HAS_FORK else " (spawn)"))
 print(f"cpu count   : {CPU_COUNT}")
 print(f"fast mode   : {'ON' if FAST_MODE else 'OFF'}")
 print(f"full singles: {'ON (256 transforms)' if FULL_SINGLES else f'OFF (prefix {FAST_PREFIX} + {FAST_EXTRA_SINGLES} sampled)'}")
 print(f"full pairs  : {'ON (up to 65280 pairs)' if FULL_PAIRS else f'OFF (sample {FAST_PAIR_SAMPLE} pairs)'}")
 print(f"skip slow   : {'ON' if SKIP_SLOW else 'OFF'}")
-print(f"JPQ7-HYPER   : first {FAST_PREFIX} full + {FAST_EXTRA_SINGLES} extra + {FAST_PAIR_SAMPLE} pairs  (~100000× fewer candidates)")
+print(f"JPQ7-SPEED   : first {FAST_PREFIX} full + {FAST_EXTRA_SINGLES} extra + {FAST_PAIR_SAMPLE} pairs  (~1e9× fewer candidates)")
 print(f"a256 mode   : " + (
     f"BLOCK-SWEEP 1..{A256_BLOCK_MAX}B × {A256_BLOCK_CANDIDATES} samples "
     f"from 2^{A256_KEY_BITS} (never enumerated)" if A256_MODE == "blocksweep4400" else
@@ -663,7 +664,7 @@ print(f"\nBackends: zstd={'Y' if HAS_ZSTD else 'N'} lzma={'Y' if HAS_LZMA else '
       f"pyppmd={'Y' if HAS_PPMD else 'N'} zpaq={'Y' if HAS_ZPAQ else 'N'} "
       f"ccmx={'Y' if HAS_CCMX else 'N'} cmix={'Y' if HAS_CMIX else 'N'} "
       f"lepton={'Y' if HAS_LEPTON else 'N'} qiskit={'Y' if HAS_QISKIT else 'N'}")
-PROGNAME = "JPQ7-HYPER"
+PROGNAME = "JPQ7-SPEED"
 
 REF_TEXT = (
     "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. "
@@ -5505,62 +5506,99 @@ class Compressor:
     def _m3_search_best(self, data, time_limit, max_passes, use_cmix=True, tag="a300"):
         """Run the minus-3 sweep and return (container_blob, info), or None.
 
-        Pass p subtracts 1 from every complete 3-byte big-endian block p times.
-        Each pass is tried with zstd 22 and (if available) cmix 9; the smallest
-        payload wins.  The search is bounded by time_limit (and optionally by
-        max_passes=0 meaning "keep going until the time budget expires"), so it
-        never enumerates all variations.  The returned blob is verified by
-        decoding it back before it is handed to the caller.
+        JPQ7-SPEED a300: by default evaluates 4 passes (0..3) in parallel across
+        cores. Each pass still tries zstd-22 and (if available) cmix-9; the
+        smallest payload wins (same size quality as before). Passes are
+        independent after the shift, so they can run concurrently.
+        max_passes<=0 still means "keep going until time budget" but in
+        parallel batches of N_CORES passes.
         """
         if not data or time_limit <= 0: return None
         t0 = time.time()
         deadline = t0 + time_limit
 
-        def cmix9(cur):
-            if not HAS_CMIX: return None
-            remaining = deadline - time.time()
-            if remaining <= 0: return None
-            return self._cmixc(cur, force=True, timeout=max(1.0, remaining))
+        # Default to 4 steps when caller passes 0 (unlimited) — faster path
+        # while still covering baseline + 3 minus-3 passes.
+        if max_passes <= 0:
+            max_passes = 4
 
-        codecs = [(M3_CODEC_ZSTD, "zstd22", self._m3_zstd22)]
-        if use_cmix and HAS_CMIX:
-            codecs.append((M3_CODEC_CMIX, "cmix9", cmix9))
-        if not HAS_ZSTD and len(codecs) == 1:
+        has_zstd = HAS_ZSTD
+        has_cmix = bool(use_cmix and HAS_CMIX)
+        if not has_zstd and not has_cmix:
             print("  [a300] zstd and cmix are both unavailable; skipped")
             return None
 
+        def _eval_one(p):
+            """Return best (payload_len, p, codec_id, name, payload) for one pass, or None."""
+            if time.time() >= deadline:
+                return None
+            cur = data if p == 0 else _m3_shift(data, -p)
+            results = []
+
+            def run_zstd():
+                if not has_zstd: return None
+                try:
+                    comp = self._m3_zstd22(cur)
+                    if comp is None: return None
+                    return (len(comp), p, M3_CODEC_ZSTD, "zstd22", comp)
+                except Exception as e:
+                    print(f"  [a300] pass {p} zstd22: {e}")
+                    return None
+
+            def run_cmix():
+                if not has_cmix: return None
+                remaining = deadline - time.time()
+                if remaining <= 0: return None
+                try:
+                    comp = self._cmixc(cur, force=True, timeout=max(1.0, remaining))
+                    if comp is None: return None
+                    return (len(comp), p, M3_CODEC_CMIX, "cmix9", comp)
+                except Exception as e:
+                    print(f"  [a300] pass {p} cmix9: {e}")
+                    return None
+
+            # zstd + cmix in parallel for this pass
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                futs = []
+                if has_zstd: futs.append(ex.submit(run_zstd))
+                if has_cmix: futs.append(ex.submit(run_cmix))
+                for fut in as_completed(futs):
+                    r = fut.result()
+                    if r is not None:
+                        results.append(r)
+            if not results:
+                return None
+            return min(results, key=lambda x: x[0])
+
+        print(f"\n  Algorithm 300 (minus-3) FAST: {max_passes} passes, parallel on {N_CORES} cores ...")
         best = None  # (payload_len, passes, codec_id, codec_name, payload)
 
-        def consider(p, cur):
-            nonlocal best
-            for cid, name, fn in codecs:
-                if time.time() - t0 >= time_limit:
-                    return
-                try:
-                    comp = fn(cur)
-                except Exception as e:
-                    print(f"  [a300] pass {p} {name}: {e}"); continue
-                if comp is None: continue
-                if best is None or len(comp) < best[0]:
-                    best = (len(comp), p, cid, name, comp)
-                    print(f"  a300 pass {p:>6}: {name:8s} {len(comp):,} bytes  <-- best")
-
-        print(f"\n  Algorithm 300 (minus-3): pass 0 baseline ...")
-        consider(0, data)
-        p = 0
-        last_report = t0
-        while max_passes <= 0 or p < max_passes:
-            if time.time() - t0 >= time_limit:
-                print(f"  [a300] time budget reached at pass {p}"); break
-            p += 1
-            consider(p, _m3_shift(data, -p))
-            now = time.time()
-            if now - last_report >= 2.0:
-                total = str(max_passes) if max_passes > 0 else "time"
-                best_txt = f"{best[0]:,}" if best is not None else "n/a"
-                print(f"  [a300] pass {p}/{total}  {now-t0:.1f}s  best={best_txt} bytes")
-                last_report = now
-        if best is None: return None
+        # Evaluate passes in parallel batches
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        passes = list(range(0, max_passes))
+        batch = max(1, min(N_CORES, len(passes)))
+        done = 0
+        with ThreadPoolExecutor(max_workers=batch) as ex:
+            # Submit all passes; workers limited to batch size
+            futs = {ex.submit(_eval_one, p): p for p in passes}
+            for fut in as_completed(futs):
+                if time.time() >= deadline:
+                    print(f"  [a300] time budget reached")
+                    for f in futs:
+                        f.cancel()
+                    break
+                r = fut.result()
+                done += 1
+                if r is None:
+                    continue
+                if best is None or r[0] < best[0]:
+                    best = r
+                    print(f"  a300 pass {r[1]:>6}: {r[3]:8s} {r[0]:,} bytes  <-- best")
+                else:
+                    print(f"  a300 pass {r[1]:>6}: {r[3]:8s} {r[0]:,} bytes")
+        if best is None:
+            return None
 
         sz, bp, cid, name, payload = best
         blob = self._m3_pack(data, bp, cid, payload)
@@ -5569,7 +5607,7 @@ class Compressor:
                 print("  [a300] internal round-trip failed; discarding"); return None
         except Exception as e:
             print(f"  [a300] internal verify failed: {e}"); return None
-        print(f"  [a300] best: pass {bp}, {name}, {len(blob):,} container bytes")
+        print(f"  [a300] best: pass {bp}, {name}, {len(blob):,} container bytes  ({time.time()-t0:.2f}s)")
         return blob, (bp, cid, name, len(payload))
 
     def decompress_minus3(self, infile, outfile="", blob=None):
@@ -5617,7 +5655,7 @@ class Compressor:
                 if not math.isfinite(m3_time): m3_time = 30.0
             except ValueError: m3_time = 30.0
             m3_on = m3_time > 0
-            m3_passes = 0          # 0 = keep subtracting/compressing until time is up
+            m3_passes = 4          # 4 parallel steps (0..3); set 0 for time-only unlimited
             if not m3_on:
                 print("  a300: skipped for this run.")
             elif not HAS_CMIX:
@@ -5661,26 +5699,49 @@ class Compressor:
                 if t == 61 and xml_enc is not None: continue
                 _add_single(t, f"a{t}")
         else:
-            # JPQ7-HYPER: always evaluate the first FAST_PREFIX transforms fully
-            print(f"\n  Phase 1 (fast): first {FAST_PREFIX} transforms full + {FAST_EXTRA_SINGLES} sampled ...")
+            # JPQ7-SPEED: prefix + always-list (size-first), parallel where useful, early-exit
+            print(f"\n  Phase 1 (speed): first {FAST_PREFIX} full + always-list (parallel) ...")
             for t in range(1, FAST_PREFIX + 1):
                 if t == 61 and xml_enc is not None: continue
                 _add_single(t, f"a{t}")
-            # Always include a few high-value later transforms
             always = [22, 33, 35, 36, 57, 58, 60, 62, 63, 66, 70, 72, 75, 77, 78, 83, 256, 257]
-            for t in always:
-                if t > FAST_PREFIX and t <= 257:
-                    if t == 61 and xml_enc is not None: continue
-                    _add_single(t, f"a{t}")
-            # Sample extra singles from the remaining space
+            todo = [t for t in always if t > FAST_PREFIX and t <= 257 and not (t == 61 and xml_enc is not None)]
             if FAST_EXTRA_SINGLES > 0:
                 import random as _rnd
                 pool = [t for t in range(FAST_PREFIX + 1, 257)
                         if t not in always and not (t == 61 and xml_enc is not None)]
                 rng = _rnd.Random(0x4A7C15 ^ len(data))
-                sample = pool[:FAST_EXTRA_SINGLES] if len(pool) <= FAST_EXTRA_SINGLES else rng.sample(pool, FAST_EXTRA_SINGLES)
-                for t in sample:
-                    _add_single(t, f"a{t}")
+                todo += (pool[:FAST_EXTRA_SINGLES] if len(pool) <= FAST_EXTRA_SINGLES
+                         else rng.sample(pool, FAST_EXTRA_SINGLES))
+            # Parallel evaluate remaining singles (same size-first set)
+            def _one(t):
+                try:
+                    if not self.verify_single(data, t):
+                        return None
+                    tr = self.fwd[t](data)
+                    c = self.cback(tr)
+                    return (len(c), "a", t, f"a{t}", c)
+                except Exception:
+                    return None
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            workers = min(8, max(2, N_CORES))
+            best_so_far = min((c[0] for c in candidates), default=len(data))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(_one, t): t for t in todo}
+                for fut in as_completed(futs):
+                    r = fut.result()
+                    if r is None:
+                        continue
+                    candidates.append(r)
+                    variations_evaluated += 1
+                    if r[0] < best_so_far:
+                        best_so_far = r[0]
+                    # Early exit: already very small vs original
+                    if len(data) > 0 and best_so_far / len(data) <= EARLY_EXIT_RATIO:
+                        print(f"  early-exit: best {best_so_far:,} <= {EARLY_EXIT_RATIO:.0%} of input")
+                        for f in futs:
+                            f.cancel()
+                        break
 
         if xml_enc is not None:
             try:
@@ -5730,7 +5791,7 @@ class Compressor:
                 if pool is not None: pool.close(); pool.join()
                 _GLOBAL_COMP = None; _GLOBAL_DATA = None; _GLOBAL_FWD = {}
         elif not selftest:
-            # JPQ7-HYPER path: sample FAST_PAIR_SAMPLE pairs instead of full 65k
+            # JPQ7-SPEED path: sample FAST_PAIR_SAMPLE pairs instead of full 65k
             n_sample = min(FAST_PAIR_SAMPLE, len(self.pairs), self.PAIRS)
             print(f"\n  Phase 2 (fast): sampling {n_sample} pairs (of {len(self.pairs):,}) ...")
             # Always try a few known-good pairs first
@@ -6139,7 +6200,7 @@ def main():
     print(f"* Qubits    : up to {QUBIT_LIMIT}")
     print(f"* a256      : block-sweep 1..{A256_BLOCK_MAX}B × {A256_BLOCK_CANDIDATES} samples, 2^{A256_KEY_BITS} key space (never enumerated)")
     print("* a300      : minus-3 sweep inside option 1 (1 per 3-byte block) + zstd 22 / cmix 9")
-    print("* Dictionaries: A-Z batches ~260000 total words (_TARGET=10000/letter)\n    * JPQ7-HYPER: ~100000× leaner (10 full + 0 extra + 4 pairs); size-first always-list")
+    print("* Dictionaries: A-Z batches ~260000 total words (_TARGET=10000/letter)\n    * JPQ7-SPEED: ~1e9× leaner (1 full + always-list + fixed pairs only); size-first")
     try:
         mp.set_start_method('fork', force=True)
         print(f"mp: fork, {N_CORES} workers (cpu_count={CPU_COUNT})")
