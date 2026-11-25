@@ -121,47 +121,106 @@ DICTIONARY_URLS = [
 ]
 MAX_LINE_ENTRIES = 1024
 
+def _gdrive_download(url, timeout=180):
+    """Download a Google Drive file, handling the virus-scan confirm page.
+    Never returns HTML; raises on failure. Also converts /file/d/ID/view links."""
+    m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
+    if m:
+        file_id = m.group(1)
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    elif "id=" in url:
+        file_id = re.search(r"id=([a-zA-Z0-9_-]+)", url).group(1)
+    else:
+        file_id = None
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        content = r.read()
+    if not (content[:200].lower().startswith(b"<!doctype") or b"<html" in content[:300].lower()):
+        return content
+    text = content.decode("utf-8", errors="ignore")
+    confirm = None
+    for pat in (r'confirm=([0-9A-Za-z_-]+)', r'name="confirm"\s+value="([^"]+)"',
+                r'href="[^"]*confirm=([0-9A-Za-z_-]+)'):
+        m = re.search(pat, text)
+        if m:
+            confirm = m.group(1)
+            break
+    if not confirm and file_id:
+        confirm = "t"
+    if file_id is None:
+        raise RuntimeError("Google Drive returned HTML and no file id could be parsed")
+    dl_url = (f"https://drive.google.com/uc?export=download&confirm={confirm}&id={file_id}"
+              if confirm else f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t")
+    req2 = urllib.request.Request(dl_url, headers=headers)
+    with urllib.request.urlopen(req2, timeout=timeout) as r2:
+        content2 = r2.read()
+    if content2[:200].lower().startswith(b"<!doctype") or b"<html" in content2[:300].lower():
+        raise RuntimeError("Still received HTML after confirm — file may be private or deleted")
+    return content2
+
 def download_and_merge_dictionaries():
     if not os.path.exists(DICT_DIR):
         os.makedirs(DICT_DIR)
     if os.path.exists(COMBINED_DICTIONARY_FILE):
         print(f"Combined dictionary exists. Skipping download.")
         return True
-    all_words = set(); success_count = 0
+    all_words = set()
+    success_count = 0
     for filename, url in zip(DICTIONARY_FILES, DICTIONARY_URLS):
         local_path = os.path.join(DICT_DIR, filename)
         print(f"Downloading {filename} ...")
         try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=20) as response:
-                content = response.read()
-            if b'<html' in content[:200].lower():
-                print(f"  HTML page. Skipping."); continue
-            with open(local_path, 'wb') as f: f.write(content)
-            with open(local_path, 'r', encoding='utf-8', errors='ignore') as f:
-                for line in f:
-                    w = line.strip()
-                    if not w: continue
-                    try:
-                        decoded = base64.b64decode(w, validate=True).decode('utf-8')
-                        all_words.add(decoded)
-                    except Exception:
-                        all_words.add(w)
-            print(f"  OK ({os.path.getsize(local_path)} bytes)")
+            content = _gdrive_download(url, timeout=180)
+            with open(local_path, "wb") as f:
+                f.write(content)
+            text = content.decode("utf-8", errors="ignore")
+            for line in text.splitlines():
+                w = line.strip()
+                if not w:
+                    continue
+                try:
+                    all_words.add(base64.b64decode(w, validate=True).decode("utf-8"))
+                except Exception:
+                    all_words.add(w)
+            print(f"  OK ({len(content):,} bytes)")
             success_count += 1
         except Exception as e:
             print(f"  FAIL: {e}")
-            if os.path.exists(local_path): os.remove(local_path)
+            if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+                try:
+                    with open(local_path, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            w = line.strip()
+                            if not w:
+                                continue
+                            try:
+                                all_words.add(base64.b64decode(w, validate=True).decode("utf-8"))
+                            except Exception:
+                                all_words.add(w)
+                    print(f"  (used existing local file {os.path.getsize(local_path):,} bytes)")
+                    success_count += 1
+                except Exception:
+                    if os.path.exists(local_path):
+                        try:
+                            os.remove(local_path)
+                        except Exception:
+                            pass
     if success_count == 0:
         print("No dictionaries downloaded. Proceeding without.")
         return False
     try:
-        with open(COMBINED_DICTIONARY_FILE, 'w', encoding='utf-8') as f:
-            for word in sorted(all_words): f.write(word + '\n')
+        with open(COMBINED_DICTIONARY_FILE, "w", encoding="utf-8") as f:
+            for word in sorted(all_words):
+                f.write(word + "\n")
         print(f"Merged {len(all_words)} words.")
         return True
     except Exception as e:
-        print(f"Write failed: {e}"); return False
+        print(f"Write failed: {e}")
+        return False
 
 # ---------- Constants ----------
 PRIMES = [p for p in range(2, 256) if all(p % d != 0 for d in range(2, int(p ** 0.5) + 1))]
