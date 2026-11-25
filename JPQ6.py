@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # written by Jurijus Pacalovas
-# JPQ6 FAST14: always runs the 14+ core algorithms + fast search; size protected; 100% lossless
+# JPQ6 FAST14x: ALWAYS 14+ core algorithms + ultra-fast extras; size protected; 100% lossless
 # JPQ7: A-Z dictionaries targeting ~260000 total words (10k/letter)
 # -*- coding: utf-8 -*-
-# JPQ6 FAST14 — ALWAYS 14+ core algorithms + prefix/extra/pairs fast path; size protected
+# JPQ6 FAST14x — ALWAYS 14+ core algorithms + ultra-light extras/pairs; size protected
 #   Base: PPMD_1.8 / JPQ5 (100% lossless transforms, pairs, images)
 #   New:  spring radix-255 block encoder (backend id 15 + transform a257)
 #   Spring never expands a block; encode then decode is identity for all inputs.
@@ -77,13 +77,13 @@ FULL_SINGLES    = os.environ.get("PPMD_FULL_SINGLES", "0") != "0"   # default OF
 FULL_PAIRS      = os.environ.get("PPMD_FULL_PAIRS",   "0") != "0"   # default OFF (keep off for speed)
 SKIP_SLOW       = os.environ.get("PPMD_SKIP_SLOW",    "1") != "0"
 EARLY_EXIT_GAIN = float(os.environ.get("PPMD_EARLY_EXIT_GAIN", "0.50"))
-EARLY_EXIT_RATIO = float(os.environ.get("PPMD_EARLY_EXIT_RATIO", "0.88"))  # stop search if best <= this fraction of input
+EARLY_EXIT_RATIO = float(os.environ.get("PPMD_EARLY_EXIT_RATIO", "0.85"))  # stop search if best <= this fraction of input
 # How many transforms are always run fully (the "first 14 algorithms")
-FAST_PREFIX     = max(1, min(256, int(os.environ.get("PPMD_FAST_PREFIX", "8") or "8")))
+FAST_PREFIX     = max(1, min(256, int(os.environ.get("PPMD_FAST_PREFIX", "4") or "4")))
 # After the prefix: sample this many extra single transforms (from 15..256)
-FAST_EXTRA_SINGLES = max(0, min(242, int(os.environ.get("PPMD_FAST_EXTRA_SINGLES", "6") or "6")))
+FAST_EXTRA_SINGLES = max(0, min(242, int(os.environ.get("PPMD_FAST_EXTRA_SINGLES", "2") or "2")))
 # After the prefix: sample this many pairs (instead of up to 65280)
-FAST_PAIR_SAMPLE   = max(0, min(65280, int(os.environ.get("PPMD_FAST_PAIR_SAMPLE", "64") or "64")))
+FAST_PAIR_SAMPLE   = max(0, min(65280, int(os.environ.get("PPMD_FAST_PAIR_SAMPLE", "16") or "16")))
 # Keep only this many best candidates for final verify (already existed as TOP_VERIFY)
 
 A256_MODE        = os.environ.get("PPMD_A256_MODE", "blocksweep4400").lower()
@@ -97,8 +97,8 @@ A256_PROGRESS    = max(1, int(os.environ.get("PPMD_A256_PROGRESS", "1000000") or
 A256_CKPT        = max(1, int(os.environ.get("PPMD_A256_CKPT", "10000000") or "10000000"))
 A256_KEY_BITS    = 4400
 A256_KEY_BYTES   = A256_KEY_BITS // 8          # 550 bytes = the 4400-bit key space
-A256_BLOCK_MAX   = max(1, min(550, int(os.environ.get("PPMD_A256_BLOCK_MAX", "128") or "128")))
-A256_BLOCK_CANDIDATES = max(2, min(4096, int(os.environ.get("PPMD_A256_BLOCK_CANDIDATES", "64") or "64")))
+A256_BLOCK_MAX   = max(1, min(550, int(os.environ.get("PPMD_A256_BLOCK_MAX", "32") or "32")))
+A256_BLOCK_CANDIDATES = max(2, min(4096, int(os.environ.get("PPMD_A256_BLOCK_CANDIDATES", "16") or "16")))
 A256_VERIFY_FAST = False
 
 
@@ -259,7 +259,7 @@ REPEATS = max(1, int(os.environ.get("PPMD_REPEATS", "1") or "1"))
 CBACK_WORKERS = max(2, int(os.environ.get("PPMD_CBACK_WORKERS", str(max(4, CPU_COUNT))) or "8"))
 CBACK_WORKERS_EFF = max(1, CPU_COUNT // max(1, N_CORES))
 CHUNK = max(1, int(os.environ.get("PPMD_CHUNK", "256") or "256"))
-TOP_VERIFY = max(1, int(os.environ.get("PPMD_TOP_VERIFY", "2") or "2"))
+TOP_VERIFY = max(1, int(os.environ.get("PPMD_TOP_VERIFY", "1") or "1"))
 try:
     _MP_CTX = mp.get_context("fork"); _HAS_FORK = True
 except (ValueError, AttributeError):
@@ -343,14 +343,14 @@ def _ins_zstd():
         except Exception: pass
     return False
 
-print("="*70); print("JPQ6 FAST14 — always 14+ algorithms; best size always saved; 100% lossless"); print("="*70)
+print("="*70); print("JPQ6 FAST14x — ALWAYS 14+ algorithms; ultra-fast extras; best size always saved; 100% lossless"); print("="*70)
 print(f"parallelism : {N_CORES} cores" + (" (fork)" if _HAS_FORK else " (spawn)"))
 print(f"cpu count   : {CPU_COUNT}")
 print(f"fast mode   : {'ON' if FAST_MODE else 'OFF'}")
 print(f"full singles: {'ON (256 transforms)' if FULL_SINGLES else f'OFF (prefix {FAST_PREFIX} + {FAST_EXTRA_SINGLES} sampled)'}")
 print(f"full pairs  : {'ON (up to 65280 pairs)' if FULL_PAIRS else f'OFF (sample {FAST_PAIR_SAMPLE} pairs)'}")
 print(f"skip slow   : {'ON' if SKIP_SLOW else 'OFF'}")
-print(f"JPQ6 FAST14  : ALWAYS core algorithms + first {FAST_PREFIX} + {FAST_EXTRA_SINGLES} extra + {FAST_PAIR_SAMPLE} pairs")
+print(f"JPQ6 FAST14x : ALWAYS 14+ core + first {FAST_PREFIX} + {FAST_EXTRA_SINGLES} extra + {FAST_PAIR_SAMPLE} pairs")
 print(f"a256 mode   : " + (
     f"BLOCK-SWEEP 1..{A256_BLOCK_MAX}B × {A256_BLOCK_CANDIDATES} samples "
     f"from 2^{A256_KEY_BITS} (never enumerated)" if A256_MODE == "blocksweep4400" else
@@ -625,7 +625,7 @@ print(f"\nBackends: zstd={'Y' if HAS_ZSTD else 'N'} lzma={'Y' if HAS_LZMA else '
       f"pyppmd={'Y' if HAS_PPMD else 'N'} zpaq={'Y' if HAS_ZPAQ else 'N'} "
       f"ccmx={'Y' if HAS_CCMX else 'N'} cmix={'Y' if HAS_CMIX else 'N'} "
       f"lepton={'Y' if HAS_LEPTON else 'N'} qiskit={'Y' if HAS_QISKIT else 'N'}")
-PROGNAME = "JPQ6-FAST14"
+PROGNAME = "JPQ6-FAST14x"
 
 REF_TEXT = (
     "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. "
@@ -5477,7 +5477,7 @@ class Compressor:
         else:
             # FAST10: prefix + ALWAYS-LIST first (size protected — always fully evaluated)
             # Extra samples only after always-list; early-exit never cancels always-list.
-            print(f"\n  Phase 1 (FAST14): first {FAST_PREFIX} + ALWAYS 14+ core algorithms (size always checked) ...")
+            print(f"\n  Phase 1 (FAST14x): first {FAST_PREFIX} + ALWAYS 14+ core algorithms (size always checked) ...")
             for t in range(1, FAST_PREFIX + 1):
                 if t == 61 and xml_enc is not None: continue
                 _add_single(t, f"a{t}")
@@ -5953,7 +5953,7 @@ def main():
     print(f"* a84-a255  : 22 algorithm families (delta/transpose/swap/bitrev/…)")
     print(f"* Qubits    : up to {QUBIT_LIMIT}")
     print(f"* a256      : block-sweep 1..{A256_BLOCK_MAX}B × {A256_BLOCK_CANDIDATES} samples, 2^{A256_KEY_BITS} key space (never enumerated)")
-    print("* Dictionaries: A-Z batches ~260000 total words (_TARGET=10000/letter)\n    * JPQ6 FAST14: ALWAYS 14+ core algorithms (never skipped) + fast extras; size protected")
+    print("* Dictionaries: A-Z batches ~260000 total words (_TARGET=10000/letter)\n    * JPQ6 FAST14x: ALWAYS 14+ core algorithms (never skipped) + ultra-fast extras; size protected")
     try:
         mp.set_start_method('fork', force=True)
         print(f"mp: fork, {N_CORES} workers (cpu_count={CPU_COUNT})")
