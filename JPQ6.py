@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # written by Jurijus Pacalovas
-# JPQ6 FAST14: always runs the 14+ core algorithms + fast search; size protected; 100% lossless
+# JPQ6 ULTRAFAST Q16+4400: extreme-speed; ALWAYS core + a62 at 16 qubits AND 4400 qubits (separate)
 # JPQ7: A-Z dictionaries targeting ~260000 total words (10k/letter)
 # -*- coding: utf-8 -*-
-# JPQ6 FAST14 — ALWAYS 14+ core algorithms + prefix/extra/pairs fast path; size protected
+# JPQ6 ULTRAFAST Q16+4400 — ALWAYS core algorithms + a62@16 + a62@4400; tiny search; size protected
+
+
 #   Base: PPMD_1.8 / JPQ5 (100% lossless transforms, pairs, images)
 #   New:  spring radix-255 block encoder (backend id 15 + transform a257)
 #   Spring never expands a block; encode then decode is identity for all inputs.
@@ -71,20 +73,24 @@ HAS_CCMX = shutil.which('ccmx') is not None
 HAS_CMIX = shutil.which('cmix') is not None
 
 FAST_MODE       = os.environ.get("PPMD_FAST", "1") != "0"
-# JPQ7-SPEED defaults: only the first 14 transforms are always fully evaluated.
-# Minimal sample for ~1e9× fewer candidates vs full 256+65280 (size protected by always-list).
-FULL_SINGLES    = os.environ.get("PPMD_FULL_SINGLES", "0") != "0"   # default OFF (keep off for speed)
-FULL_PAIRS      = os.environ.get("PPMD_FULL_PAIRS",   "0") != "0"   # default OFF (keep off for speed)
+# JPQ6 ULTRAFAST defaults: extreme speed path.
+# Evaluating all 256 transforms + 65 280 pairs at ~1 ns each is physically
+# impossible on classical hardware. This build keeps the ALWAYS-core list
+# (size-protected, 100 % lossless) and reduces everything else to the absolute
+# minimum so wall-clock time is typically many times faster than FAST14.
+FULL_SINGLES    = os.environ.get("PPMD_FULL_SINGLES", "0") != "0"   # default OFF
+FULL_PAIRS      = os.environ.get("PPMD_FULL_PAIRS",   "0") != "0"   # default OFF
 SKIP_SLOW       = os.environ.get("PPMD_SKIP_SLOW",    "1") != "0"
-EARLY_EXIT_GAIN = float(os.environ.get("PPMD_EARLY_EXIT_GAIN", "0.50"))
-EARLY_EXIT_RATIO = float(os.environ.get("PPMD_EARLY_EXIT_RATIO", "0.88"))  # stop search if best <= this fraction of input
-# How many transforms are always run fully (the "first 14 algorithms")
-FAST_PREFIX     = max(1, min(256, int(os.environ.get("PPMD_FAST_PREFIX", "8") or "8")))
-# After the prefix: sample this many extra single transforms (from 15..256)
-FAST_EXTRA_SINGLES = max(0, min(242, int(os.environ.get("PPMD_FAST_EXTRA_SINGLES", "6") or "6")))
-# After the prefix: sample this many pairs (instead of up to 65280)
-FAST_PAIR_SAMPLE   = max(0, min(65280, int(os.environ.get("PPMD_FAST_PAIR_SAMPLE", "64") or "64")))
-# Keep only this many best candidates for final verify (already existed as TOP_VERIFY)
+EARLY_EXIT_GAIN = float(os.environ.get("PPMD_EARLY_EXIT_GAIN", "0.30"))
+EARLY_EXIT_RATIO = float(os.environ.get("PPMD_EARLY_EXIT_RATIO", "0.95"))  # exit earlier
+# Ultra-fast prefix (first N singles always evaluated)
+FAST_PREFIX     = max(1, min(256, int(os.environ.get("PPMD_FAST_PREFIX", "4") or "4")))
+# Extra singles after the always-list (0 = none → maximum speed)
+FAST_EXTRA_SINGLES = max(0, min(242, int(os.environ.get("PPMD_FAST_EXTRA_SINGLES", "0") or "0")))
+# Pair sample (very small → maximum speed)
+FAST_PAIR_SAMPLE   = max(0, min(65280, int(os.environ.get("PPMD_FAST_PAIR_SAMPLE", "8") or "8")))
+# Keep only this many best candidates for final verify
+
 
 A256_MODE        = os.environ.get("PPMD_A256_MODE", "blocksweep4400").lower()
 A256_ALLOW_FULL  = os.environ.get("PPMD_A256_ALLOW_FULL", "0") == "1"
@@ -343,14 +349,18 @@ def _ins_zstd():
         except Exception: pass
     return False
 
-print("="*70); print("JPQ6 FAST14 — always 14+ algorithms; best size always saved; 100% lossless"); print("="*70)
+print("="*70); print("JPQ6 ULTRAFAST Q16+4400 — extreme speed; a62 always @16 AND @4400; 100% lossless"); print("="*70)
 print(f"parallelism : {N_CORES} cores" + (" (fork)" if _HAS_FORK else " (spawn)"))
 print(f"cpu count   : {CPU_COUNT}")
 print(f"fast mode   : {'ON' if FAST_MODE else 'OFF'}")
 print(f"full singles: {'ON (256 transforms)' if FULL_SINGLES else f'OFF (prefix {FAST_PREFIX} + {FAST_EXTRA_SINGLES} sampled)'}")
 print(f"full pairs  : {'ON (up to 65280 pairs)' if FULL_PAIRS else f'OFF (sample {FAST_PAIR_SAMPLE} pairs)'}")
 print(f"skip slow   : {'ON' if SKIP_SLOW else 'OFF'}")
-print(f"JPQ6 FAST14  : ALWAYS core algorithms + first {FAST_PREFIX} + {FAST_EXTRA_SINGLES} extra + {FAST_PAIR_SAMPLE} pairs")
+print(f"JPQ6 ULTRAFAST Q16+4400: ALWAYS core + a62@16 + a62@4400 + first {FAST_PREFIX} + {FAST_EXTRA_SINGLES} extra + {FAST_PAIR_SAMPLE} pairs")
+print("NOTE: true 1 ns per transform/pair is impossible; this build minimises work instead.")
+print("QUBITS: a62 is always evaluated separately at 16 qubits and at 4400 qubits.")
+
+
 print(f"a256 mode   : " + (
     f"BLOCK-SWEEP 1..{A256_BLOCK_MAX}B × {A256_BLOCK_CANDIDATES} samples "
     f"from 2^{A256_KEY_BITS} (never enumerated)" if A256_MODE == "blocksweep4400" else
@@ -614,18 +624,21 @@ def ask_pairs(n_qubits=16):
         except ValueError: pass
         print(f"  Must be 1..{cap}.")
 
-QUBITS = ask_qubits() if HAS_QISKIT else QUBIT_LIMIT
+# Default interactive ask still available; a62 is ALWAYS also evaluated at 16 and 4400.
+QUBITS = ask_qubits() if HAS_QISKIT else 16
 PAIRS = ask_pairs(QUBITS)
 print(f"\nChosen: QUBITS={QUBITS}  PAIRS={PAIRS}")
+print("NOTE: a62 quantum transform is ALWAYS evaluated separately at 16 qubits and at 4400 qubits.")
 if PAIRS > MAX_PAIRS:
     print(f"FATAL: {PAIRS} pairs exceed 2-byte header cap {MAX_PAIRS}."); sys.exit(1)
+
 
 print(f"\nBackends: zstd={'Y' if HAS_ZSTD else 'N'} lzma={'Y' if HAS_LZMA else 'N'} "
       f"paq={'Y' if paq else 'N'} brotli={'Y' if HAS_BROTLI else 'N'} "
       f"pyppmd={'Y' if HAS_PPMD else 'N'} zpaq={'Y' if HAS_ZPAQ else 'N'} "
       f"ccmx={'Y' if HAS_CCMX else 'N'} cmix={'Y' if HAS_CMIX else 'N'} "
       f"lepton={'Y' if HAS_LEPTON else 'N'} qiskit={'Y' if HAS_QISKIT else 'N'}")
-PROGNAME = "JPQ6-FAST14"
+PROGNAME = "JPQ6-ULTRAFAST-Q16-4400"
 
 REF_TEXT = (
     "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. "
@@ -5561,7 +5574,8 @@ class Compressor:
         else:
             # FAST10: prefix + ALWAYS-LIST first (size protected — always fully evaluated)
             # Extra samples only after always-list; early-exit never cancels always-list.
-            print(f"\n  Phase 1 (FAST14): first {FAST_PREFIX} + ALWAYS 14+ core algorithms (size always checked) ...")
+            print(f"\n  Phase 1 (ULTRAFAST): first {FAST_PREFIX} + ALWAYS core algorithms (size always checked) ...")
+
             for t in range(1, FAST_PREFIX + 1):
                 if t == 61 and xml_enc is not None: continue
                 _add_single(t, f"a{t}")
@@ -5587,8 +5601,24 @@ class Compressor:
                         continue
                     candidates.append(r)
                     variations_evaluated += 1
+            # 1b) a62 ALWAYS evaluated separately at 16 qubits AND at 4400 qubits
+            #     (transform ID stays 62; QUBITS is stored inside the blob so decode is independent)
+            saved_qubits = self.QUBITS
+            for qb, tag in ((16, "a62@16"), (4400, "a62@4400")):
+                try:
+                    self.QUBITS = qb
+                    if self.verify_single(data, 62):
+                        tr = self.fwd[62](data)
+                        c = self.cback(tr)
+                        candidates.append((len(c), "a", 62, tag, c))
+                        variations_evaluated += 1
+                        print(f"  [{tag}] size={len(c):,}  (QUBITS={qb})")
+                except Exception as e:
+                    print(f"  [{tag}] failed: {e}")
+            self.QUBITS = saved_qubits
             best_so_far = min((c[0] for c in candidates), default=len(data))
-            print(f"  always-list done: best so far {best_so_far:,} bytes (size protected)")
+            print(f"  always-list + a62@16 + a62@4400 done: best so far {best_so_far:,} bytes (size protected)")
+
             # 2) Optional extra samples — may early-exit
             if FAST_EXTRA_SINGLES > 0:
                 import random as _rnd
@@ -6037,7 +6067,10 @@ def main():
     print(f"* a84-a255  : 22 algorithm families (delta/transpose/swap/bitrev/…)")
     print(f"* Qubits    : up to {QUBIT_LIMIT}")
     print(f"* a256      : block-sweep 1..{A256_BLOCK_MAX}B × {A256_BLOCK_CANDIDATES} samples, 2^{A256_KEY_BITS} key space (never enumerated)")
-    print("* Dictionaries: A-Z batches ~260000 total words (_TARGET=10000/letter)\n    * JPQ6 FAST14: ALWAYS 14+ core algorithms (never skipped) + fast extras; size protected")
+    print("* Dictionaries: A-Z batches ~260000 total words (_TARGET=10000/letter)")
+    print("* JPQ6 ULTRAFAST Q16+4400: ALWAYS core algorithms + a62@16 + a62@4400 (separate)")
+    print("* Minimal extras/pairs for speed; size protected; 100% lossless")
+    print("* True 1 ns / transform is impossible; this build minimises evaluated candidates instead.")
     try:
         mp.set_start_method('fork', force=True)
         print(f"mp: fork, {N_CORES} workers (cpu_count={CPU_COUNT})")
@@ -6047,11 +6080,14 @@ def main():
     c = Compressor(try_dl=(dl == 'y'), pairs=PAIRS, qubits=QUBITS)
     while True:
         print("\nMenu:")
-        print("1) Compress (JPQ5 / JPQ6 FAST10)")
+        print("1) Compress (JPQ6 ULTRAFAST Q16+4400)")
         print("2) Extract")
         print("3) Self-test (256 transformations, 65,280 pairs)")
         ch = input("> ").strip()
         if ch == "1":
+            print("enter file")
+            print("Input file 5 seconds:")
+            time.sleep(5)
             f = input("Input file: ").strip()
             if not f: print("No file."); continue
             c.compress(f); print("\nDone."); return
@@ -6063,6 +6099,8 @@ def main():
         elif ch == "3":
             c.selftest()
         else: print("Invalid")
+
+
 
 if __name__ == "__main__":
     main()
